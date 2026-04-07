@@ -7,7 +7,10 @@ import time
 import requests
 from datetime import datetime, timezone
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    filters, ContextTypes, ConversationHandler
+)
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -15,13 +18,18 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
-# Дефолтные настройки анализа (можно менять)
-DEFAULT_DAYS            = 7
-STABILITY_THRESHOLD     = -0.04   # %
-MAX_OUTLIER_PCT         = 25      # %
-NEG_AVG_THRESHOLD       = -0.08   # %
+DEFAULT_DAYS        = 7
+STABILITY_THRESHOLD = -0.04
+MAX_OUTLIER_PCT     = 25
+NEG_AVG_THRESHOLD   = -0.08
 
 BASE_URL = "https://api.phemex.com"
+
+# Состояния диалога
+WAIT_ANALYZE_COINS = 1
+WAIT_ANALYZE_DAYS  = 2
+WAIT_SHOW_COIN     = 3
+WAIT_SHOW_DAYS     = 4
 
 # ─────────────────────────────────────────────
 # API
@@ -92,83 +100,33 @@ def analyze_coin(coin, start_ms, end_ms):
         "category": category, "error": None,
     }
 
-# ─────────────────────────────────────────────
-# HANDLERS
-# ─────────────────────────────────────────────
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "👋 *Phemex Funding Rate Analyzer*\n\n"
-        "Команды:\n"
-        "`/analyze BTC ETH SOL` — анализ монет\n"
-        "`/analyze BTC ETH --days 14` — за 14 дней\n"
-        "`/show ENJ` — все ставки по монете\n"
-        "`/show ENJ --days 14` — за 14 дней\n"
-        "`/settings` — текущие настройки фильтров\n"
-        "`/help` — эта справка\n\n"
-        "Монеты указывай через пробел: `BTC ETH SOL ENJ`"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await cmd_start(update, context)
-
-
-async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "⚙️ *Текущие настройки*\n\n"
-        f"Период по умолчанию: `{DEFAULT_DAYS}` дней\n"
-        f"Порог ставки: `{STABILITY_THRESHOLD}%`\n"
-        f"Макс. выбросов: `{MAX_OUTLIER_PCT}%`\n"
-        f"Neg avg порог: `{NEG_AVG_THRESHOLD}%`\n\n"
-        "Категории результата:\n"
-        "✅ *ПОДХОДИТ* — выбросов ≤ 25%\n"
-        "⚡ *ЧАСТИЧНО* — нестабильно, но neg\\_avg ≤ -0.08%\n"
-        "❌ *НЕ ПОДХОДИТ* — не прошла ни один критерий"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-
-def parse_args(args):
-    """Парсит список аргументов, возвращает (coins, days)."""
+def parse_tokens(text):
+    """Парсит строку вида 'BTC ETH SOL --days 14' -> (coins, days)"""
+    parts = text.strip().split()
     days = DEFAULT_DAYS
     coins = []
     i = 0
-    while i < len(args):
-        if args[i] == "--days" and i + 1 < len(args):
+    while i < len(parts):
+        if parts[i].lower() == "--days" and i + 1 < len(parts):
             try:
-                days = int(args[i + 1])
+                days = int(parts[i + 1])
                 i += 2
                 continue
             except ValueError:
                 pass
-        coins.append(args[i].upper())
+        coins.append(parts[i].upper())
         i += 1
     return coins, days
 
 
-async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    coins, days = parse_args(context.args)
-
-    if not coins:
-        await update.message.reply_text(
-            "Укажи монеты через пробел:\n`/analyze BTC ETH SOL ENJ`",
-            parse_mode="Markdown"
-        )
-        return
-
-    await update.message.reply_text(
-        f"🔍 Анализирую {len(coins)} монет за {days} дней...",
-    )
+async def do_analyze(update, coins, days):
+    await update.message.reply_text(f"🔍 Анализирую {len(coins)} монет за {days} дней...")
 
     now_ms = int(time.time() * 1000)
     start_ms = now_ms - days * 24 * 60 * 60 * 1000
 
-    results = []
-    for coin in coins:
-        res = analyze_coin(coin, start_ms, now_ms)
-        results.append(res)
+    results = [analyze_coin(c, start_ms, now_ms) for c in coins]
 
     full    = [r for r in results if r.get("category") == "full"]
     partial = [r for r in results if r.get("category") == "partial"]
@@ -186,7 +144,6 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"  `{r['coin']:<8}` avg `{r['avg']:+.4f}%`  neg\\_avg `{r['neg_avg']:+.4f}%`  "
                 f"выбр `{r['outlier_pct']:.0f}%`  [стаб:{s1} neg:{s2}]"
             )
-
     if partial:
         lines.append(f"\n⚡ *ЧАСТИЧНО* ({len(partial)}):")
         for r in sorted(partial, key=lambda x: x["neg_avg"]):
@@ -194,7 +151,6 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"  `{r['coin']:<8}` avg `{r['avg']:+.4f}%`  neg\\_avg `{r['neg_avg']:+.4f}%`  "
                 f"выбр `{r['outlier_pct']:.0f}%`"
             )
-
     if fail:
         lines.append(f"\n❌ *НЕ ПОДХОДЯТ* ({len(fail)}):")
         for r in sorted(fail, key=lambda x: x["neg_avg"]):
@@ -202,7 +158,6 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"  `{r['coin']:<8}` avg `{r['avg']:+.4f}%`  neg\\_avg `{r['neg_avg']:+.4f}%`  "
                 f"выбр `{r['outlier_pct']:.0f}%`"
             )
-
     if errored:
         lines.append(f"\n⚠️ *Ошибки* ({len(errored)}):")
         for r in errored:
@@ -211,21 +166,7 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        await update.message.reply_text(
-            "Укажи монету:\n`/show ENJ`\n`/show ENJ --days 14`",
-            parse_mode="Markdown"
-        )
-        return
-
-    coins, days = parse_args(args)
-    coin = coins[0] if coins else None
-    if not coin:
-        await update.message.reply_text("Укажи монету, например: `/show ENJ`", parse_mode="Markdown")
-        return
-
+async def do_show(update, coin, days):
     await update.message.reply_text(f"🔍 Загружаю ставки {coin} за {days} дней...")
 
     now_ms = int(time.time() * 1000)
@@ -242,10 +183,8 @@ async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
     neg_avg = sum(neg_rates) / len(neg_rates) if neg_rates else 0.0
 
     header = (
-        f"📈 *{coin}* — {sym_or_err} — {days} дней\n"
-        f"Ставок: `{len(rows)}`  |  "
-        f"Avg: `{avg:+.4f}%`  |  "
-        f"Neg avg: `{neg_avg:+.4f}%`\n"
+        f"📈 *{coin}* — `{sym_or_err}` — {days} дней\n"
+        f"Ставок: `{len(rows)}`  |  Avg: `{avg:+.4f}%`  |  Neg avg: `{neg_avg:+.4f}%`\n"
         f"Min: `{min(rates):+.4f}%`  |  Max: `{max(rates):+.4f}%`\n\n"
         f"`{'Время (UTC)':<17} {'Ставка':>10}`\n"
         f"`{'─'*29}`\n"
@@ -258,7 +197,6 @@ async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
         marker = " ◀" if rate <= STABILITY_THRESHOLD else ""
         rate_lines.append(f"`{ts.strftime('%m-%d %H:%M'):<12} {rate:>+10.4f}%{marker}`")
 
-    # Telegram limit ~4096 chars — режем на части если много строк
     chunk = header
     messages = []
     for line in rate_lines:
@@ -273,10 +211,119 @@ async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ─────────────────────────────────────────────
+# CONVERSATION: /analyze
+# ─────────────────────────────────────────────
+
+async def analyze_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args:
+        coins, days = parse_tokens(" ".join(context.args))
+        if coins:
+            await do_analyze(update, coins, days)
+            return ConversationHandler.END
+
     await update.message.reply_text(
-        "Не знаю такой команды. Напиши /help чтобы увидеть список команд."
+        "Введи названия монет через пробел:\n\n"
+        "Например: `BTC ETH SOL ENJ RON`\n\n"
+        "Или с периодом: `BTC ETH --days 14`\n\n"
+        "Отмена: /cancel",
+        parse_mode="Markdown"
     )
+    return WAIT_ANALYZE_COINS
+
+
+async def analyze_got_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text:
+        await update.message.reply_text("Пожалуйста, введи названия монет.")
+        return WAIT_ANALYZE_COINS
+
+    coins, days = parse_tokens(text)
+    if not coins:
+        await update.message.reply_text("Не распознал монеты. Попробуй ещё раз, например: `BTC ETH SOL`", parse_mode="Markdown")
+        return WAIT_ANALYZE_COINS
+
+    await do_analyze(update, coins, days)
+    return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────
+# CONVERSATION: /show
+# ─────────────────────────────────────────────
+
+async def show_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args:
+        coins, days = parse_tokens(" ".join(context.args))
+        if coins:
+            await do_show(update, coins[0], days)
+            return ConversationHandler.END
+
+    await update.message.reply_text(
+        "Введи название монеты:\n\n"
+        "Например: `ENJ`\n\n"
+        "Или с периодом: `ENJ --days 14`\n\n"
+        "Отмена: /cancel",
+        parse_mode="Markdown"
+    )
+    return WAIT_SHOW_COIN
+
+
+async def show_got_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    coins, days = parse_tokens(text)
+    if not coins:
+        await update.message.reply_text("Не распознал монету. Попробуй ещё раз, например: `ENJ`", parse_mode="Markdown")
+        return WAIT_SHOW_COIN
+
+    await do_show(update, coins[0], days)
+    return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────
+# ПРОСТЫЕ КОМАНДЫ
+# ─────────────────────────────────────────────
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Отменено.")
+    return ConversationHandler.END
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "👋 *Phemex Funding Rate Analyzer*\n\n"
+        "Команды:\n"
+        "/analyze — анализ монет по фильтрам\n"
+        "/show — посмотреть все ставки по монете\n"
+        "/settings — текущие настройки\n"
+        "/help — эта справка\n\n"
+        "Можно писать сразу с монетами:\n"
+        "`/analyze BTC ETH SOL`\n"
+        "`/show ENJ --days 14`"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await cmd_start(update, context)
+
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "⚙️ *Текущие настройки*\n\n"
+        f"Период по умолчанию: `{DEFAULT_DAYS}` дней\n"
+        f"Порог ставки: `{STABILITY_THRESHOLD}%`\n"
+        f"Макс. выбросов: `{MAX_OUTLIER_PCT}%`\n"
+        f"Neg avg порог: `{NEG_AVG_THRESHOLD}%`\n\n"
+        "Категории:\n"
+        "✅ *ПОДХОДИТ* — стабильность ок\n"
+        "⚡ *ЧАСТИЧНО* — нестабильно, но neg\\_avg сильный\n"
+        "❌ *НЕ ПОДХОДИТ* — не прошла ни один критерий"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Не знаю такой команды. Напиши /help.")
 
 
 # ─────────────────────────────────────────────
@@ -285,15 +332,28 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN не задан! Добавь переменную окружения BOT_TOKEN.")
+        raise ValueError("BOT_TOKEN не задан!")
 
     app = Application.builder().token(BOT_TOKEN).build()
+
+    analyze_conv = ConversationHandler(
+        entry_points=[CommandHandler("analyze", analyze_start)],
+        states={WAIT_ANALYZE_COINS: [MessageHandler(filters.TEXT & ~filters.COMMAND, analyze_got_coins)]},
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+    )
+
+    show_conv = ConversationHandler(
+        entry_points=[CommandHandler("show", show_start)],
+        states={WAIT_SHOW_COIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, show_got_coin)]},
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+    )
 
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("help",     cmd_help))
     app.add_handler(CommandHandler("settings", cmd_settings))
-    app.add_handler(CommandHandler("analyze",  cmd_analyze))
-    app.add_handler(CommandHandler("show",     cmd_show))
+    app.add_handler(CommandHandler("cancel",   cmd_cancel))
+    app.add_handler(analyze_conv)
+    app.add_handler(show_conv)
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
     print("Бот запущен...")
