@@ -31,6 +31,7 @@ EXCHANGES_ENABLED = {
     "toobit": True,
     "okx": True,
     "bingx": True,
+    "kucoin": True,
 }
 
 # Когда анализируешь без указания биржи — используются все включённые
@@ -325,6 +326,67 @@ def bingx_fetch(coin, start_ms, end_ms):
 
     return [], last_err
 
+
+# ─────────────────────────────────────────────
+# KUCOIN API
+# ─────────────────────────────────────────────
+
+def kucoin_fetch(coin, start_ms, end_ms):
+    """Возвращает list of (timestamp_ms, rate_pct).
+
+    Формат ответа KuCoin:
+    {"code": "200000", "data": [
+      {"symbol": "ENJUSDTM", "fundingRate": -0.001, "timepoint": 1570708800000}
+    ]}
+    Символ формата: ENJUSDTM (без дефисов, M на конце).
+    Авторизация не нужна.
+    """
+    coin = coin.upper()
+    if coin.endswith("USDT"):
+        sym = coin + "M"
+    elif coin.endswith("USD"):
+        sym = coin + "TM"
+    else:
+        sym = f"{coin}USDTM"
+
+    last_err = None
+    try:
+        url = "https://api-futures.kucoin.com/api/v1/contract/funding-rates"
+        params = {"symbol": sym, "from": start_ms, "to": end_ms}
+        r = requests.get(url, params=params, timeout=10)
+
+        if r.status_code == 451:
+            return [], "KuCoin заблокирован в вашем регионе (ошибка 451)"
+        if r.status_code == 403:
+            return [], "KuCoin недоступен (ошибка 403)"
+
+        r.raise_for_status()
+        data = r.json()
+
+        if data.get("code") != "200000":
+            raise ValueError(data.get("msg", f"API error code: {data.get('code')}"))
+
+        items = data.get("data", [])
+        if not items:
+            return [], f"Нет данных (символ: {sym})"
+
+        # KuCoin возвращает данные от новых к старым, разворачиваем
+        filtered = []
+        for x in items:
+            ts = int(x.get("timepoint", 0))
+            rate = float(x.get("fundingRate", 0)) * 100
+            filtered.append((ts, rate))
+
+        if not filtered:
+            return [], f"Нет данных за период (символ: {sym})"
+
+        return filtered, sym
+
+    except Exception as e:
+        last_err = str(e)
+
+    return [], last_err
+
 # ─────────────────────────────────────────────
 # УНИВЕРСАЛЬНЫЙ АНАЛИЗ
 # ─────────────────────────────────────────────
@@ -335,6 +397,7 @@ EXCHANGE_FETCHERS = {
     "toobit": toobit_fetch,
     "okx": okx_fetch,
     "bingx": bingx_fetch,
+    "kucoin": kucoin_fetch,
 }
 
 EXCHANGE_LABELS = {
@@ -343,6 +406,7 @@ EXCHANGE_LABELS = {
     "toobit": "Toobit",
     "okx": "OKX",
     "bingx": "BingX",
+    "kucoin": "KuCoin",
 }
 
 
