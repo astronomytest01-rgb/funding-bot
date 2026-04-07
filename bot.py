@@ -77,40 +77,63 @@ def phemex_fetch(coin, start_ms, end_ms):
 # ─────────────────────────────────────────────
 
 def xt_fetch(coin, start_ms, end_ms):
-    """Возвращает list of (timestamp_ms, rate_pct) или raises"""
+    """Возвращает list of (timestamp_ms, rate_pct).
+
+    Реальный формат ответа XT:
+    {
+      "returnCode": 0,
+      "result": {
+        "hasNext": false,
+        "items": [
+          {"id": 123, "symbol": "enj_usdt", "fundingRate": -0.001,
+           "createdTime": 1234567890000, "collectionInternal": 14400}
+        ]
+      }
+    }
+    """
     coin = coin.upper()
-    # XT формат символа: btc_usdt (нижний регистр)
     if coin.endswith("USDT"):
         sym = coin.lower()
     elif coin.endswith("USD"):
-        sym = coin.lower() + "t"  # попробуем добавить t
+        sym = coin.lower() + "t"
     else:
         sym = f"{coin.lower()}_usdt"
 
     last_err = None
-    # XT отдаёт последние N записей, фильтруем по времени на нашей стороне
     try:
         url = "https://fapi.xt.com/future/market/v1/public/q/funding-rate-record"
-        params = {"symbol": sym, "limit": 500}
+        params = {"symbol": sym, "limit": 500, "direction": "NEXT"}
         r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
         data = r.json()
-        # XT формат: {"returnCode":0,"msgInfo":"success","error":null,"result":[{"symbol":"btc_usdt","fundingRate":"0.0001","settleTime":1234567890000},...]}
+
         if data.get("returnCode") != 0:
-            raise ValueError(data.get("msgInfo", "API error"))
-        rows = data.get("result", [])
-        if not rows:
-            return [], "Нет данных"
-        # Фильтруем по времени
+            err = data.get("error", {})
+            msg = err.get("msg") if isinstance(err, dict) else str(err)
+            raise ValueError(msg or "API error")
+
+        result = data.get("result", {})
+        # result может быть объектом {items:[...]} или списком напрямую
+        if isinstance(result, list):
+            items = result
+        else:
+            items = result.get("items", [])
+
+        if not items:
+            return [], f"Нет данных (символ: {sym})"
+
         filtered = []
-        for x in rows:
-            ts = x.get("settleTime") or x.get("fundingTime") or x.get("time") or 0
+        for x in items:
+            ts = x.get("createdTime") or x.get("settleTime") or x.get("fundingTime") or 0
             rate = float(x.get("fundingRate", 0)) * 100
             if ts >= start_ms:
                 filtered.append((ts, rate))
+
         if not filtered:
-            return [], "Нет данных за период"
+            return [], f"Нет данных за период (символ: {sym}, всего: {len(items)})"
+
         return filtered, sym
+
     except Exception as e:
         last_err = str(e)
 
@@ -213,6 +236,9 @@ def parse_tokens(text):
     i = 0
     while i < len(parts):
         p = parts[i].lower()
+        # пропускаем команды вида /analyze если вдруг попали в текст
+        if p.startswith("/"):
+            i += 1; continue
         if p == "--days" and i + 1 < len(parts):
             try:
                 days = int(parts[i + 1]); i += 2; continue
