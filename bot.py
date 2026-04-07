@@ -25,14 +25,17 @@ NEG_AVG_THRESHOLD   = -0.08
 
 # ── Биржи ─────────────────────────────────────
 # Включай/выключай биржи здесь (True/False)
+# Состояние бирж (изменяется в рантайме через /toggle)
 EXCHANGES_ENABLED = {
     "phemex": True,
     "xt":     True,
     "toobit": True,
-    "okx": True,
-    "bingx": True,
+    "okx":    True,
+    "bingx":  True,
     "kucoin": True,
-    "gate": True,
+    "gate":   True,
+    "blofin": True,
+    "weex":   True,
 }
 
 # Когда анализируешь без указания биржи — используются все включённые
@@ -453,6 +456,113 @@ def gate_fetch(coin, start_ms, end_ms):
     return [], last_err
 
 # ─────────────────────────────────────────────
+# BLOFIN API
+# ─────────────────────────────────────────────
+
+def blofin_fetch(coin, start_ms, end_ms):
+    """Формат: {"code":"0","data":[{"instId":"ENJ-USDT","fundingRate":"0.0001","fundingTime":"1703462400000"}]}
+    Символ: ENJ-USDT. Авторизация не нужна.
+    """
+    coin = coin.upper()
+    if coin.endswith("USDT"):
+        sym = coin[:-4] + "-USDT"
+    elif coin.endswith("USD"):
+        sym = coin[:-3] + "-USDT"
+    else:
+        sym = f"{coin}-USDT"
+
+    last_err = None
+    try:
+        url = "https://openapi.blofin.com/api/v1/market/funding-rate-history"
+        params = {"instId": sym, "limit": 100}
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code in (451, 403):
+            return [], f"BloFin недоступен (ошибка {r.status_code})"
+        r.raise_for_status()
+        data = r.json()
+        if data.get("code") != "0":
+            raise ValueError(data.get("msg", "API error"))
+        items = data.get("data", [])
+        if not items:
+            return [], f"Нет данных (символ: {sym})"
+        filtered = [(int(x["fundingTime"]), float(x["fundingRate"]) * 100)
+                    for x in items if int(x["fundingTime"]) >= start_ms]
+        if not filtered:
+            return [], f"Нет данных за период (символ: {sym}, всего: {len(items)})"
+        return filtered, sym
+    except Exception as e:
+        last_err = str(e)
+    return [], last_err
+
+
+# ─────────────────────────────────────────────
+# WEEX API
+# ─────────────────────────────────────────────
+
+def weex_fetch(coin, start_ms, end_ms):
+    """Формат: [{"symbol":"ENJUSDT","fundingRate":"0.0001","fundingTime":1703462400000}]
+    Символ: ENJUSDT. Лимит 7 дней на запрос — делаем несколько запросов если нужно.
+    Авторизация не нужна.
+    """
+    coin = coin.upper()
+    if coin.endswith("USDT"):
+        sym = coin
+    elif coin.endswith("USD"):
+        sym = coin + "T"
+    else:
+        sym = f"{coin}USDT"
+
+    # WEEX ограничивает 7 дней на запрос, нарезаем на чанки
+    SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000
+    all_rows = []
+    last_err = None
+    chunk_start = start_ms
+
+    try:
+        while chunk_start < end_ms:
+            chunk_end = min(chunk_start + SEVEN_DAYS_MS, end_ms)
+            url = "https://api-contract.weex.com/capi/v3/market/fundingRate"
+            params = {"symbol": sym, "startTime": chunk_start, "endTime": chunk_end, "limit": 1000}
+            r = requests.get(url, params=params, timeout=10)
+            if r.status_code in (451, 403):
+                return [], f"WEEX недоступен (ошибка {r.status_code})"
+            r.raise_for_status()
+            data = r.json()
+            # WEEX возвращает массив напрямую
+            if isinstance(data, list):
+                all_rows.extend(data)
+            elif isinstance(data, dict):
+                if data.get("code") not in (None, 0, "0", "200"):
+                    raise ValueError(str(data.get("msg", data)))
+                rows = data.get("data", [])
+                if isinstance(rows, list):
+                    all_rows.extend(rows)
+            chunk_start = chunk_end + 1
+            time.sleep(0.1)
+
+        if not all_rows:
+            return [], f"Нет данных (символ: {sym})"
+
+        filtered = []
+        for x in all_rows:
+            ts = int(x.get("fundingTime", 0))
+            rate = float(x.get("fundingRate", 0)) * 100
+            if start_ms <= ts <= end_ms:
+                filtered.append((ts, rate))
+
+        # убираем дубли и сортируем
+        filtered = sorted(set(filtered), key=lambda x: x[0])
+
+        if not filtered:
+            return [], f"Нет данных за период (символ: {sym})"
+        return filtered, sym
+
+    except Exception as e:
+        last_err = str(e)
+    return [], last_err
+
+
+# ─────────────────────────────────────────────
 # УНИВЕРСАЛЬНЫЙ АНАЛИЗ
 # ─────────────────────────────────────────────
 
@@ -463,7 +573,9 @@ EXCHANGE_FETCHERS = {
     "okx": okx_fetch,
     "bingx": bingx_fetch,
     "kucoin": kucoin_fetch,
-    "gate": gate_fetch,
+    "gate":   gate_fetch,
+    "blofin": blofin_fetch,
+    "weex":   weex_fetch,
 }
 
 EXCHANGE_LABELS = {
@@ -473,7 +585,9 @@ EXCHANGE_LABELS = {
     "okx": "OKX",
     "bingx": "BingX",
     "kucoin": "KuCoin",
-    "gate": "Gate.io",
+    "gate":   "Gate.io",
+    "blofin": "BloFin",
+    "weex":   "WEEX",
 }
 
 
@@ -917,7 +1031,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/analyze — анализ монет\n"
         "/show — ставки по монете\n"
         "/calc — калькулятор дохода\n"
-        "/exchanges — статус бирж\n"
+        "/exchanges — статус и управление биржами\n"
+        "/toggle xt — вкл/выкл биржу\n"
         "/settings — настройки фильтров\n"
         "/help — справка\n\n"
         "Параметры (можно добавлять к любой команде):\n"
@@ -937,9 +1052,54 @@ async def cmd_exchanges(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["🏦 *Статус бирж*\n"]
     for ex, enabled in EXCHANGES_ENABLED.items():
         label = EXCHANGE_LABELS.get(ex, ex.upper())
-        status = "✅ включена" if enabled else "❌ выключена"
-        lines.append(f"`{label}` — {status}")
-    lines.append("\nЧтобы включить/выключить биржу — измени `EXCHANGES_ENABLED` в `bot.py`")
+        status = "✅" if enabled else "❌"
+        lines.append(f"{status} `{label}` (`{ex}`)")
+    lines.append("\n*Включить/выключить:*")
+    lines.append("`/toggle phemex` — переключить Phemex")
+    lines.append("`/toggle xt okx` — несколько сразу")
+    lines.append("`/toggle all` — включить все")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Включает/выключает биржи. /toggle xt /toggle phemex okx /toggle all"""
+    args = [a.lower() for a in (context.args or [])]
+
+    if not args:
+        await update.message.reply_text(
+            "Укажи биржу: `/toggle xt` или `/toggle phemex okx` или `/toggle all`",
+            parse_mode="Markdown"
+        )
+        return
+
+    if "all" in args:
+        # Включить все
+        for ex in EXCHANGES_ENABLED:
+            EXCHANGES_ENABLED[ex] = True
+        active = [EXCHANGE_LABELS.get(e, e) for e in EXCHANGES_ENABLED]
+        await update.message.reply_text(
+            f"✅ Все биржи включены: `{', '.join(active)}`",
+            parse_mode="Markdown"
+        )
+        return
+
+    results = []
+    for arg in args:
+        if arg not in EXCHANGES_ENABLED:
+            results.append(f"⚠️ `{arg}` — неизвестная биржа")
+            continue
+        EXCHANGES_ENABLED[arg] = not EXCHANGES_ENABLED[arg]
+        label = EXCHANGE_LABELS.get(arg, arg.upper())
+        status = "✅ включена" if EXCHANGES_ENABLED[arg] else "❌ выключена"
+        results.append(f"{status}: `{label}`")
+
+    # Показать текущий статус всех
+    lines = results + ["\n*Текущий статус:*"]
+    for ex, enabled in EXCHANGES_ENABLED.items():
+        label = EXCHANGE_LABELS.get(ex, ex.upper())
+        icon = "✅" if enabled else "❌"
+        lines.append(f"{icon} `{label}`")
+
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -994,6 +1154,7 @@ def main():
     app.add_handler(CommandHandler("help",      cmd_help))
     app.add_handler(CommandHandler("settings",  cmd_settings))
     app.add_handler(CommandHandler("exchanges", cmd_exchanges))
+    app.add_handler(CommandHandler("toggle",    cmd_toggle))
     app.add_handler(CommandHandler("cancel",    cmd_cancel))
     app.add_handler(analyze_conv)
     app.add_handler(show_conv)
