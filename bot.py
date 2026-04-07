@@ -30,6 +30,9 @@ WAIT_ANALYZE_COINS = 1
 WAIT_ANALYZE_DAYS  = 2
 WAIT_SHOW_COIN     = 3
 WAIT_SHOW_DAYS     = 4
+WAIT_CALC_COIN     = 5
+WAIT_CALC_AMOUNT   = 6
+WAIT_CALC_DAYS     = 7
 
 # ─────────────────────────────────────────────
 # API
@@ -294,11 +297,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Команды:\n"
         "/analyze — анализ монет по фильтрам\n"
         "/show — посмотреть все ставки по монете\n"
+        "/calc — калькулятор дохода от фандинга\n"
         "/settings — текущие настройки\n"
         "/help — эта справка\n\n"
-        "Можно писать сразу с монетами:\n"
+        "Можно писать сразу с аргументами:\n"
         "`/analyze BTC ETH SOL`\n"
-        "`/show ENJ --days 14`"
+        "`/show ENJ --days 14`\n"
+        "`/calc ENJ 25000 --days 7`"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -326,6 +331,133 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Не знаю такой команды. Напиши /help.")
 
 
+
+# ─────────────────────────────────────────────
+# CALC: доход от фандинга
+# ─────────────────────────────────────────────
+
+def calc_funding_income(rows, amount_usd):
+    """
+    Считает доход от шорта за каждую отрицательную ставку.
+    При отрицательном фандинге шорт ПОЛУЧАЕТ выплату.
+    выплата = amount * abs(rate/100)
+    """
+    by_day = {}
+    total_income = 0.0
+
+    for r in rows:
+        rate = float(r["fundingRate"]) * 100
+        if rate >= 0:
+            continue  # платим сами — пропускаем
+        payment = amount_usd * abs(rate / 100)
+        total_income += payment
+
+        ts = datetime.fromtimestamp(r["fundingTime"] / 1000, tz=timezone.utc)
+        day = ts.strftime("%Y-%m-%d")
+        by_day[day] = by_day.get(day, 0.0) + payment
+
+    return total_income, by_day
+
+
+async def do_calc(update, coin, amount_usd, days):
+    await update.message.reply_text(f"🔍 Считаю доход по {coin} за {days} дней...")
+
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - days * 24 * 60 * 60 * 1000
+
+    rows, sym_or_err = fetch_rows(coin, start_ms, now_ms)
+    if not rows:
+        await update.message.reply_text(f"❌ Ошибка: {sym_or_err}")
+        return
+
+    total_income, by_day = calc_funding_income(rows, amount_usd)
+    income_per_day = total_income / days if days > 0 else 0
+
+    # Считаем ставки для контекста
+    rates = [float(r["fundingRate"]) * 100 for r in rows]
+    neg_rates = [r for r in rates if r < 0]
+    neg_avg = sum(neg_rates) / len(neg_rates) if neg_rates else 0.0
+    total_payments = len(neg_rates)
+
+    lines = [
+        f"💰 *Калькулятор фандинга — {coin}*\n",
+        f"Сумма позиции: `${amount_usd:,.0f}`",
+        f"Период: `{days}` дней",
+        f"Выплат получено: `{total_payments}` из `{len(rows)}` ставок\n",
+        f"📈 *Итого заработано: `${total_income:.2f}`*",
+        f"📅 В среднем в день: `${income_per_day:.2f}`",
+        f"⚡ Avg neg ставка: `{neg_avg:+.4f}%`\n",
+        f"`{'Дата':<12} {'Доход за день':>14}`",
+        f"`{'─'*28}`",
+    ]
+
+    for day in sorted(by_day.keys(), reverse=True):
+        lines.append(f"`{day:<12} ${by_day[day]:>12.2f}`")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def calc_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /calc ENJ 25000 --days 7
+    if context.args:
+        parts = context.args
+        coins, days = parse_tokens(" ".join(parts))
+        # Ищем число как сумму
+        amount = None
+        coin = None
+        remaining = []
+        for p in coins:
+            try:
+                amount = float(p.replace("$", "").replace(",", ""))
+            except ValueError:
+                remaining.append(p)
+        coin = remaining[0] if remaining else None
+        if coin and amount:
+            await do_calc(update, coin, amount, days)
+            return ConversationHandler.END
+
+    await update.message.reply_text(
+        "Введи монету и сумму позиции через пробел:\n\n"
+        "Например: `ENJ 25000`\n"
+        "Или с периодом: `ENJ 25000 --days 14`\n\n"
+        "Отмена: /cancel",
+        parse_mode="Markdown"
+    )
+    return WAIT_CALC_COIN
+
+
+async def calc_got_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    coins, days = parse_tokens(text)
+
+    amount = None
+    coin = None
+    remaining = []
+    for p in coins:
+        try:
+            amount = float(p.replace("$", "").replace(",", ""))
+        except ValueError:
+            remaining.append(p)
+    coin = remaining[0] if remaining else None
+
+    if not coin:
+        await update.message.reply_text(
+            "Не распознал монету. Попробуй: `ENJ 25000` или `ENJ 25000 --days 14`",
+            parse_mode="Markdown"
+        )
+        return WAIT_CALC_COIN
+
+    if not amount or amount <= 0:
+        await update.message.reply_text(
+            "Не распознал сумму. Попробуй: `ENJ 25000`",
+            parse_mode="Markdown"
+        )
+        return WAIT_CALC_COIN
+
+    await do_calc(update, coin, amount, days)
+    return ConversationHandler.END
+
+
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
@@ -348,12 +480,19 @@ def main():
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
 
+    calc_conv = ConversationHandler(
+        entry_points=[CommandHandler("calc", calc_start)],
+        states={WAIT_CALC_COIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, calc_got_input)]},
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+    )
+
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("help",     cmd_help))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("cancel",   cmd_cancel))
     app.add_handler(analyze_conv)
     app.add_handler(show_conv)
+    app.add_handler(calc_conv)
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
     print("Бот запущен...")
