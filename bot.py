@@ -29,6 +29,7 @@ EXCHANGES_ENABLED = {
     "phemex": True,
     "xt":     True,
     "toobit": True,
+    "binance": True,
 }
 
 # Когда анализируешь без указания биржи — используются все включённые
@@ -198,6 +199,63 @@ def toobit_fetch(coin, start_ms, end_ms):
 
     return [], last_err
 
+
+# ─────────────────────────────────────────────
+# BINANCE API
+# ─────────────────────────────────────────────
+
+def binance_fetch(coin, start_ms, end_ms):
+    """Возвращает list of (timestamp_ms, rate_pct).
+
+    Формат ответа Binance:
+    [
+      {"symbol": "BTCUSDT", "fundingRate": "0.00010000",
+       "fundingTime": 1570708800000, "markPrice": "..."}
+    ]
+    Авторизация не нужна. Лимит 1000 записей за запрос.
+    """
+    coin = coin.upper()
+    if coin.endswith("USDT"):
+        sym = coin
+    elif coin.endswith("USD"):
+        sym = coin + "T"
+    else:
+        sym = f"{coin}USDT"
+
+    last_err = None
+    try:
+        url = "https://fapi.binance.com/fapi/v1/fundingRate"
+        params = {"symbol": sym, "limit": 1000, "endTime": end_ms}
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+
+        if isinstance(data, dict) and data.get("code"):
+            raise ValueError(data.get("msg", "API error"))
+
+        if not isinstance(data, list):
+            raise ValueError(f"Unexpected format: {str(data)[:100]}")
+
+        if not data:
+            return [], f"Нет данных (символ: {sym})"
+
+        filtered = []
+        for x in data:
+            ts = int(x.get("fundingTime", 0))
+            rate = float(x.get("fundingRate", 0)) * 100
+            if ts >= start_ms:
+                filtered.append((ts, rate))
+
+        if not filtered:
+            return [], f"Нет данных за период (символ: {sym}, всего: {len(data)})"
+
+        return filtered, sym
+
+    except Exception as e:
+        last_err = str(e)
+
+    return [], last_err
+
 # ─────────────────────────────────────────────
 # УНИВЕРСАЛЬНЫЙ АНАЛИЗ
 # ─────────────────────────────────────────────
@@ -206,12 +264,14 @@ EXCHANGE_FETCHERS = {
     "phemex": phemex_fetch,
     "xt":     xt_fetch,
     "toobit": toobit_fetch,
+    "binance": binance_fetch,
 }
 
 EXCHANGE_LABELS = {
     "phemex": "Phemex",
     "xt":     "XT",
     "toobit": "Toobit",
+    "binance": "Binance",
 }
 
 
