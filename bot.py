@@ -28,6 +28,7 @@ NEG_AVG_THRESHOLD   = -0.08
 EXCHANGES_ENABLED = {
     "phemex": True,
     "xt":     True,
+    "toobit": True,
 }
 
 # Когда анализируешь без указания биржи — используются все включённые
@@ -140,6 +141,63 @@ def xt_fetch(coin, start_ms, end_ms):
     return [], last_err
 
 
+
+# ─────────────────────────────────────────────
+# TOOBIT API
+# ─────────────────────────────────────────────
+
+def toobit_fetch(coin, start_ms, end_ms):
+    """Возвращает list of (timestamp_ms, rate_pct).
+
+    Формат ответа Toobit:
+    [
+      {"id": "123", "symbol": "BTC-SWAP-USDT",
+       "settleTime": "1570708800000", "settleRate": "0.00321", "period": "8H"}
+    ]
+    """
+    coin = coin.upper()
+    # Toobit формат: BTC-SWAP-USDT
+    if coin.endswith("USDT"):
+        base = coin[:-4]  # убираем USDT
+        sym = f"{base}-SWAP-USDT"
+    elif coin.endswith("USD"):
+        base = coin[:-3]
+        sym = f"{base}-SWAP-USDT"
+    else:
+        sym = f"{coin}-SWAP-USDT"
+
+    last_err = None
+    try:
+        url = "https://api.toobit.com/api/v1/futures/historyFundingRate"
+        params = {"symbol": sym, "limit": 1000}
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+
+        # Ответ — массив напрямую
+        if not isinstance(data, list):
+            raise ValueError(f"Unexpected response format: {str(data)[:100]}")
+
+        if not data:
+            return [], f"Нет данных (символ: {sym})"
+
+        filtered = []
+        for x in data:
+            ts = int(x.get("settleTime", 0))
+            rate = float(x.get("settleRate", 0)) * 100
+            if ts >= start_ms:
+                filtered.append((ts, rate))
+
+        if not filtered:
+            return [], f"Нет данных за период (символ: {sym}, всего: {len(data)})"
+
+        return filtered, sym
+
+    except Exception as e:
+        last_err = str(e)
+
+    return [], last_err
+
 # ─────────────────────────────────────────────
 # УНИВЕРСАЛЬНЫЙ АНАЛИЗ
 # ─────────────────────────────────────────────
@@ -147,11 +205,13 @@ def xt_fetch(coin, start_ms, end_ms):
 EXCHANGE_FETCHERS = {
     "phemex": phemex_fetch,
     "xt":     xt_fetch,
+    "toobit": toobit_fetch,
 }
 
 EXCHANGE_LABELS = {
     "phemex": "Phemex",
     "xt":     "XT",
+    "toobit": "Toobit",
 }
 
 
@@ -228,7 +288,9 @@ def analyze_coin_multi(coin, start_ms, end_ms, exchanges):
 # ─────────────────────────────────────────────
 
 def parse_tokens(text):
-    """'BTC ETH --days 14 --exchange xt' -> (coins, days, exchange)"""
+    """'BTC ETH /days 14 /exchange xt' -> (coins, days, exchange)
+    Поддерживает как /days и /exchange так и --days и --exchange.
+    """
     parts = text.strip().split()
     days = DEFAULT_DAYS
     exchange = None
@@ -236,16 +298,18 @@ def parse_tokens(text):
     i = 0
     while i < len(parts):
         p = parts[i].lower()
-        # пропускаем команды вида /analyze если вдруг попали в текст
-        if p.startswith("/"):
-            i += 1; continue
-        if p == "--days" and i + 1 < len(parts):
+        # /days N или --days N
+        if p in ("/days", "--days") and i + 1 < len(parts):
             try:
                 days = int(parts[i + 1]); i += 2; continue
             except ValueError:
                 pass
-        if p == "--exchange" and i + 1 < len(parts):
+        # /exchange NAME или --exchange NAME
+        if p in ("/exchange", "--exchange") and i + 1 < len(parts):
             exchange = parts[i + 1].lower(); i += 2; continue
+        # пропускаем команды вида /analyze если вдруг попали в текст
+        if p in ("/analyze", "/show", "/calc", "/start", "/help", "/settings", "/exchanges", "/cancel"):
+            i += 1; continue
         coins.append(parts[i].upper())
         i += 1
     return coins, days, exchange
@@ -484,10 +548,10 @@ async def analyze_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Введи монеты через пробел:\n\n"
         "`BTC ETH SOL ENJ`\n"
-        "`BTC ETH --days 14`\n"
-        "`BTC ETH --exchange xt`\n"
-        "`BTC ETH --exchange phemex`\n"
-        "`BTC ETH --exchange all`\n\n"
+        "`BTC ETH /days 14`\n"
+        "`BTC ETH /exchange xt`\n"
+        "`BTC ETH /exchange phemex`\n"
+        "`BTC ETH /exchange all`\n\n"
         "Отмена: /cancel",
         parse_mode="Markdown"
     )
@@ -595,10 +659,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/settings — настройки фильтров\n"
         "/help — справка\n\n"
         "Параметры (можно добавлять к любой команде):\n"
-        "`--days 14` — период\n"
-        "`--exchange phemex` — только Phemex\n"
-        "`--exchange xt` — только XT\n"
-        "`--exchange all` — все биржи"
+        "`/days 14` — период\n"
+        "`/exchange phemex` — только Phemex\n"
+        "`/exchange xt` — только XT\n"
+        "`/exchange all` — все биржи"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
