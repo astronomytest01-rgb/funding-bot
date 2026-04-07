@@ -32,6 +32,7 @@ EXCHANGES_ENABLED = {
     "okx": True,
     "bingx": True,
     "kucoin": True,
+    "gate": True,
 }
 
 # Когда анализируешь без указания биржи — используются все включённые
@@ -387,6 +388,70 @@ def kucoin_fetch(coin, start_ms, end_ms):
 
     return [], last_err
 
+
+# ─────────────────────────────────────────────
+# GATE.IO API
+# ─────────────────────────────────────────────
+
+def gate_fetch(coin, start_ms, end_ms):
+    """Возвращает list of (timestamp_ms, rate_pct).
+
+    Формат ответа Gate.io:
+    [{"t": 1547706332, "r": "0.000100"}]
+    t — unix timestamp в секундах, r — ставка в долях.
+    Символ формата: ENJ_USDT
+    Авторизация не нужна.
+    """
+    coin = coin.upper()
+    if coin.endswith("USDT"):
+        sym = coin
+    elif coin.endswith("USD"):
+        sym = coin + "T"
+    else:
+        sym = f"{coin}_USDT"
+
+    last_err = None
+    try:
+        url = "https://api.gateio.ws/api/v4/futures/usdt/funding_rate"
+        params = {
+            "contract": sym,
+            "from": start_ms // 1000,  # Gate принимает unix секунды
+            "to": end_ms // 1000,
+            "limit": 1000,
+        }
+        r = requests.get(url, params=params, timeout=10)
+
+        if r.status_code == 451:
+            return [], "Gate.io заблокирован в вашем регионе (ошибка 451)"
+        if r.status_code == 403:
+            return [], "Gate.io недоступен (ошибка 403)"
+
+        r.raise_for_status()
+        data = r.json()
+
+        if not isinstance(data, list):
+            raise ValueError(f"Unexpected format: {str(data)[:100]}")
+
+        if not data:
+            return [], f"Нет данных (символ: {sym})"
+
+        filtered = []
+        for x in data:
+            ts = int(x.get("t", 0)) * 1000  # конвертируем в ms
+            rate = float(x.get("r", 0)) * 100
+            if ts >= start_ms:
+                filtered.append((ts, rate))
+
+        if not filtered:
+            return [], f"Нет данных за период (символ: {sym}, всего: {len(data)})"
+
+        return filtered, sym
+
+    except Exception as e:
+        last_err = str(e)
+
+    return [], last_err
+
 # ─────────────────────────────────────────────
 # УНИВЕРСАЛЬНЫЙ АНАЛИЗ
 # ─────────────────────────────────────────────
@@ -398,6 +463,7 @@ EXCHANGE_FETCHERS = {
     "okx": okx_fetch,
     "bingx": bingx_fetch,
     "kucoin": kucoin_fetch,
+    "gate": gate_fetch,
 }
 
 EXCHANGE_LABELS = {
@@ -407,6 +473,7 @@ EXCHANGE_LABELS = {
     "okx": "OKX",
     "bingx": "BingX",
     "kucoin": "KuCoin",
+    "gate": "Gate.io",
 }
 
 
