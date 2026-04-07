@@ -32,7 +32,7 @@ EXCHANGES_ENABLED = {
 }
 
 # Когда анализируешь без указания биржи — используются все включённые
-# Можно переопределить через --exchange phemex или --exchange xt или --exchange all
+# Можно переопределить через /exchange phemex или /exchange xt или /exchange all
 
 # ─────────────────────────────────────────────
 # Состояния диалога
@@ -576,8 +576,8 @@ async def show_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Введи монету:\n\n"
         "`ENJ`\n"
-        "`ENJ --days 14`\n"
-        "`ENJ --exchange xt`\n\n"
+        "`ENJ /days 14`\n"
+        "`ENJ /exchange xt`\n\n"
         "Отмена: /cancel",
         parse_mode="Markdown"
     )
@@ -609,8 +609,8 @@ async def calc_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Введи монету и сумму позиции:\n\n"
         "`ENJ 25000`\n"
-        "`ENJ 25000 --days 14`\n"
-        "`ENJ 25000 --exchange xt`\n\n"
+        "`ENJ 25000 /days 14`\n"
+        "`ENJ 25000 /exchange xt`\n\n"
         "Отмена: /cancel",
         parse_mode="Markdown"
     )
