@@ -29,7 +29,7 @@ EXCHANGES_ENABLED = {
     "phemex": True,
     "xt":     True,
     "toobit": True,
-    "binance": True,
+    "okx": True,
 }
 
 # Когда анализируешь без указания биржи — используются все включённые
@@ -200,54 +200,62 @@ def toobit_fetch(coin, start_ms, end_ms):
     return [], last_err
 
 
+
 # ─────────────────────────────────────────────
-# BINANCE API
+# OKX API
 # ─────────────────────────────────────────────
 
-def binance_fetch(coin, start_ms, end_ms):
+def okx_fetch(coin, start_ms, end_ms):
     """Возвращает list of (timestamp_ms, rate_pct).
 
-    Формат ответа Binance:
-    [
-      {"symbol": "BTCUSDT", "fundingRate": "0.00010000",
-       "fundingTime": 1570708800000, "markPrice": "..."}
-    ]
-    Авторизация не нужна. Лимит 1000 записей за запрос.
+    Формат ответа OKX:
+    {"code":"0","data":[
+      {"fundingRate":"0.0001","fundingTime":"1570708800000","instId":"BTC-USDT-SWAP",...}
+    ]}
+    Авторизация не нужна. Лимит 100 записей за запрос.
     """
     coin = coin.upper()
     if coin.endswith("USDT"):
-        sym = coin
+        base = coin[:-4]
+        sym = f"{base}-USDT-SWAP"
     elif coin.endswith("USD"):
-        sym = coin + "T"
+        base = coin[:-3]
+        sym = f"{base}-USDT-SWAP"
     else:
-        sym = f"{coin}USDT"
+        sym = f"{coin}-USDT-SWAP"
 
     last_err = None
     try:
-        url = "https://fapi.binance.com/fapi/v1/fundingRate"
-        params = {"symbol": sym, "limit": 1000, "endTime": end_ms}
+        url = "https://www.okx.com/api/v5/public/funding-rate-history"
+        # OKX возвращает макс 100 записей, фильтруем по времени на нашей стороне
+        params = {"instId": sym, "limit": 100}
         r = requests.get(url, params=params, timeout=10)
+
+        # 451 = геоблокировка
+        if r.status_code == 451:
+            return [], "OKX заблокирован в вашем регионе (ошибка 451)"
+        if r.status_code == 403:
+            return [], "OKX недоступен (ошибка 403)"
+
         r.raise_for_status()
         data = r.json()
 
-        if isinstance(data, dict) and data.get("code"):
+        if data.get("code") != "0":
             raise ValueError(data.get("msg", "API error"))
 
-        if not isinstance(data, list):
-            raise ValueError(f"Unexpected format: {str(data)[:100]}")
-
-        if not data:
+        items = data.get("data", [])
+        if not items:
             return [], f"Нет данных (символ: {sym})"
 
         filtered = []
-        for x in data:
+        for x in items:
             ts = int(x.get("fundingTime", 0))
             rate = float(x.get("fundingRate", 0)) * 100
             if ts >= start_ms:
                 filtered.append((ts, rate))
 
         if not filtered:
-            return [], f"Нет данных за период (символ: {sym}, всего: {len(data)})"
+            return [], f"Нет данных за период (символ: {sym}, всего: {len(items)})"
 
         return filtered, sym
 
@@ -264,14 +272,14 @@ EXCHANGE_FETCHERS = {
     "phemex": phemex_fetch,
     "xt":     xt_fetch,
     "toobit": toobit_fetch,
-    "binance": binance_fetch,
+    "okx": okx_fetch,
 }
 
 EXCHANGE_LABELS = {
     "phemex": "Phemex",
     "xt":     "XT",
     "toobit": "Toobit",
-    "binance": "Binance",
+    "okx": "OKX",
 }
 
 
