@@ -1,5 +1,5 @@
 """
-Phemex Funding Rate Telegram Bot
+Phemex + XT Funding Rate Telegram Bot
 """
 
 import os
@@ -23,68 +23,134 @@ STABILITY_THRESHOLD = -0.04
 MAX_OUTLIER_PCT     = 25
 NEG_AVG_THRESHOLD   = -0.08
 
-BASE_URL = "https://api.phemex.com"
+# ── Биржи ─────────────────────────────────────
+# Включай/выключай биржи здесь (True/False)
+EXCHANGES_ENABLED = {
+    "phemex": True,
+    "xt":     True,
+}
 
+# Когда анализируешь без указания биржи — используются все включённые
+# Можно переопределить через --exchange phemex или --exchange xt или --exchange all
+
+# ─────────────────────────────────────────────
 # Состояния диалога
+# ─────────────────────────────────────────────
 WAIT_ANALYZE_COINS = 1
-WAIT_ANALYZE_DAYS  = 2
 WAIT_SHOW_COIN     = 3
-WAIT_SHOW_DAYS     = 4
 WAIT_CALC_COIN     = 5
-WAIT_CALC_AMOUNT   = 6
-WAIT_CALC_DAYS     = 7
 
 # ─────────────────────────────────────────────
-# API
+# PHEMEX API
 # ─────────────────────────────────────────────
 
-def get_funding_history(symbol, start_ms, end_ms):
-    url = f"{BASE_URL}/api-data/public/data/funding-rate-history"
-    params = {"symbol": symbol, "end": end_ms, "limit": 1000}
-    resp = requests.get(url, params=params, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("code") != 0:
-        raise ValueError(f"API error: {data.get('msg')}")
-    rows = data.get("data", {}).get("rows", [])
-    return [r for r in rows if r["fundingTime"] >= start_ms]
-
-
-def funding_symbols(coin):
-    coin = coin.upper().strip()
+def phemex_fetch(coin, start_ms, end_ms):
+    """Возвращает list of (timestamp_ms, rate_pct) или raises"""
+    candidates = []
+    coin = coin.upper()
     if coin.endswith("USDT") or coin.endswith("USD"):
-        return [f".{coin}FR8H"]
-    return [f".{coin}USDTFR8H", f".{coin}USDFR8H"]
+        candidates = [f".{coin}FR8H"]
+    else:
+        candidates = [f".{coin}USDTFR8H", f".{coin}USDFR8H"]
 
-
-def fetch_rows(coin, start_ms, end_ms):
-    last_error = None
-    for sym in funding_symbols(coin):
+    last_err = None
+    for sym in candidates:
         try:
-            rows = get_funding_history(sym, start_ms, end_ms)
+            url = "https://api.phemex.com/api-data/public/data/funding-rate-history"
+            params = {"symbol": sym, "end": end_ms, "limit": 1000}
+            r = requests.get(url, params=params, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            if data.get("code") != 0:
+                raise ValueError(data.get("msg"))
+            rows = [x for x in data.get("data", {}).get("rows", []) if x["fundingTime"] >= start_ms]
             if rows:
-                return rows, sym
+                return [(x["fundingTime"], float(x["fundingRate"]) * 100) for x in rows], sym
         except Exception as e:
-            last_error = str(e)
+            last_err = str(e)
         time.sleep(0.15)
-    return [], last_error
+    return [], last_err
 
 
-def analyze_coin(coin, start_ms, end_ms):
-    rows, sym_or_err = fetch_rows(coin, start_ms, end_ms)
-    if not rows:
-        return {"coin": coin, "error": sym_or_err or "Нет данных", "sym": None}
+# ─────────────────────────────────────────────
+# XT API
+# ─────────────────────────────────────────────
 
-    rates = [float(r["fundingRate"]) * 100 for r in rows]
-    neg_rates = [r for r in rates if r < 0]
-    total = len(rates)
+def xt_fetch(coin, start_ms, end_ms):
+    """Возвращает list of (timestamp_ms, rate_pct) или raises"""
+    coin = coin.upper()
+    # XT формат символа: btc_usdt (нижний регистр)
+    if coin.endswith("USDT"):
+        sym = coin.lower()
+    elif coin.endswith("USD"):
+        sym = coin.lower() + "t"  # попробуем добавить t
+    else:
+        sym = f"{coin.lower()}_usdt"
 
-    below = sum(1 for r in rates if r <= STABILITY_THRESHOLD)
+    last_err = None
+    # XT отдаёт последние N записей, фильтруем по времени на нашей стороне
+    try:
+        url = "https://fapi.xt.com/future/market/v1/public/q/funding-rate-record"
+        params = {"symbol": sym, "limit": 500}
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        # XT формат: {"returnCode":0,"msgInfo":"success","error":null,"result":[{"symbol":"btc_usdt","fundingRate":"0.0001","settleTime":1234567890000},...]}
+        if data.get("returnCode") != 0:
+            raise ValueError(data.get("msgInfo", "API error"))
+        rows = data.get("result", [])
+        if not rows:
+            return [], "Нет данных"
+        # Фильтруем по времени
+        filtered = []
+        for x in rows:
+            ts = x.get("settleTime") or x.get("fundingTime") or x.get("time") or 0
+            rate = float(x.get("fundingRate", 0)) * 100
+            if ts >= start_ms:
+                filtered.append((ts, rate))
+        if not filtered:
+            return [], "Нет данных за период"
+        return filtered, sym
+    except Exception as e:
+        last_err = str(e)
+
+    return [], last_err
+
+
+# ─────────────────────────────────────────────
+# УНИВЕРСАЛЬНЫЙ АНАЛИЗ
+# ─────────────────────────────────────────────
+
+EXCHANGE_FETCHERS = {
+    "phemex": phemex_fetch,
+    "xt":     xt_fetch,
+}
+
+EXCHANGE_LABELS = {
+    "phemex": "Phemex",
+    "xt":     "XT",
+}
+
+
+def get_active_exchanges(requested=None):
+    """Возвращает список активных бирж."""
+    if requested and requested != "all":
+        exs = [e.strip().lower() for e in requested.split(",")]
+        return [e for e in exs if e in EXCHANGE_FETCHERS]
+    return [e for e, enabled in EXCHANGES_ENABLED.items() if enabled]
+
+
+def analyze_rates(rates_pct):
+    """Считает метрики по списку ставок в %."""
+    if not rates_pct:
+        return None
+    neg = [r for r in rates_pct if r < 0]
+    total = len(rates_pct)
+    below = sum(1 for r in rates_pct if r <= STABILITY_THRESHOLD)
     outlier_pct = (total - below) / total * 100
     pass_stability = outlier_pct <= MAX_OUTLIER_PCT
-
-    neg_avg = sum(neg_rates) / len(neg_rates) if neg_rates else 0.0
-    pass_neg_avg = bool(neg_rates) and neg_avg <= NEG_AVG_THRESHOLD
+    neg_avg = sum(neg) / len(neg) if neg else 0.0
+    pass_neg_avg = bool(neg) and neg_avg <= NEG_AVG_THRESHOLD
 
     if pass_stability:
         category = "full"
@@ -94,141 +160,308 @@ def analyze_coin(coin, start_ms, end_ms):
         category = "fail"
 
     return {
-        "coin": coin, "sym": sym_or_err, "rates": rates,
-        "total": total, "avg": sum(rates) / total,
-        "neg_avg": neg_avg, "neg_count": len(neg_rates),
-        "min": min(rates), "max": max(rates),
+        "total": total,
+        "avg": sum(rates_pct) / total,
+        "neg_avg": neg_avg,
+        "neg_count": len(neg),
+        "min": min(rates_pct),
+        "max": max(rates_pct),
         "outlier_pct": outlier_pct,
-        "pass_stability": pass_stability, "pass_neg_avg": pass_neg_avg,
-        "category": category, "error": None,
+        "pass_stability": pass_stability,
+        "pass_neg_avg": pass_neg_avg,
+        "category": category,
     }
 
 
-def parse_tokens(text):
-    """Парсит строку вида 'BTC ETH SOL --days 14' -> (coins, days)"""
-    parts = text.strip().split()
-    days = DEFAULT_DAYS
-    coins = []
-    i = 0
-    while i < len(parts):
-        if parts[i].lower() == "--days" and i + 1 < len(parts):
-            try:
-                days = int(parts[i + 1])
-                i += 2
-                continue
-            except ValueError:
-                pass
-        coins.append(parts[i].upper())
-        i += 1
-    return coins, days
+def analyze_coin_multi(coin, start_ms, end_ms, exchanges):
+    """Анализирует монету на нескольких биржах. Возвращает dict по биржам."""
+    results = {}
+    for ex in exchanges:
+        fetcher = EXCHANGE_FETCHERS.get(ex)
+        if not fetcher:
+            continue
+        try:
+            data, sym_or_err = fetcher(coin, start_ms, end_ms)
+        except Exception as e:
+            results[ex] = {"error": str(e), "sym": None}
+            continue
 
+        if not data:
+            results[ex] = {"error": sym_or_err or "Нет данных", "sym": None}
+            continue
 
-async def do_analyze(update, coins, days):
-    await update.message.reply_text(f"🔍 Анализирую {len(coins)} монет за {days} дней...")
-
-    now_ms = int(time.time() * 1000)
-    start_ms = now_ms - days * 24 * 60 * 60 * 1000
-
-    results = [analyze_coin(c, start_ms, now_ms) for c in coins]
-
-    full    = [r for r in results if r.get("category") == "full"]
-    partial = [r for r in results if r.get("category") == "partial"]
-    fail    = [r for r in results if r.get("category") == "fail"]
-    errored = [r for r in results if r.get("error")]
-
-    lines = [f"📊 *Результат анализа* — {days} дней\n"]
-
-    if full:
-        lines.append(f"✅ *ПОДХОДЯТ* ({len(full)}):")
-        for r in sorted(full, key=lambda x: x["neg_avg"]):
-            s1 = "✓" if r["pass_stability"] else "✗"
-            s2 = "✓" if r["pass_neg_avg"] else "✗"
-            lines.append(
-                f"  `{r['coin']:<8}` avg `{r['avg']:+.4f}%`  neg\\_avg `{r['neg_avg']:+.4f}%`  "
-                f"выбр `{r['outlier_pct']:.0f}%`  [стаб:{s1} neg:{s2}]"
-            )
-    if partial:
-        lines.append(f"\n⚡ *ЧАСТИЧНО* ({len(partial)}):")
-        for r in sorted(partial, key=lambda x: x["neg_avg"]):
-            lines.append(
-                f"  `{r['coin']:<8}` avg `{r['avg']:+.4f}%`  neg\\_avg `{r['neg_avg']:+.4f}%`  "
-                f"выбр `{r['outlier_pct']:.0f}%`"
-            )
-    if fail:
-        lines.append(f"\n❌ *НЕ ПОДХОДЯТ* ({len(fail)}):")
-        for r in sorted(fail, key=lambda x: x["neg_avg"]):
-            lines.append(
-                f"  `{r['coin']:<8}` avg `{r['avg']:+.4f}%`  neg\\_avg `{r['neg_avg']:+.4f}%`  "
-                f"выбр `{r['outlier_pct']:.0f}%`"
-            )
-    if errored:
-        lines.append(f"\n⚠️ *Ошибки* ({len(errored)}):")
-        for r in errored:
-            lines.append(f"  `{r['coin']}` — {r['error']}")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def do_show(update, coin, days):
-    await update.message.reply_text(f"🔍 Загружаю ставки {coin} за {days} дней...")
-
-    now_ms = int(time.time() * 1000)
-    start_ms = now_ms - days * 24 * 60 * 60 * 1000
-
-    rows, sym_or_err = fetch_rows(coin, start_ms, now_ms)
-    if not rows:
-        await update.message.reply_text(f"❌ Ошибка: {sym_or_err}")
-        return
-
-    rates = [float(r["fundingRate"]) * 100 for r in rows]
-    neg_rates = [r for r in rates if r < 0]
-    avg = sum(rates) / len(rates)
-    neg_avg = sum(neg_rates) / len(neg_rates) if neg_rates else 0.0
-
-    header = (
-        f"📈 *{coin}* — `{sym_or_err}` — {days} дней\n"
-        f"Ставок: `{len(rows)}`  |  Avg: `{avg:+.4f}%`  |  Neg avg: `{neg_avg:+.4f}%`\n"
-        f"Min: `{min(rates):+.4f}%`  |  Max: `{max(rates):+.4f}%`\n\n"
-        f"`{'Время (UTC)':<17} {'Ставка':>10}`\n"
-        f"`{'─'*29}`\n"
-    )
-
-    rate_lines = []
-    for r in reversed(rows):
-        ts = datetime.fromtimestamp(r["fundingTime"] / 1000, tz=timezone.utc)
-        rate = float(r["fundingRate"]) * 100
-        marker = " ◀" if rate <= STABILITY_THRESHOLD else ""
-        rate_lines.append(f"`{ts.strftime('%m-%d %H:%M'):<12} {rate:>+10.4f}%{marker}`")
-
-    chunk = header
-    messages = []
-    for line in rate_lines:
-        if len(chunk) + len(line) + 1 > 4000:
-            messages.append(chunk)
-            chunk = ""
-        chunk += line + "\n"
-    if chunk:
-        messages.append(chunk)
-
-    for msg in messages:
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        rates = [r for _, r in data]
+        metrics = analyze_rates(rates)
+        metrics["coin"] = coin
+        metrics["sym"] = sym_or_err
+        metrics["exchange"] = ex
+        metrics["error"] = None
+        results[ex] = metrics
+    return results
 
 
 # ─────────────────────────────────────────────
-# CONVERSATION: /analyze
+# ПАРСИНГ АРГУМЕНТОВ
+# ─────────────────────────────────────────────
+
+def parse_tokens(text):
+    """'BTC ETH --days 14 --exchange xt' -> (coins, days, exchange)"""
+    parts = text.strip().split()
+    days = DEFAULT_DAYS
+    exchange = None
+    coins = []
+    i = 0
+    while i < len(parts):
+        p = parts[i].lower()
+        if p == "--days" and i + 1 < len(parts):
+            try:
+                days = int(parts[i + 1]); i += 2; continue
+            except ValueError:
+                pass
+        if p == "--exchange" and i + 1 < len(parts):
+            exchange = parts[i + 1].lower(); i += 2; continue
+        coins.append(parts[i].upper())
+        i += 1
+    return coins, days, exchange
+
+
+# ─────────────────────────────────────────────
+# ФОРМАТИРОВАНИЕ РЕЗУЛЬТАТОВ
+# ─────────────────────────────────────────────
+
+def fmt_coin_line(coin, ex_results, active_exchanges):
+    """Форматирует одну строку монеты для всех бирж."""
+    lines = []
+    # Определяем общую категорию (лучшая из бирж)
+    categories = [r.get("category") for r in ex_results.values() if not r.get("error")]
+    if "full" in categories:
+        overall = "✅"
+    elif "partial" in categories:
+        overall = "⚡"
+    elif categories:
+        overall = "❌"
+    else:
+        overall = "⚠️"
+
+    lines.append(f"{overall} *{coin}*")
+    for ex in active_exchanges:
+        r = ex_results.get(ex, {})
+        label = EXCHANGE_LABELS.get(ex, ex.upper())
+        if r.get("error"):
+            lines.append(f"  `{label}`: ошибка — {r['error'][:40]}")
+            continue
+        cat = {"full": "✅", "partial": "⚡", "fail": "❌"}.get(r.get("category", "fail"), "❌")
+        lines.append(
+            f"  `{label}` {cat}  avg `{r['avg']:+.4f}%`  neg\\_avg `{r['neg_avg']:+.4f}%`  выбр `{r['outlier_pct']:.0f}%`"
+        )
+    return "\n".join(lines)
+
+
+def build_analyze_reply(all_results, days, active_exchanges):
+    """Строит итоговое сообщение анализа."""
+    ex_labels = " + ".join(EXCHANGE_LABELS.get(e, e.upper()) for e in active_exchanges)
+    lines = [f"📊 *Анализ* — {days} дней — {ex_labels}\n"]
+
+    # Группируем монеты по лучшей категории
+    def best_cat(ex_res):
+        cats = [r.get("category") for r in ex_res.values() if not r.get("error")]
+        if "full" in cats: return "full"
+        if "partial" in cats: return "partial"
+        if cats: return "fail"
+        return "error"
+
+    full    = [(c, r) for c, r in all_results.items() if best_cat(r) == "full"]
+    partial = [(c, r) for c, r in all_results.items() if best_cat(r) == "partial"]
+    fail    = [(c, r) for c, r in all_results.items() if best_cat(r) == "fail"]
+    errors  = [(c, r) for c, r in all_results.items() if best_cat(r) == "error"]
+
+    if full:
+        lines.append(f"✅ *ПОДХОДЯТ* ({len(full)}):")
+        for coin, ex_res in full:
+            lines.append(fmt_coin_line(coin, ex_res, active_exchanges))
+            lines.append("")
+
+    if partial:
+        lines.append(f"⚡ *ЧАСТИЧНО* ({len(partial)}):")
+        for coin, ex_res in partial:
+            lines.append(fmt_coin_line(coin, ex_res, active_exchanges))
+            lines.append("")
+
+    if fail:
+        lines.append(f"❌ *НЕ ПОДХОДЯТ* ({len(fail)}):")
+        for coin, ex_res in fail:
+            lines.append(fmt_coin_line(coin, ex_res, active_exchanges))
+            lines.append("")
+
+    if errors:
+        lines.append(f"⚠️ *Ошибки* ({len(errors)}):")
+        for coin, _ in errors:
+            lines.append(f"  `{coin}` — нет данных ни на одной бирже")
+
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────
+# DO-функции
+# ─────────────────────────────────────────────
+
+async def do_analyze(update, coins, days, exchange_arg):
+    active = get_active_exchanges(exchange_arg)
+    if not active:
+        await update.message.reply_text("❌ Нет активных бирж. Проверь настройки EXCHANGES_ENABLED.")
+        return
+
+    ex_str = " + ".join(EXCHANGE_LABELS.get(e, e) for e in active)
+    await update.message.reply_text(f"🔍 Анализирую {len(coins)} монет на {ex_str} за {days} дней...")
+
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - days * 24 * 60 * 60 * 1000
+
+    all_results = {}
+    for coin in coins:
+        all_results[coin] = analyze_coin_multi(coin, start_ms, now_ms, active)
+
+    reply = build_analyze_reply(all_results, days, active)
+    # Telegram limit
+    if len(reply) > 4000:
+        chunks = [reply[i:i+4000] for i in range(0, len(reply), 4000)]
+        for chunk in chunks:
+            await update.message.reply_text(chunk, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(reply, parse_mode="Markdown")
+
+
+async def do_show(update, coin, days, exchange_arg):
+    active = get_active_exchanges(exchange_arg)
+    if not active:
+        await update.message.reply_text("❌ Нет активных бирж.")
+        return
+
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - days * 24 * 60 * 60 * 1000
+
+    for ex in active:
+        fetcher = EXCHANGE_FETCHERS.get(ex)
+        label = EXCHANGE_LABELS.get(ex, ex.upper())
+        await update.message.reply_text(f"🔍 Загружаю {coin} с {label} за {days} дней...")
+
+        try:
+            data, sym_or_err = fetcher(coin, start_ms, now_ms)
+        except Exception as e:
+            await update.message.reply_text(f"❌ {label}: {e}")
+            continue
+
+        if not data:
+            await update.message.reply_text(f"❌ {label}: {sym_or_err}")
+            continue
+
+        data_sorted = sorted(data, key=lambda x: x[0], reverse=True)
+        rates = [r for _, r in data_sorted]
+        neg = [r for r in rates if r < 0]
+        avg = sum(rates) / len(rates)
+        neg_avg = sum(neg) / len(neg) if neg else 0.0
+
+        header = (
+            f"📈 *{coin}* — {label} — `{sym_or_err}` — {days} дней\n"
+            f"Ставок: `{len(rates)}`  |  Avg: `{avg:+.4f}%`  |  Neg avg: `{neg_avg:+.4f}%`\n"
+            f"Min: `{min(rates):+.4f}%`  |  Max: `{max(rates):+.4f}%`\n\n"
+            f"`{'Время (UTC)':<17} {'Ставка':>10}`\n"
+            f"`{'─'*29}`\n"
+        )
+
+        rate_lines = []
+        for ts, rate in data_sorted:
+            dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
+            marker = "  ◀" if rate <= STABILITY_THRESHOLD else ""
+            rate_lines.append(f"`{dt.strftime('%m-%d %H:%M'):<12} {rate:>+10.4f}%{marker}`")
+
+        chunk = header
+        messages = []
+        for line in rate_lines:
+            if len(chunk) + len(line) + 1 > 4000:
+                messages.append(chunk)
+                chunk = ""
+            chunk += line + "\n"
+        if chunk:
+            messages.append(chunk)
+
+        for msg in messages:
+            await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def do_calc(update, coin, amount_usd, days, exchange_arg):
+    active = get_active_exchanges(exchange_arg)
+    if not active:
+        await update.message.reply_text("❌ Нет активных бирж.")
+        return
+
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - days * 24 * 60 * 60 * 1000
+
+    for ex in active:
+        fetcher = EXCHANGE_FETCHERS.get(ex)
+        label = EXCHANGE_LABELS.get(ex, ex.upper())
+        await update.message.reply_text(f"🔍 Считаю доход по {coin} на {label} за {days} дней...")
+
+        try:
+            data, sym_or_err = fetcher(coin, start_ms, now_ms)
+        except Exception as e:
+            await update.message.reply_text(f"❌ {label}: {e}")
+            continue
+
+        if not data:
+            await update.message.reply_text(f"❌ {label}: {sym_or_err}")
+            continue
+
+        by_day = {}
+        total_income = 0.0
+        for ts, rate in data:
+            if rate >= 0:
+                continue
+            payment = amount_usd * abs(rate / 100)
+            total_income += payment
+            day = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+            by_day[day] = by_day.get(day, 0.0) + payment
+
+        rates = [r for _, r in data]
+        neg = [r for r in rates if r < 0]
+        neg_avg = sum(neg) / len(neg) if neg else 0.0
+        income_per_day = total_income / days if days > 0 else 0
+
+        lines = [
+            f"💰 *Калькулятор — {coin} — {label}*\n",
+            f"Сумма позиции: `${amount_usd:,.0f}`",
+            f"Период: `{days}` дней",
+            f"Выплат получено: `{len(neg)}` из `{len(rates)}` ставок\n",
+            f"📈 *Итого: `${total_income:.2f}`*",
+            f"📅 В среднем в день: `${income_per_day:.2f}`",
+            f"⚡ Avg neg ставка: `{neg_avg:+.4f}%`\n",
+            f"`{'Дата':<12} {'Доход':>12}`",
+            f"`{'─'*26}`",
+        ]
+        for day in sorted(by_day.keys(), reverse=True):
+            lines.append(f"`{day:<12} ${by_day[day]:>10.2f}`")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ─────────────────────────────────────────────
+# CONVERSATION HANDLERS
 # ─────────────────────────────────────────────
 
 async def analyze_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
-        coins, days = parse_tokens(" ".join(context.args))
+        coins, days, exchange = parse_tokens(" ".join(context.args))
         if coins:
-            await do_analyze(update, coins, days)
+            await do_analyze(update, coins, days, exchange)
             return ConversationHandler.END
-
     await update.message.reply_text(
-        "Введи названия монет через пробел:\n\n"
-        "Например: `BTC ETH SOL ENJ RON`\n\n"
-        "Или с периодом: `BTC ETH --days 14`\n\n"
+        "Введи монеты через пробел:\n\n"
+        "`BTC ETH SOL ENJ`\n"
+        "`BTC ETH --days 14`\n"
+        "`BTC ETH --exchange xt`\n"
+        "`BTC ETH --exchange phemex`\n"
+        "`BTC ETH --exchange all`\n\n"
         "Отмена: /cancel",
         parse_mode="Markdown"
     )
@@ -236,35 +469,25 @@ async def analyze_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def analyze_got_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if not text:
-        await update.message.reply_text("Пожалуйста, введи названия монет.")
-        return WAIT_ANALYZE_COINS
-
-    coins, days = parse_tokens(text)
+    coins, days, exchange = parse_tokens(update.message.text.strip())
     if not coins:
-        await update.message.reply_text("Не распознал монеты. Попробуй ещё раз, например: `BTC ETH SOL`", parse_mode="Markdown")
+        await update.message.reply_text("Не распознал монеты. Попробуй: `BTC ETH SOL`", parse_mode="Markdown")
         return WAIT_ANALYZE_COINS
-
-    await do_analyze(update, coins, days)
+    await do_analyze(update, coins, days, exchange)
     return ConversationHandler.END
 
 
-# ─────────────────────────────────────────────
-# CONVERSATION: /show
-# ─────────────────────────────────────────────
-
 async def show_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
-        coins, days = parse_tokens(" ".join(context.args))
+        coins, days, exchange = parse_tokens(" ".join(context.args))
         if coins:
-            await do_show(update, coins[0], days)
+            await do_show(update, coins[0], days, exchange)
             return ConversationHandler.END
-
     await update.message.reply_text(
-        "Введи название монеты:\n\n"
-        "Например: `ENJ`\n\n"
-        "Или с периодом: `ENJ --days 14`\n\n"
+        "Введи монету:\n\n"
+        "`ENJ`\n"
+        "`ENJ --days 14`\n"
+        "`ENJ --exchange xt`\n\n"
         "Отмена: /cancel",
         parse_mode="Markdown"
     )
@@ -272,13 +495,54 @@ async def show_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_got_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    coins, days = parse_tokens(text)
+    coins, days, exchange = parse_tokens(update.message.text.strip())
     if not coins:
-        await update.message.reply_text("Не распознал монету. Попробуй ещё раз, например: `ENJ`", parse_mode="Markdown")
+        await update.message.reply_text("Не распознал монету. Попробуй: `ENJ`", parse_mode="Markdown")
         return WAIT_SHOW_COIN
+    await do_show(update, coins[0], days, exchange)
+    return ConversationHandler.END
 
-    await do_show(update, coins[0], days)
+
+async def calc_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args:
+        coins, days, exchange = parse_tokens(" ".join(context.args))
+        amount = None
+        remaining = []
+        for p in coins:
+            try:
+                amount = float(p.replace("$", "").replace(",", ""))
+            except ValueError:
+                remaining.append(p)
+        if remaining and amount:
+            await do_calc(update, remaining[0], amount, days, exchange)
+            return ConversationHandler.END
+    await update.message.reply_text(
+        "Введи монету и сумму позиции:\n\n"
+        "`ENJ 25000`\n"
+        "`ENJ 25000 --days 14`\n"
+        "`ENJ 25000 --exchange xt`\n\n"
+        "Отмена: /cancel",
+        parse_mode="Markdown"
+    )
+    return WAIT_CALC_COIN
+
+
+async def calc_got_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    coins, days, exchange = parse_tokens(update.message.text.strip())
+    amount = None
+    remaining = []
+    for p in coins:
+        try:
+            amount = float(p.replace("$", "").replace(",", ""))
+        except ValueError:
+            remaining.append(p)
+    if not remaining:
+        await update.message.reply_text("Не распознал монету. Попробуй: `ENJ 25000`", parse_mode="Markdown")
+        return WAIT_CALC_COIN
+    if not amount or amount <= 0:
+        await update.message.reply_text("Не распознал сумму. Попробуй: `ENJ 25000`", parse_mode="Markdown")
+        return WAIT_CALC_COIN
+    await do_calc(update, remaining[0], amount, days, exchange)
     return ConversationHandler.END
 
 
@@ -292,18 +556,23 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    active = [EXCHANGE_LABELS.get(e, e) for e, on in EXCHANGES_ENABLED.items() if on]
+    ex_str = ", ".join(active)
     text = (
-        "👋 *Phemex Funding Rate Analyzer*\n\n"
+        "👋 *Phemex + XT Funding Rate Analyzer*\n\n"
+        f"Активные биржи: `{ex_str}`\n\n"
         "Команды:\n"
-        "/analyze — анализ монет по фильтрам\n"
-        "/show — посмотреть все ставки по монете\n"
-        "/calc — калькулятор дохода от фандинга\n"
-        "/settings — текущие настройки\n"
-        "/help — эта справка\n\n"
-        "Можно писать сразу с аргументами:\n"
-        "`/analyze BTC ETH SOL`\n"
-        "`/show ENJ --days 14`\n"
-        "`/calc ENJ 25000 --days 7`"
+        "/analyze — анализ монет\n"
+        "/show — ставки по монете\n"
+        "/calc — калькулятор дохода\n"
+        "/exchanges — статус бирж\n"
+        "/settings — настройки фильтров\n"
+        "/help — справка\n\n"
+        "Параметры (можно добавлять к любой команде):\n"
+        "`--days 14` — период\n"
+        "`--exchange phemex` — только Phemex\n"
+        "`--exchange xt` — только XT\n"
+        "`--exchange all` — все биржи"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -312,150 +581,35 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_start(update, context)
 
 
+async def cmd_exchanges(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = ["🏦 *Статус бирж*\n"]
+    for ex, enabled in EXCHANGES_ENABLED.items():
+        label = EXCHANGE_LABELS.get(ex, ex.upper())
+        status = "✅ включена" if enabled else "❌ выключена"
+        lines.append(f"`{label}` — {status}")
+    lines.append("\nЧтобы включить/выключить биржу — измени `EXCHANGES_ENABLED` в `bot.py`")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    active = [EXCHANGE_LABELS.get(e, e) for e, on in EXCHANGES_ENABLED.items() if on]
     text = (
-        "⚙️ *Текущие настройки*\n\n"
+        "⚙️ *Настройки*\n\n"
+        f"Активные биржи: `{', '.join(active)}`\n"
         f"Период по умолчанию: `{DEFAULT_DAYS}` дней\n"
         f"Порог ставки: `{STABILITY_THRESHOLD}%`\n"
         f"Макс. выбросов: `{MAX_OUTLIER_PCT}%`\n"
         f"Neg avg порог: `{NEG_AVG_THRESHOLD}%`\n\n"
         "Категории:\n"
         "✅ *ПОДХОДИТ* — стабильность ок\n"
-        "⚡ *ЧАСТИЧНО* — нестабильно, но neg\\_avg сильный\n"
-        "❌ *НЕ ПОДХОДИТ* — не прошла ни один критерий"
+        "⚡ *ЧАСТИЧНО* — neg\\_avg сильный, нестабильно\n"
+        "❌ *НЕ ПОДХОДИТ* — не прошла"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Не знаю такой команды. Напиши /help.")
-
-
-
-# ─────────────────────────────────────────────
-# CALC: доход от фандинга
-# ─────────────────────────────────────────────
-
-def calc_funding_income(rows, amount_usd):
-    """
-    Считает доход от шорта за каждую отрицательную ставку.
-    При отрицательном фандинге шорт ПОЛУЧАЕТ выплату.
-    выплата = amount * abs(rate/100)
-    """
-    by_day = {}
-    total_income = 0.0
-
-    for r in rows:
-        rate = float(r["fundingRate"]) * 100
-        if rate >= 0:
-            continue  # платим сами — пропускаем
-        payment = amount_usd * abs(rate / 100)
-        total_income += payment
-
-        ts = datetime.fromtimestamp(r["fundingTime"] / 1000, tz=timezone.utc)
-        day = ts.strftime("%Y-%m-%d")
-        by_day[day] = by_day.get(day, 0.0) + payment
-
-    return total_income, by_day
-
-
-async def do_calc(update, coin, amount_usd, days):
-    await update.message.reply_text(f"🔍 Считаю доход по {coin} за {days} дней...")
-
-    now_ms = int(time.time() * 1000)
-    start_ms = now_ms - days * 24 * 60 * 60 * 1000
-
-    rows, sym_or_err = fetch_rows(coin, start_ms, now_ms)
-    if not rows:
-        await update.message.reply_text(f"❌ Ошибка: {sym_or_err}")
-        return
-
-    total_income, by_day = calc_funding_income(rows, amount_usd)
-    income_per_day = total_income / days if days > 0 else 0
-
-    # Считаем ставки для контекста
-    rates = [float(r["fundingRate"]) * 100 for r in rows]
-    neg_rates = [r for r in rates if r < 0]
-    neg_avg = sum(neg_rates) / len(neg_rates) if neg_rates else 0.0
-    total_payments = len(neg_rates)
-
-    lines = [
-        f"💰 *Калькулятор фандинга — {coin}*\n",
-        f"Сумма позиции: `${amount_usd:,.0f}`",
-        f"Период: `{days}` дней",
-        f"Выплат получено: `{total_payments}` из `{len(rows)}` ставок\n",
-        f"📈 *Итого заработано: `${total_income:.2f}`*",
-        f"📅 В среднем в день: `${income_per_day:.2f}`",
-        f"⚡ Avg neg ставка: `{neg_avg:+.4f}%`\n",
-        f"`{'Дата':<12} {'Доход за день':>14}`",
-        f"`{'─'*28}`",
-    ]
-
-    for day in sorted(by_day.keys(), reverse=True):
-        lines.append(f"`{day:<12} ${by_day[day]:>12.2f}`")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def calc_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /calc ENJ 25000 --days 7
-    if context.args:
-        parts = context.args
-        coins, days = parse_tokens(" ".join(parts))
-        # Ищем число как сумму
-        amount = None
-        coin = None
-        remaining = []
-        for p in coins:
-            try:
-                amount = float(p.replace("$", "").replace(",", ""))
-            except ValueError:
-                remaining.append(p)
-        coin = remaining[0] if remaining else None
-        if coin and amount:
-            await do_calc(update, coin, amount, days)
-            return ConversationHandler.END
-
-    await update.message.reply_text(
-        "Введи монету и сумму позиции через пробел:\n\n"
-        "Например: `ENJ 25000`\n"
-        "Или с периодом: `ENJ 25000 --days 14`\n\n"
-        "Отмена: /cancel",
-        parse_mode="Markdown"
-    )
-    return WAIT_CALC_COIN
-
-
-async def calc_got_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    coins, days = parse_tokens(text)
-
-    amount = None
-    coin = None
-    remaining = []
-    for p in coins:
-        try:
-            amount = float(p.replace("$", "").replace(",", ""))
-        except ValueError:
-            remaining.append(p)
-    coin = remaining[0] if remaining else None
-
-    if not coin:
-        await update.message.reply_text(
-            "Не распознал монету. Попробуй: `ENJ 25000` или `ENJ 25000 --days 14`",
-            parse_mode="Markdown"
-        )
-        return WAIT_CALC_COIN
-
-    if not amount or amount <= 0:
-        await update.message.reply_text(
-            "Не распознал сумму. Попробуй: `ENJ 25000`",
-            parse_mode="Markdown"
-        )
-        return WAIT_CALC_COIN
-
-    await do_calc(update, coin, amount, days)
-    return ConversationHandler.END
 
 
 # ─────────────────────────────────────────────
@@ -473,23 +627,22 @@ def main():
         states={WAIT_ANALYZE_COINS: [MessageHandler(filters.TEXT & ~filters.COMMAND, analyze_got_coins)]},
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
-
     show_conv = ConversationHandler(
         entry_points=[CommandHandler("show", show_start)],
         states={WAIT_SHOW_COIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, show_got_coin)]},
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
-
     calc_conv = ConversationHandler(
         entry_points=[CommandHandler("calc", calc_start)],
         states={WAIT_CALC_COIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, calc_got_input)]},
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
 
-    app.add_handler(CommandHandler("start",    cmd_start))
-    app.add_handler(CommandHandler("help",     cmd_help))
-    app.add_handler(CommandHandler("settings", cmd_settings))
-    app.add_handler(CommandHandler("cancel",   cmd_cancel))
+    app.add_handler(CommandHandler("start",     cmd_start))
+    app.add_handler(CommandHandler("help",      cmd_help))
+    app.add_handler(CommandHandler("settings",  cmd_settings))
+    app.add_handler(CommandHandler("exchanges", cmd_exchanges))
+    app.add_handler(CommandHandler("cancel",    cmd_cancel))
     app.add_handler(analyze_conv)
     app.add_handler(show_conv)
     app.add_handler(calc_conv)
