@@ -30,6 +30,7 @@ EXCHANGES_ENABLED = {
     "xt":     True,
     "toobit": True,
     "okx": True,
+    "bingx": True,
 }
 
 # Когда анализируешь без указания биржи — используются все включённые
@@ -264,6 +265,66 @@ def okx_fetch(coin, start_ms, end_ms):
 
     return [], last_err
 
+
+# ─────────────────────────────────────────────
+# BINGX API
+# ─────────────────────────────────────────────
+
+def bingx_fetch(coin, start_ms, end_ms):
+    """Возвращает list of (timestamp_ms, rate_pct).
+
+    Формат ответа BingX:
+    {"code": 0, "msg": "", "data": [
+      {"symbol": "BTC-USDT", "fundingRate": "0.0001", "fundingTime": 1570708800000}
+    ]}
+    Авторизация не нужна. Символ формата BTC-USDT.
+    """
+    coin = coin.upper()
+    if coin.endswith("USDT"):
+        sym = coin[:-4] + "-USDT"
+    elif coin.endswith("USD"):
+        sym = coin[:-3] + "-USDT"
+    else:
+        sym = f"{coin}-USDT"
+
+    last_err = None
+    try:
+        url = "https://open-api.bingx.com/openApi/swap/v2/quote/fundingRate"
+        params = {"symbol": sym, "limit": 1000}
+        r = requests.get(url, params=params, timeout=10)
+
+        if r.status_code == 451:
+            return [], "BingX заблокирован в вашем регионе (ошибка 451)"
+        if r.status_code == 403:
+            return [], "BingX недоступен (ошибка 403)"
+
+        r.raise_for_status()
+        data = r.json()
+
+        if data.get("code") != 0:
+            raise ValueError(data.get("msg", "API error"))
+
+        items = data.get("data", [])
+        if not items:
+            return [], f"Нет данных (символ: {sym})"
+
+        filtered = []
+        for x in items:
+            ts = int(x.get("fundingTime", 0))
+            rate = float(x.get("fundingRate", 0)) * 100
+            if ts >= start_ms:
+                filtered.append((ts, rate))
+
+        if not filtered:
+            return [], f"Нет данных за период (символ: {sym}, всего: {len(items)})"
+
+        return filtered, sym
+
+    except Exception as e:
+        last_err = str(e)
+
+    return [], last_err
+
 # ─────────────────────────────────────────────
 # УНИВЕРСАЛЬНЫЙ АНАЛИЗ
 # ─────────────────────────────────────────────
@@ -273,6 +334,7 @@ EXCHANGE_FETCHERS = {
     "xt":     xt_fetch,
     "toobit": toobit_fetch,
     "okx": okx_fetch,
+    "bingx": bingx_fetch,
 }
 
 EXCHANGE_LABELS = {
@@ -280,6 +342,7 @@ EXCHANGE_LABELS = {
     "xt":     "XT",
     "toobit": "Toobit",
     "okx": "OKX",
+    "bingx": "BingX",
 }
 
 
