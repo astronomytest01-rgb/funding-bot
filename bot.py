@@ -1037,6 +1037,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/toggle xt — вкл/выкл биржу\n"
         "/toggle none — выключить все биржи\n"
         "/toggle all — включить все биржи\n"
+        "/scan — полный скан всех монет Phemex\n"
+        "/stopscan — остановить скан\n"
         "/delta — дельта-нейтраль: лонг+шорт связка\n"
         "/deltacalc — калькулятор дохода по связке\n"
         "/settings — настройки фильтров\n"
@@ -1138,6 +1140,173 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Не знаю такой команды. Напиши /help.")
 
+
+
+
+# ─────────────────────────────────────────────
+# PHEMEX SCAN — полный скан всех контрактов
+# ─────────────────────────────────────────────
+
+# Флаг для остановки скана (per chat_id)
+_scan_running = {}   # {chat_id: True/False}
+SCAN_DAYS     = 3    # период скана всегда 3 дня
+SCAN_BATCH    = 20   # размер порции
+
+
+def phemex_get_all_symbols():
+    """Получает список всех USDT-маржинальных перпетуалов с Phemex.
+    Возвращает список строк-монет: ['BTC', 'ETH', 'ENJ', ...]
+    """
+    url = "https://api.phemex.com/public/products"
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    products = data.get("data", {}).get("products", [])
+    coins = []
+    for p in products:
+        if p.get("type") == "Perpetual" and p.get("status") == "Listed":
+            sym = p.get("symbol", "")
+            # BTCUSD -> BTC, ETHUSD -> ETH
+            if sym.endswith("USD"):
+                coin = sym[:-3]
+                if coin:
+                    coins.append(coin)
+    return coins
+
+
+async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запускает полный скан всех монет Phemex под фильтры."""
+    chat_id = update.effective_chat.id
+
+    # Если скан уже идёт — сообщаем
+    if _scan_running.get(chat_id):
+        await update.message.reply_text(
+            "⏳ Скан уже запущен. Чтобы остановить — /stopscan",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Получаем список монет
+    await update.message.reply_text("🔍 Загружаю список монет с Phemex...")
+    try:
+        all_coins = phemex_get_all_symbols()
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка получения списка: {e}")
+        return
+
+    total = len(all_coins)
+    await update.message.reply_text(
+        f"📋 Найдено *{total}* контрактов на Phemex\n"
+        f"Период: *{SCAN_DAYS} дня* | Порции: *{SCAN_BATCH}* монет\n"
+        f"Фильтры: neg\_avg ≤ {NEG_AVG_THRESHOLD}% | выбросов ≤ {MAX_OUTLIER_PCT}%\n\n"
+        f"Остановить: /stopscan",
+        parse_mode="Markdown"
+    )
+
+    _scan_running[chat_id] = True
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - SCAN_DAYS * 24 * 60 * 60 * 1000
+
+    passed_full    = []  # ✅ стабильность
+    passed_partial = []  # ⚡ только neg avg
+
+    batches = [all_coins[i:i+SCAN_BATCH] for i in range(0, total, SCAN_BATCH)]
+
+    for batch_idx, batch in enumerate(batches):
+        # Проверяем флаг остановки перед каждой порцией
+        if not _scan_running.get(chat_id):
+            await update.message.reply_text(
+                f"⛔ Скан остановлен на порции {batch_idx + 1}/{len(batches)}\n"
+                f"Проанализировано: {batch_idx * SCAN_BATCH}/{total} монет",
+                parse_mode="Markdown"
+            )
+            return
+
+        # Анализируем порцию
+        batch_results = []
+        for coin in batch:
+            if not _scan_running.get(chat_id):
+                break
+            rows, sym = phemex_fetch(coin, start_ms, now_ms)
+            if not rows:
+                continue
+            rates = [r for _, r in rows]
+            total_rates = len(rates)
+            if not total_rates:
+                continue
+            neg = [r for r in rates if r < 0]
+            below = sum(1 for r in rates if r <= STABILITY_THRESHOLD)
+            outlier_pct = (total_rates - below) / total_rates * 100
+            pass_stability = outlier_pct <= MAX_OUTLIER_PCT
+            neg_avg = sum(neg) / len(neg) if neg else 0.0
+            pass_neg_avg = bool(neg) and neg_avg <= NEG_AVG_THRESHOLD
+
+            if pass_stability:
+                batch_results.append(("full", coin, neg_avg, outlier_pct))
+                passed_full.append((coin, neg_avg, outlier_pct))
+            elif pass_neg_avg:
+                batch_results.append(("partial", coin, neg_avg, outlier_pct))
+                passed_partial.append((coin, neg_avg, outlier_pct))
+
+            time.sleep(0.15)
+
+        # Прогресс после каждой порции
+        scanned = min((batch_idx + 1) * SCAN_BATCH, total)
+        remaining = total - scanned
+        found_so_far = len(passed_full) + len(passed_partial)
+
+        if batch_results:
+            lines = [
+                f"📊 Порция {batch_idx + 1}/{len(batches)} "
+                f"\[{scanned}/{total} | осталось {remaining}\]\n"
+            ]
+            for cat, coin, na, op in batch_results:
+                icon = "✅" if cat == "full" else "⚡"
+                lines.append(f"{icon} `{coin}` neg\_avg `{na:+.4f}%` выбр `{op:.0f}%`")
+            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        else:
+            # Тихий прогресс без результатов (каждые 3 порции или последняя)
+            if batch_idx % 3 == 2 or batch_idx == len(batches) - 1:
+                await update.message.reply_text(
+                    f"⏳ {scanned}/{total} проанализировано, найдено: {found_so_far} | осталось {remaining}"
+                )
+
+    _scan_running[chat_id] = False
+
+    # Итоговый отчёт
+    if not passed_full and not passed_partial:
+        await update.message.reply_text(
+            f"✅ Скан завершён: {total} монет\n\n"
+            f"За {SCAN_DAYS} дня ни одна монета не прошла фильтры.",
+            parse_mode="Markdown"
+        )
+        return
+
+    lines = [f"✅ *Скан завершён* — {total} монет за {SCAN_DAYS} дня\n"]
+
+    if passed_full:
+        passed_full.sort(key=lambda x: x[1])  # по neg_avg
+        lines.append(f"✅ *ПОДХОДЯТ* ({len(passed_full)}):")
+        for coin, na, op in passed_full:
+            lines.append(f"  `{coin}` neg\_avg `{na:+.4f}%` выбр `{op:.0f}%`")
+
+    if passed_partial:
+        passed_partial.sort(key=lambda x: x[1])
+        lines.append(f"\n⚡ *ЧАСТИЧНО* ({len(passed_partial)}):")
+        for coin, na, op in passed_partial:
+            lines.append(f"  `{coin}` neg\_avg `{na:+.4f}%` выбр `{op:.0f}%`")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_stopscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Останавливает текущий скан."""
+    chat_id = update.effective_chat.id
+    if _scan_running.get(chat_id):
+        _scan_running[chat_id] = False
+        await update.message.reply_text("⛔ Скан будет остановлен после текущей монеты.")
+    else:
+        await update.message.reply_text("Скан не запущен.")
 
 
 # ─────────────────────────────────────────────
@@ -1468,6 +1637,8 @@ def main():
     app.add_handler(CommandHandler("settings",  cmd_settings))
     app.add_handler(CommandHandler("exchanges", cmd_exchanges))
     app.add_handler(CommandHandler("toggle",    cmd_toggle))
+    app.add_handler(CommandHandler("scan",      cmd_scan))
+    app.add_handler(CommandHandler("stopscan",  cmd_stopscan))
 
     delta_conv = ConversationHandler(
         entry_points=[CommandHandler("delta", delta_start)],
