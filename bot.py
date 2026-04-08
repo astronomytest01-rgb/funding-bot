@@ -47,6 +47,8 @@ EXCHANGES_ENABLED = {
 WAIT_ANALYZE_COINS = 1
 WAIT_SHOW_COIN     = 3
 WAIT_CALC_COIN     = 5
+WAIT_DELTA_COIN    = 7
+WAIT_DELTACALC     = 9
 
 # ─────────────────────────────────────────────
 # PHEMEX API
@@ -1033,6 +1035,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/calc — калькулятор дохода\n"
         "/exchanges — статус и управление биржами\n"
         "/toggle xt — вкл/выкл биржу\n"
+        "/delta — дельта-нейтраль: лонг+шорт связка\n"
+        "/deltacalc — калькулятор дохода по связке\n"
         "/settings — настройки фильтров\n"
         "/help — справка\n\n"
         "Параметры (можно добавлять к любой команде):\n"
@@ -1067,18 +1071,26 @@ async def cmd_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not args:
         await update.message.reply_text(
-            "Укажи биржу: `/toggle xt` или `/toggle phemex okx` или `/toggle all`",
+            "Укажи биржу: `/toggle xt` или `/toggle phemex okx`\n`/toggle all` — включить все\n`/toggle none` — выключить все",
             parse_mode="Markdown"
         )
         return
 
     if "all" in args:
-        # Включить все
         for ex in EXCHANGES_ENABLED:
             EXCHANGES_ENABLED[ex] = True
         active = [EXCHANGE_LABELS.get(e, e) for e in EXCHANGES_ENABLED]
         await update.message.reply_text(
             f"✅ Все биржи включены: `{', '.join(active)}`",
+            parse_mode="Markdown"
+        )
+        return
+
+    if "none" in args:
+        for ex in EXCHANGES_ENABLED:
+            EXCHANGES_ENABLED[ex] = False
+        await update.message.reply_text(
+            "❌ Все биржи выключены. Включи нужные: `/toggle phemex xt`",
             parse_mode="Markdown"
         )
         return
@@ -1124,6 +1136,290 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Не знаю такой команды. Напиши /help.")
 
 
+
+# ─────────────────────────────────────────────
+# DELTA-NEUTRAL: поиск лучшей связки лонг/шорт
+# ─────────────────────────────────────────────
+
+def calc_std(rates):
+    """Стандартное отклонение списка ставок."""
+    if not rates:
+        return 0.0
+    n = len(rates)
+    mean = sum(rates) / n
+    return (sum((r - mean) ** 2 for r in rates) / n) ** 0.5
+
+
+def analyze_delta(coin, days, long_exchanges=None, all_exchanges=None):
+    """
+    Ищет лучшую дельта-нейтральную связку для монеты.
+
+    Логика:
+    1. Проверяем каждую биржу как кандидата для ЛОНГА:
+       монета должна проходить фильтры (стабильно отриц. фандинг).
+    2. Для каждого лонга перебираем остальные биржи как кандидаты для ШОРТА:
+       - Считаем средний фандинг шорта и его стабильность (std)
+       - Чистый доход = avg_long_rate + avg_short_rate (оба в %)
+         (long_rate отрицательный → мы получаем; short_rate положит → получаем, отриц → платим)
+       - Стабильность связки = std_long + std_short (меньше = лучше)
+    3. Сортируем: сначала по чистому доходу (больше = лучше),
+       при равенстве — по стабильности (меньше std = лучше).
+    """
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - days * 24 * 60 * 60 * 1000
+
+    if all_exchanges is None:
+        all_exchanges = [e for e, on in EXCHANGES_ENABLED.items() if on]
+    if long_exchanges is None:
+        long_exchanges = all_exchanges
+
+    # Собираем данные по всем биржам
+    exchange_data = {}
+    for ex in all_exchanges:
+        fetcher = EXCHANGE_FETCHERS.get(ex)
+        if not fetcher:
+            continue
+        try:
+            data, sym = fetcher(coin, start_ms, now_ms)
+            if data:
+                rates = [r for _, r in data]
+                exchange_data[ex] = {"rates": rates, "sym": sym}
+        except Exception:
+            pass
+        time.sleep(0.1)
+
+    # Ищем лонг-кандидатов (проходят наши фильтры)
+    long_candidates = []
+    for ex in long_exchanges:
+        if ex not in exchange_data:
+            continue
+        rates = exchange_data[ex]["rates"]
+        neg = [r for r in rates if r < 0]
+        total = len(rates)
+        below = sum(1 for r in rates if r <= STABILITY_THRESHOLD)
+        outlier_pct = (total - below) / total * 100 if total else 100
+        neg_avg = sum(neg) / len(neg) if neg else 0.0
+        pass_stability = outlier_pct <= MAX_OUTLIER_PCT
+        pass_neg_avg = bool(neg) and neg_avg <= NEG_AVG_THRESHOLD
+
+        if pass_stability or pass_neg_avg:
+            long_candidates.append({
+                "exchange": ex,
+                "rates": rates,
+                "avg": sum(rates) / total if total else 0,
+                "neg_avg": neg_avg,
+                "std": calc_std(rates),
+                "outlier_pct": outlier_pct,
+                "pass_stability": pass_stability,
+                "pass_neg_avg": pass_neg_avg,
+            })
+
+    if not long_candidates:
+        return None, exchange_data
+
+    # Для каждого лонга ищем лучший шорт
+    best_pairs = []
+
+    for long_info in long_candidates:
+        long_ex = long_info["exchange"]
+        long_avg = long_info["avg"]  # отрицательный → мы ПОЛУЧАЕМ abs(avg)
+
+        short_candidates = []
+        for ex in all_exchanges:
+            if ex == long_ex:
+                continue
+            if ex not in exchange_data:
+                continue
+            rates = exchange_data[ex]["rates"]
+            total = len(rates)
+            if not total:
+                continue
+            avg = sum(rates) / total
+            std = calc_std(rates)
+
+            # Чистый доход на шорте:
+            # если avg > 0 (положительный фандинг) → шорт ПОЛУЧАЕТ avg
+            # если avg < 0 (отрицательный фандинг) → шорт ПЛАТИТ abs(avg)
+            # Итого за период: long получает abs(long_avg), шорт получает avg_short
+            # net_income_pct = abs(long_avg) + avg_short
+            net_income_pct = abs(long_avg) + avg  # avg шорта: + = хорошо, - = плохо
+
+            short_candidates.append({
+                "exchange": ex,
+                "avg": avg,
+                "std": std,
+                "net_income_pct": net_income_pct,
+                "rates": rates,
+            })
+
+        # Сортируем шорт-кандидатов: больший net_income, затем меньший std
+        short_candidates.sort(key=lambda x: (-x["net_income_pct"], x["std"]))
+
+        for short_info in short_candidates[:3]:  # топ-3 варианта шорта
+            best_pairs.append({
+                "long_ex": long_ex,
+                "short_ex": short_info["exchange"],
+                "long_avg": long_avg,
+                "long_std": long_info["std"],
+                "long_neg_avg": long_info["neg_avg"],
+                "long_outlier_pct": long_info["outlier_pct"],
+                "short_avg": short_info["avg"],
+                "short_std": short_info["std"],
+                "net_income_pct": short_info["net_income_pct"],
+                "pass_stability": long_info["pass_stability"],
+                "pass_neg_avg": long_info["pass_neg_avg"],
+            })
+
+    # Финальная сортировка всех пар
+    best_pairs.sort(key=lambda x: (-x["net_income_pct"], x["long_std"] + x["short_std"]))
+    return best_pairs, exchange_data
+
+
+def fmt_delta_result(coin, pairs, days, amount_usd=None):
+    """Форматирует результат дельта-анализа."""
+    if not pairs:
+        return f"⚠️ *{coin}* — не найдено подходящих бирж для лонга за {days} дней"
+
+    lines = [f"⚖️ *Дельта-нейтраль: {coin}* — {days} дней\n"]
+
+    # Показываем топ-3 пары
+    for i, p in enumerate(pairs[:3], 1):
+        long_label = EXCHANGE_LABELS.get(p["long_ex"], p["long_ex"].upper())
+        short_label = EXCHANGE_LABELS.get(p["short_ex"], p["short_ex"].upper())
+
+        # Иконка стабильности лонга
+        long_cat = "✅" if p["pass_stability"] else "⚡"
+
+        # Знак для шорта: + если зарабатываем на шорте, - если платим
+        short_sign = "+" if p["short_avg"] >= 0 else ""
+
+        lines.append(f"*#{i}* 🟢 Лонг `{long_label}` + 🔴 Шорт `{short_label}`")
+        lines.append(
+            f"  Лонг {long_cat}: avg `{p['long_avg']:+.4f}%`  std `{p['long_std']:.4f}`"
+        )
+        lines.append(
+            f"  Шорт: avg `{p['short_avg']:+.4f}%`  std `{p['short_std']:.4f}`"
+        )
+        lines.append(
+            f"  📈 Чистый доход/ставку: `{p['net_income_pct']:+.4f}%`"
+        )
+
+        if amount_usd:
+            # Считаем реальный доход за период
+            # Количество ставок примерно = days * 24 / interval_h (обычно 8ч = 3 в день)
+            approx_payments = days * 3
+            income_long = amount_usd * abs(p["long_avg"] / 100) * approx_payments
+            income_short = amount_usd * (p["short_avg"] / 100) * approx_payments
+            net = income_long + income_short
+            lines.append(
+                f"  💰 ~${income_long:.2f} (лонг) {'+' if income_short >= 0 else ''}"
+                f"${income_short:.2f} (шорт) = *${net:.2f}* за {days}д"
+            )
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────
+# DELTA CONVERSATION HANDLERS
+# ─────────────────────────────────────────────
+
+async def delta_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args:
+        coins, days, exchange = parse_tokens(" ".join(context.args))
+        if coins:
+            await do_delta(update, coins, days)
+            return ConversationHandler.END
+    await update.message.reply_text(
+        "Введи монеты для дельта-анализа:\n\n"
+        "`ENJ`\n"
+        "`ENJ JTO RON`\n"
+        "`ENJ /days 14`\n\n"
+        "Отмена: /cancel",
+        parse_mode="Markdown"
+    )
+    return WAIT_DELTA_COIN
+
+
+async def delta_got_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    coins, days, _ = parse_tokens(update.message.text.strip())
+    if not coins:
+        await update.message.reply_text("Не распознал монеты. Попробуй: `ENJ JTO`", parse_mode="Markdown")
+        return WAIT_DELTA_COIN
+    await do_delta(update, coins, days)
+    return ConversationHandler.END
+
+
+async def deltacalc_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args:
+        coins, days, _ = parse_tokens(" ".join(context.args))
+        amount = None
+        remaining = []
+        for p in coins:
+            try:
+                amount = float(p.replace("$", "").replace(",", ""))
+            except ValueError:
+                remaining.append(p)
+        if remaining and amount:
+            await do_delta(update, remaining, days, amount_usd=amount)
+            return ConversationHandler.END
+    await update.message.reply_text(
+        "Введи монету и сумму позиции:\n\n"
+        "`ENJ 25000`\n"
+        "`ENJ 25000 /days 14`\n\n"
+        "Отмена: /cancel",
+        parse_mode="Markdown"
+    )
+    return WAIT_DELTACALC
+
+
+async def deltacalc_got_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    coins, days, _ = parse_tokens(update.message.text.strip())
+    amount = None
+    remaining = []
+    for p in coins:
+        try:
+            amount = float(p.replace("$", "").replace(",", ""))
+        except ValueError:
+            remaining.append(p)
+    if not remaining:
+        await update.message.reply_text("Не распознал монету. Попробуй: `ENJ 25000`", parse_mode="Markdown")
+        return WAIT_DELTACALC
+    if not amount or amount <= 0:
+        await update.message.reply_text("Не распознал сумму. Попробуй: `ENJ 25000`", parse_mode="Markdown")
+        return WAIT_DELTACALC
+    await do_delta(update, remaining, days, amount_usd=amount)
+    return ConversationHandler.END
+
+
+async def do_delta(update, coins, days, amount_usd=None):
+    active = [e for e, on in EXCHANGES_ENABLED.items() if on]
+    if len(active) < 2:
+        await update.message.reply_text(
+            "❌ Нужно минимум 2 активные биржи для дельта-анализа.\n"
+            "Включи биржи: `/toggle all`",
+            parse_mode="Markdown"
+        )
+        return
+
+    ex_str = " + ".join(EXCHANGE_LABELS.get(e, e) for e in active)
+    suffix = f" | сумма ${amount_usd:,.0f}" if amount_usd else ""
+    await update.message.reply_text(
+        f"⚖️ Дельта-анализ {len(coins)} монет на {ex_str} за {days} дней{suffix}...",
+    )
+
+    for coin in coins:
+        pairs, _ = analyze_delta(coin, days, all_exchanges=active)
+        reply = fmt_delta_result(coin, pairs, days, amount_usd)
+
+        # Нарезаем если длинное
+        if len(reply) > 4000:
+            for chunk in [reply[i:i+4000] for i in range(0, len(reply), 4000)]:
+                await update.message.reply_text(chunk, parse_mode="Markdown")
+        else:
+            await update.message.reply_text(reply, parse_mode="Markdown")
+
+
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
@@ -1155,6 +1451,19 @@ def main():
     app.add_handler(CommandHandler("settings",  cmd_settings))
     app.add_handler(CommandHandler("exchanges", cmd_exchanges))
     app.add_handler(CommandHandler("toggle",    cmd_toggle))
+
+    delta_conv = ConversationHandler(
+        entry_points=[CommandHandler("delta", delta_start)],
+        states={WAIT_DELTA_COIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, delta_got_coins)]},
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+    )
+    deltacalc_conv = ConversationHandler(
+        entry_points=[CommandHandler("deltacalc", deltacalc_start)],
+        states={WAIT_DELTACALC: [MessageHandler(filters.TEXT & ~filters.COMMAND, deltacalc_got_input)]},
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+    )
+    app.add_handler(delta_conv)
+    app.add_handler(deltacalc_conv)
     app.add_handler(CommandHandler("cancel",    cmd_cancel))
     app.add_handler(analyze_conv)
     app.add_handler(show_conv)
