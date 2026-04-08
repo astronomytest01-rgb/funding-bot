@@ -1149,7 +1149,7 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Флаг для остановки скана (per chat_id)
 _scan_running = {}   # {chat_id: True/False}
-SCAN_DAYS     = 3    # период скана всегда 3 дня
+SCAN_DAYS     = 7    # период скана
 SCAN_BATCH    = 20   # размер порции
 
 
