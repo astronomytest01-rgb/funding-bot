@@ -1155,22 +1155,27 @@ SCAN_BATCH    = 20   # размер порции
 
 def phemex_get_all_symbols():
     """Получает список всех USDT-маржинальных перпетуалов с Phemex.
+    Использует /exchange/public/cfg/v2/products — там 526 Listed USDT контрактов.
     Возвращает список строк-монет: ['BTC', 'ETH', 'ENJ', ...]
     """
-    url = "https://api.phemex.com/public/products"
+    url = "https://api.phemex.com/exchange/public/cfg/v2/products"
     r = requests.get(url, timeout=15)
     r.raise_for_status()
     data = r.json()
     products = data.get("data", {}).get("products", [])
     coins = []
+    seen = set()
     for p in products:
-        if p.get("type") == "Perpetual" and p.get("status") == "Listed":
+        if (p.get("type") == "PerpetualV2"
+                and p.get("quoteCurrency") == "USDT"
+                and p.get("status") == "Listed"):
             sym = p.get("symbol", "")
-            # BTCUSD -> BTC, ETHUSD -> ETH
-            if sym.endswith("USD"):
-                coin = sym[:-3]
-                if coin:
+            # BTCUSDT -> BTC, ENJUSDT -> ENJ
+            if sym.endswith("USDT"):
+                coin = sym[:-4]
+                if coin and coin not in seen:
                     coins.append(coin)
+                    seen.add(coin)
     return coins
 
 
