@@ -1043,6 +1043,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/toggle all — включить все биржи\n"
         "/scan — полный скан всех монет Phemex\n"
         "/stopscan — остановить скан\n"
+        "/scankucoin — скан всех монет KuCoin\n"
+        "/scanxt — скан всех монет XT\n"
+        "/scantoobit — скан всех монет Toobit\n"
         "/delta — дельта-нейтраль: лонг+шорт связка\n"
         "/deltacalc — калькулятор дохода по связке\n"
         "/settings — настройки фильтров\n"
@@ -1316,6 +1319,138 @@ async def cmd_stopscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Скан будет остановлен после текущей монеты.")
     else:
         await update.message.reply_text("Скан не запущен.")
+
+# ─────────────────────────────────────────────
+# СКАНЕРЫ ПО БИРЖАМ (только ✅ ПОДХОДЯТ)
+# ─────────────────────────────────────────────
+
+async def run_exchange_scan(update, exchange_key, chat_id):
+    """
+    Универсальная функция скана по одной бирже.
+    Берёт список монет с Phemex (526 шт), проверяет каждую на указанной бирже.
+    Показывает только ✅ ПОДХОДЯТ (pass_stability), частично — нет.
+    """
+    if _scan_running.get(chat_id):
+        await update.message.reply_text(
+            "⏳ Скан уже запущен. Чтобы остановить — /stopscan"
+        )
+        return
+
+    label    = EXCHANGE_LABELS.get(exchange_key, exchange_key.upper())
+    fetcher  = EXCHANGE_FETCHERS.get(exchange_key)
+    if not fetcher:
+        await update.message.reply_text(f"❌ Биржа `{exchange_key}` не найдена.", parse_mode="Markdown")
+        return
+
+    await update.message.reply_text(f"🔍 Загружаю список монет с Phemex...")
+    try:
+        all_coins = phemex_get_all_symbols()
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка получения списка: {e}")
+        return
+
+    total = len(all_coins)
+    await update.message.reply_text(
+        f"📋 Скан *{label}* — {total} монет\n"
+        f"Период: *{SCAN_DAYS} дней* | Порции: *{SCAN_BATCH}* монет\n"
+        f"Только ✅ ПОДХОДЯТ (выбросов ≤ {MAX_OUTLIER_PCT}%)\n\n"
+        "Остановить: /stopscan",
+        parse_mode="Markdown"
+    )
+
+    _scan_running[chat_id] = True
+    now_ms   = int(time.time() * 1000)
+    start_ms = now_ms - SCAN_DAYS * 24 * 60 * 60 * 1000
+
+    passed = []
+    batches = [all_coins[i:i+SCAN_BATCH] for i in range(0, total, SCAN_BATCH)]
+
+    for batch_idx, batch in enumerate(batches):
+        if not _scan_running.get(chat_id):
+            await update.message.reply_text(
+                f"⛔ Скан остановлен на порции {batch_idx + 1}/{len(batches)}\n"
+                f"Проанализировано: {batch_idx * SCAN_BATCH}/{total} монет"
+            )
+            return
+
+        batch_results = []
+        for coin in batch:
+            if not _scan_running.get(chat_id):
+                break
+            try:
+                rows, sym = fetcher(coin, start_ms, now_ms)
+            except Exception:
+                rows = []
+            if not rows:
+                continue
+
+            rates      = [r for _, r in rows]
+            total_r    = len(rates)
+            below      = sum(1 for r in rates if r <= STABILITY_THRESHOLD)
+            outlier    = (total_r - below) / total_r * 100
+            neg        = [r for r in rates if r < 0]
+            neg_avg    = sum(neg) / len(neg) if neg else 0.0
+
+            # Только полное прохождение фильтров
+            if outlier <= MAX_OUTLIER_PCT:
+                batch_results.append((coin, neg_avg, outlier))
+                passed.append((coin, neg_avg, outlier))
+
+            time.sleep(0.15)
+
+        scanned    = min((batch_idx + 1) * SCAN_BATCH, total)
+        remaining  = total - scanned
+
+        if batch_results:
+            lines = [
+                f"📊 Порция {batch_idx + 1}/{len(batches)} "
+                f"[{scanned}/{total} | осталось {remaining}]\n"
+            ]
+            for coin, na, op in batch_results:
+                lines.append(f"✅ `{coin}` neg\_avg `{na:+.4f}%` выбр `{op:.0f}%`")
+            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        else:
+            if batch_idx % 3 == 2 or batch_idx == len(batches) - 1:
+                await update.message.reply_text(
+                    f"⏳ {scanned}/{total} | найдено: {len(passed)} | осталось {remaining}"
+                )
+
+    _scan_running[chat_id] = False
+
+    if not passed:
+        await update.message.reply_text(
+            f"✅ Скан {label} завершён: {total} монет\n\n"
+            f"За {SCAN_DAYS} дней ни одна монета не прошла фильтры.",
+            parse_mode="Markdown"
+        )
+        return
+
+    passed.sort(key=lambda x: x[1])
+    lines = [f"✅ *Скан {label} завершён* — {total} монет за {SCAN_DAYS} дней\n"]
+    lines.append(f"✅ *ПОДХОДЯТ* ({len(passed)}):")
+    for coin, na, op in passed:
+        lines.append(f"  `{coin}` neg\_avg `{na:+.4f}%` выбр `{op:.0f}%`")
+
+    reply = "\n".join(lines)
+    if len(reply) > 4000:
+        for chunk in [reply[i:i+4000] for i in range(0, len(reply), 4000)]:
+            await update.message.reply_text(chunk, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(reply, parse_mode="Markdown")
+
+
+async def cmd_scan_kucoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await run_exchange_scan(update, "kucoin", update.effective_chat.id)
+
+
+async def cmd_scan_xt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await run_exchange_scan(update, "xt", update.effective_chat.id)
+
+
+async def cmd_scan_toobit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await run_exchange_scan(update, "toobit", update.effective_chat.id)
+
+
 
 
 # ─────────────────────────────────────────────
@@ -1647,7 +1782,10 @@ def main():
     app.add_handler(CommandHandler("exchanges", cmd_exchanges))
     app.add_handler(CommandHandler("toggle",    cmd_toggle))
     app.add_handler(CommandHandler("scan",      cmd_scan))
-    app.add_handler(CommandHandler("stopscan",  cmd_stopscan))
+    app.add_handler(CommandHandler("stopscan",   cmd_stopscan))
+    app.add_handler(CommandHandler("scankucoin", cmd_scan_kucoin))
+    app.add_handler(CommandHandler("scanxt",     cmd_scan_xt))
+    app.add_handler(CommandHandler("scantoobit", cmd_scan_toobit))
     app.add_handler(CommandHandler("cancel",    cmd_cancel))
 
     delta_conv = ConversationHandler(
