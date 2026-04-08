@@ -1644,6 +1644,7 @@ def main():
     app.add_handler(CommandHandler("toggle",    cmd_toggle))
     app.add_handler(CommandHandler("scan",      cmd_scan))
     app.add_handler(CommandHandler("stopscan",  cmd_stopscan))
+    app.add_handler(CommandHandler("cancel",    cmd_cancel))
 
     delta_conv = ConversationHandler(
         entry_points=[CommandHandler("delta", delta_start)],
@@ -1655,12 +1656,14 @@ def main():
         states={WAIT_DELTACALC: [MessageHandler(filters.TEXT & ~filters.COMMAND, deltacalc_got_input)]},
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
-    app.add_handler(delta_conv)
-    app.add_handler(deltacalc_conv)
-    app.add_handler(CommandHandler("cancel",    cmd_cancel))
+
+    # ConversationHandlers — должны быть зарегистрированы до MessageHandler(unknown)
     app.add_handler(analyze_conv)
     app.add_handler(show_conv)
     app.add_handler(calc_conv)
+    app.add_handler(delta_conv)
+    app.add_handler(deltacalc_conv)
+
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
     print("Бот запущен...")
