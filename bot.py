@@ -1035,6 +1035,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/calc — калькулятор дохода\n"
         "/exchanges — статус и управление биржами\n"
         "/toggle xt — вкл/выкл биржу\n"
+        "/toggle none — выключить все биржи\n"
+        "/toggle all — включить все биржи\n"
         "/delta — дельта-нейтраль: лонг+шорт связка\n"
         "/deltacalc — калькулятор дохода по связке\n"
         "/settings — настройки фильтров\n"
@@ -1058,10 +1060,11 @@ async def cmd_exchanges(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label = EXCHANGE_LABELS.get(ex, ex.upper())
         status = "✅" if enabled else "❌"
         lines.append(f"{status} `{label}` (`{ex}`)")
-    lines.append("\n*Включить/выключить:*")
-    lines.append("`/toggle phemex` — переключить Phemex")
+    lines.append("\n*Управление:*")
+    lines.append("`/toggle phemex` — вкл/выкл Phemex")
     lines.append("`/toggle xt okx` — несколько сразу")
     lines.append("`/toggle all` — включить все")
+    lines.append("`/toggle none` — выключить все")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -1306,14 +1309,27 @@ def fmt_delta_result(coin, pairs, days, amount_usd=None):
 
         if amount_usd:
             # Считаем реальный доход за период
-            # Количество ставок примерно = days * 24 / interval_h (обычно 8ч = 3 в день)
+            # Количество ставок примерно = days * 3 (обычно 3 ставки/день при 8ч интервале)
             approx_payments = days * 3
             income_long = amount_usd * abs(p["long_avg"] / 100) * approx_payments
             income_short = amount_usd * (p["short_avg"] / 100) * approx_payments
             net = income_long + income_short
+            net_per_day = net / days if days > 0 else 0
+            income_long_day = income_long / days if days > 0 else 0
+            income_short_day = income_short / days if days > 0 else 0
+            short_str = (f"+${income_short:.2f}" if income_short >= 0 else f"-${abs(income_short):.2f}")
+            short_day_str = (f"+${income_short_day:.2f}" if income_short_day >= 0 else f"-${abs(income_short_day):.2f}")
             lines.append(
-                f"  💰 ~${income_long:.2f} (лонг) {'+' if income_short >= 0 else ''}"
-                f"${income_short:.2f} (шорт) = *${net:.2f}* за {days}д"
+                f"  💰 *За {days} дней:*"
+            )
+            lines.append(
+                f"  Лонг: `+${income_long:.2f}`  Шорт: `{short_str}`"
+            )
+            lines.append(
+                f"  Итого: *${net:.2f}*"
+            )
+            lines.append(
+                f"  📅 *В день:* лонг `+${income_long_day:.2f}` шорт `{short_day_str}` итого `${net_per_day:.2f}`"
             )
         lines.append("")
 
@@ -1332,9 +1348,9 @@ async def delta_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
     await update.message.reply_text(
         "Введи монеты для дельта-анализа:\n\n"
-        "`ENJ`\n"
-        "`ENJ JTO RON`\n"
-        "`ENJ /days 14`\n\n"
+        "`ENJ` — за 7 дней (по умолчанию)\n"
+        "`ENJ JTO RON` — несколько монет\n"
+        "`ENJ /days 14` — за 14 дней\n\n"
         "Отмена: /cancel",
         parse_mode="Markdown"
     )
@@ -1364,9 +1380,10 @@ async def deltacalc_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await do_delta(update, remaining, days, amount_usd=amount)
             return ConversationHandler.END
     await update.message.reply_text(
-        "Введи монету и сумму позиции:\n\n"
-        "`ENJ 25000`\n"
-        "`ENJ 25000 /days 14`\n\n"
+        "Введи монету, сумму и (опционально) период:\n\n"
+        "`ENJ 25000` — за 7 дней (по умолчанию)\n"
+        "`ENJ 25000 /days 14` — за 14 дней\n"
+        "`ENJ JTO 25000 /days 30` — несколько монет\n\n"
         "Отмена: /cancel",
         parse_mode="Markdown"
     )
