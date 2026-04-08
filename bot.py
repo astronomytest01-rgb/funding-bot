@@ -67,13 +67,17 @@ def phemex_fetch(coin, start_ms, end_ms):
     for sym in candidates:
         try:
             url = "https://api.phemex.com/api-data/public/data/funding-rate-history"
-            params = {"symbol": sym, "end": end_ms, "limit": 1000}
+            params = {"symbol": sym, "start": start_ms, "end": end_ms, "limit": 1000}
             r = requests.get(url, params=params, timeout=10)
             r.raise_for_status()
             data = r.json()
             if data.get("code") != 0:
                 raise ValueError(data.get("msg"))
-            rows = [x for x in data.get("data", {}).get("rows", []) if x["fundingTime"] >= start_ms]
+            rows = [
+                x for x in data.get("data", {}).get("rows", [])
+                if x["fundingTime"] >= start_ms
+                and abs(float(x["fundingRate"])) < 0.5  # фильтр аномалий > ±50%
+            ]
             if rows:
                 return [(x["fundingTime"], float(x["fundingRate"]) * 100) for x in rows], sym
         except Exception as e:
