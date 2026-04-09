@@ -1735,6 +1735,17 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass  # Если текст не изменился — игнорируем
 
 
+
+async def cmd_stopscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Останавливает текущий скан."""
+    chat_id = update.effective_chat.id
+    if _scan_running.get(chat_id):
+        _scan_running[chat_id] = False
+        await update.message.reply_text("⛔ Скан останавливается...")
+    else:
+        await update.message.reply_text("Нет активного скана.")
+
+
 # ─────────────────────────────────────────────
 # DELTA-NEUTRAL: поиск лучшей связки лонг/шорт
 # ─────────────────────────────────────────────
@@ -2051,7 +2062,7 @@ def main():
             ACF_DAYS_NUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, acf_days_num)],
             ACF_EXCH:     [CallbackQueryHandler(acf_exchange_btn, pattern="^acf_")],
         },
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        fallbacks=[CommandHandler("cancel", cmd_cancel)]
     )
     # /funding-rates
     fr_conv = ConversationHandler(
@@ -2062,7 +2073,7 @@ def main():
             FR_DAYS_NUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, fr_days_num)],
             FR_EXCH:     [CallbackQueryHandler(fr_exchange_btn, pattern="^fr_")],
         },
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        fallbacks=[CommandHandler("cancel", cmd_cancel)]
     )
     # /profit-calculator
     pc_conv = ConversationHandler(
@@ -2075,7 +2086,7 @@ def main():
             PC_DAYS_NUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, pc_days_num)],
             PC_EXCH:     [CallbackQueryHandler(pc_exchange_btn, pattern="^pc_")],
         },
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        fallbacks=[CommandHandler("cancel", cmd_cancel)]
     )
 
     app.add_handler(CommandHandler("start",     cmd_start))
