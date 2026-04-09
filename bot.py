@@ -22,6 +22,8 @@ DEFAULT_DAYS        = 7
 STABILITY_THRESHOLD = -0.04
 MAX_OUTLIER_PCT     = 25
 NEG_AVG_THRESHOLD   = -0.08
+MIN_NEG_RATIO       = 0.30   # минимум 30% ставок должны быть отрицательными для ЛОНГ
+MIN_POS_RATIO       = 0.30   # минимум 30% ставок должны быть положительными для ШОРТ
 
 # ── Биржи ─────────────────────────────────────
 # Включай/выключай биржи здесь (True/False)
@@ -95,7 +97,7 @@ def phemex_fetch(coin, start_ms, end_ms):
             rows = [
                 x for x in data.get("data", {}).get("rows", [])
                 if x["fundingTime"] >= start_ms
-                and abs(float(x["fundingRate"])) < 0.5  # фильтр аномалий > ±50%
+                and abs(float(x["fundingRate"])) < 0.01  # фильтр аномалий > ±1%
             ]
             if rows:
                 return [(x["fundingTime"], float(x["fundingRate"]) * 100) for x in rows], sym
@@ -637,18 +639,22 @@ def analyze_rates(rates_pct):
     avg   = sum(rates_pct) / total
 
     # ── LONG: стабильно отрицательные ────────────────────────────────────
-    below_neg    = sum(1 for r in rates_pct if r <= STABILITY_THRESHOLD)
+    # outlier = % ставок которые НЕ прошли порог (т.е. не достаточно отрицательные)
+    below_neg    = sum(1 for r in rates_pct if r <= STABILITY_THRESHOLD)  # <= -0.04%
     outlier_long = (total - below_neg) / total * 100
     neg_avg      = sum(neg) / len(neg) if neg else 0.0
+    neg_ratio    = len(neg) / total
     pass_stability_long = outlier_long <= MAX_OUTLIER_PCT
-    pass_neg_avg        = bool(neg) and neg_avg <= NEG_AVG_THRESHOLD
+    pass_neg_avg        = bool(neg) and neg_avg <= NEG_AVG_THRESHOLD and neg_ratio >= MIN_NEG_RATIO
 
     # ── SHORT: стабильно положительные ───────────────────────────────────
-    above_pos     = sum(1 for r in rates_pct if r >= -STABILITY_THRESHOLD)
+    # outlier = % ставок которые НЕ прошли порог (т.е. не достаточно положительные)
+    above_pos     = sum(1 for r in rates_pct if r >= -STABILITY_THRESHOLD)  # >= +0.04%
     outlier_short = (total - above_pos) / total * 100
     pos_avg       = sum(pos) / len(pos) if pos else 0.0
+    pos_ratio     = len(pos) / total
     pass_stability_short = outlier_short <= MAX_OUTLIER_PCT
-    pass_pos_avg         = bool(pos) and pos_avg >= -NEG_AVG_THRESHOLD
+    pass_pos_avg         = bool(pos) and pos_avg >= -NEG_AVG_THRESHOLD and pos_ratio >= MIN_POS_RATIO
 
     # Определяем категорию и направление
     if pass_stability_long:
@@ -836,14 +842,26 @@ def build_analyze_reply(all_results, days, active_exchanges):
 # DO-функции
 # ─────────────────────────────────────────────
 
-async def do_analyze(update, coins, days, exchange_arg):
-    active = get_active_exchanges(exchange_arg)
+async def do_analyze(update, coins, days, exchange_arg, selected_exchanges=None):
+    # Получаем reply функцию независимо от типа (Update или CallbackQuery)
+    if hasattr(update, 'message') and update.message:
+        reply_fn = update.message.reply_text
+    elif hasattr(update, 'reply_text'):
+        reply_fn = update.reply_text
+    else:
+        reply_fn = update.message.reply_text
+
+    # Если переданы выбранные биржи — используем их
+    if selected_exchanges:
+        active = [e for e in selected_exchanges if e in EXCHANGE_FETCHERS]
+    else:
+        active = get_active_exchanges(exchange_arg)
     if not active:
-        await update.message.reply_text("❌ Нет активных бирж. Проверь настройки EXCHANGES_ENABLED.")
+        await reply_fn("❌ Нет активных бирж. Проверь настройки EXCHANGES_ENABLED.")
         return
 
     ex_str = " + ".join(EXCHANGE_LABELS.get(e, e) for e in active)
-    await update.message.reply_text(f"🔍 Анализирую {len(coins)} монет на {ex_str} за {days} дней...")
+    await reply_fn(f"🔍 Анализирую {len(coins)} монет на {ex_str} за {days} дней...")
 
     now_ms = int(time.time() * 1000)
     start_ms = now_ms - days * 24 * 60 * 60 * 1000
@@ -857,9 +875,9 @@ async def do_analyze(update, coins, days, exchange_arg):
     if len(reply) > 4000:
         chunks = [reply[i:i+4000] for i in range(0, len(reply), 4000)]
         for chunk in chunks:
-            await update.message.reply_text(chunk, parse_mode="Markdown")
+            await reply_fn(chunk, parse_mode="Markdown")
     else:
-        await update.message.reply_text(reply, parse_mode="Markdown")
+        await reply_fn(reply, parse_mode="Markdown")
 
 
 async def do_show(update, coin, days, exchange_arg):
@@ -1290,10 +1308,10 @@ async def cmd_analyze_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             direction = r["direction"]
             key_avg   = r["neg_avg"] if direction == "LONG" else r["pos_avg"]
             outlier   = r["outlier_pct"]
+            category  = r["category"]  # "full" или "partial"
 
-            if outlier <= MAX_OUTLIER_PCT:
-                batch_results.append((coin, key_avg, outlier, direction))
-                passed.append((coin, key_avg, outlier, direction))
+            batch_results.append((coin, key_avg, outlier, direction, category))
+            passed.append((coin, key_avg, outlier, direction, category))
 
             time.sleep(0.15)
 
@@ -1302,9 +1320,10 @@ async def cmd_analyze_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
         if batch_results:
             lines = [f"📊 Порция {batch_idx+1}/{len(batches)} [{scanned}/{total} | осталось {remaining}]\n"]
-            for coin, na, op, direction in batch_results:
+            for coin, na, op, direction, cat in batch_results:
                 dir_icon = "🟢" if direction == "LONG" else "🔴"
-                lines.append(f"✅ {dir_icon} `{coin}` avg `{na:+.4f}%` выбр `{op:.0f}%`")
+                cat_icon = "✅" if cat == "full" else "⚡"
+                lines.append(f"{cat_icon} {dir_icon} `{coin}` avg `{na:+.4f}%` выбр `{op:.0f}%`")
             await q.message.reply_text("\n".join(lines), parse_mode="Markdown")
         else:
             if batch_idx % 3 == 2 or batch_idx == len(batches) - 1:
@@ -1324,15 +1343,26 @@ async def cmd_analyze_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     passed.sort(key=lambda x: x[1])
     lines = [f"✅ *Скан {label} завершён* — {total} монет за {SCAN_DAYS} дней\n"]
-    longs  = [(c, na, op) for c, na, op, d in passed if d == "LONG"]
-    shorts = [(c, na, op) for c, na, op, d in passed if d == "SHORT"]
-    if longs:
-        lines.append(f"🟢 *ЛОНГ* ({len(longs)}):")
-        for coin, na, op in sorted(longs, key=lambda x: x[1]):
+    full_longs  = [(c, na, op) for c, na, op, d, cat in passed if d == "LONG"  and cat == "full"]
+    full_shorts = [(c, na, op) for c, na, op, d, cat in passed if d == "SHORT" and cat == "full"]
+    part_longs  = [(c, na, op) for c, na, op, d, cat in passed if d == "LONG"  and cat == "partial"]
+    part_shorts = [(c, na, op) for c, na, op, d, cat in passed if d == "SHORT" and cat == "partial"]
+
+    if full_longs:
+        lines.append(f"✅ 🟢 *ЛОНГ — ПОДХОДЯТ* ({len(full_longs)}):")
+        for coin, na, op in sorted(full_longs, key=lambda x: x[1]):
             lines.append(f"  `{coin}` avg `{na:+.4f}%` выбр `{op:.0f}%`")
-    if shorts:
-        lines.append(f"\n🔴 *ШОРТ* ({len(shorts)}):")
-        for coin, na, op in sorted(shorts, key=lambda x: -x[1]):
+    if full_shorts:
+        lines.append(f"\n✅ 🔴 *ШОРТ — ПОДХОДЯТ* ({len(full_shorts)}):")
+        for coin, na, op in sorted(full_shorts, key=lambda x: -x[1]):
+            lines.append(f"  `{coin}` avg `{na:+.4f}%` выбр `{op:.0f}%`")
+    if part_longs:
+        lines.append(f"\n⚡ 🟢 *ЛОНГ — ЧАСТИЧНО* ({len(part_longs)}):")
+        for coin, na, op in sorted(part_longs, key=lambda x: x[1]):
+            lines.append(f"  `{coin}` avg `{na:+.4f}%` выбр `{op:.0f}%`")
+    if part_shorts:
+        lines.append(f"\n⚡ 🔴 *ШОРТ — ЧАСТИЧНО* ({len(part_shorts)}):")
+        for coin, na, op in sorted(part_shorts, key=lambda x: -x[1]):
             lines.append(f"  `{coin}` avg `{na:+.4f}%` выбр `{op:.0f}%`")
 
     reply = "\n".join(lines)
@@ -2085,7 +2115,6 @@ def fmt_delta_result(coin, pairs, days, amount_usd=None):
 
 async def do_delta(update, coins, days):
     """Запускает дельта-анализ для списка монет и отправляет результат."""
-    # Получаем объект message в зависимости от типа update
     msg = update.message if hasattr(update, 'message') and update.message else update
 
     if not coins:
@@ -2097,8 +2126,14 @@ async def do_delta(update, coins, days):
 
     for coin in coins:
         try:
-            pairs = analyze_delta(coin, days)
-            text  = fmt_delta_result(coin, pairs, days)
+            result = analyze_delta(coin, days)
+            # analyze_delta возвращает (pairs, exchange_data) или None
+            if isinstance(result, tuple):
+                pairs, _ = result
+            else:
+                pairs = result
+
+            text = fmt_delta_result(coin, pairs, days)
             if len(text) > 4000:
                 for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
                     await msg.reply_text(chunk, parse_mode="Markdown")
