@@ -1057,16 +1057,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/funding — ставки фандинга по монете\n"
         "/calculator — калькулятор дохода от фандинга\n"
         "/analyze — скан всех монет на выбранной бирже\n"
-        "/stopscan — остановить скан\n"
-        "/delta — дельта-нейтраль: лонг+шорт связка\n"
-        "/deltacalc — калькулятор дохода по связке\n"
+        "/findpair — дельта-нейтраль: найти пару лонг+шорт\n"
         "/settings — настройки и управление биржами\n"
         "/help — справка\n\n"
         "💡 *Быстрый ввод:*\n"
         "`/filter ENJ phemex 7`\n"
         "`/funding ENJ phemex 7`\n"
-        "`/calculator ENJ 25000 7 phemex`\n\n"
-        "Порядок параметров любой: монета, биржа, дни"
+        "`/calculator ENJ 25000 7 phemex`"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -1184,7 +1181,7 @@ async def cmd_analyze_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     chat_id  = q.message.chat_id
 
     if _scan_running.get(chat_id):
-        await q.edit_message_text("⏳ Скан уже запущен. Чтобы остановить — /stopscan")
+        await q.edit_message_text("⏳ Скан уже запущен.")
         return
 
     label = {"phemex": "Phemex", "kucoin": "KuCoin", "toobit": "Toobit", "xt": "XT"}.get(exchange, exchange)
@@ -1201,7 +1198,7 @@ async def cmd_analyze_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         f"📋 Скан *{label}* — {total} монет\n"
         f"Период: *{SCAN_DAYS} дней* | Порции: *{SCAN_BATCH}* монет\n"
         f"Только ✅ ПОДХОДЯТ\n\n"
-        "Остановить: /stopscan",
+        "",
         parse_mode="Markdown"
     )
 
@@ -1301,12 +1298,10 @@ async def cmd_analyze_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 def make_days_keyboard(cb_prefix):
     """Кнопки выбора периода."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("1 день",  callback_data=f"{cb_prefix}_days_1"),
-         InlineKeyboardButton("3 дня",   callback_data=f"{cb_prefix}_days_3")],
-        [InlineKeyboardButton("7 дней",  callback_data=f"{cb_prefix}_days_7"),
-         InlineKeyboardButton("14 дней", callback_data=f"{cb_prefix}_days_14")],
-        [InlineKeyboardButton("✏️ Другое", callback_data=f"{cb_prefix}_days_other")],
-        [InlineKeyboardButton("❌ Отмена", callback_data=f"{cb_prefix}_cancel")],
+        [InlineKeyboardButton("7 дней",       callback_data=f"{cb_prefix}_days_7"),
+         InlineKeyboardButton("14 дней",      callback_data=f"{cb_prefix}_days_14")],
+        [InlineKeyboardButton("Другой период", callback_data=f"{cb_prefix}_days_other")],
+        [InlineKeyboardButton("Отмена",        callback_data=f"{cb_prefix}_cancel")],
     ])
 
 
@@ -1323,19 +1318,19 @@ def make_exchange_keyboard(cb_prefix):
             row = []
     if row:
         buttons.append(row)
-    buttons.append([InlineKeyboardButton("🌐 Все биржи", callback_data=f"{cb_prefix}_ex_all")])
-    buttons.append([InlineKeyboardButton("❌ Отмена",    callback_data=f"{cb_prefix}_cancel")])
+    buttons.append([InlineKeyboardButton("Все биржи", callback_data=f"{cb_prefix}_ex_all")])
+    buttons.append([InlineKeyboardButton("Отмена",    callback_data=f"{cb_prefix}_cancel")])
     return InlineKeyboardMarkup(buttons)
 
 
 def make_amount_keyboard(cb_prefix):
     """Кнопки выбора суммы."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("$15,000", callback_data=f"{cb_prefix}_amt_15000"),
-         InlineKeyboardButton("$20,000", callback_data=f"{cb_prefix}_amt_20000")],
-        [InlineKeyboardButton("$25,000", callback_data=f"{cb_prefix}_amt_25000"),
-         InlineKeyboardButton("✏️ Другое", callback_data=f"{cb_prefix}_amt_other")],
-        [InlineKeyboardButton("❌ Отмена", callback_data=f"{cb_prefix}_cancel")],
+        [InlineKeyboardButton("15000",  callback_data=f"{cb_prefix}_amt_15000"),
+         InlineKeyboardButton("20000",  callback_data=f"{cb_prefix}_amt_20000")],
+        [InlineKeyboardButton("25000",  callback_data=f"{cb_prefix}_amt_25000"),
+         InlineKeyboardButton("Другое", callback_data=f"{cb_prefix}_amt_other")],
+        [InlineKeyboardButton("Отмена", callback_data=f"{cb_prefix}_cancel")],
     ])
 
 
@@ -1351,11 +1346,8 @@ async def acf_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await do_analyze(update, coins, days, exchange)
             return ConversationHandler.END
     await update.message.reply_text(
-        "🔍 *Анализ монет по фильтрам*\\n\\n"
-        "Шаг 1/3: Введи название монеты или несколько через пробел:\\n\\n"
-        "`ENJ`\\n"
-        "`ENJ RON JTO`\\n\\n"
-        "💡 Быстрый ввод: `/analyze-coin-match-filter ENJ phemex 7`\\n\\n"
+        "🔍 Анализ монет по фильтрам\n\n"
+        "Шаг 1/3: Введи название монеты или несколько через пробел\n\n"
         "Отмена: /cancel",
         parse_mode="Markdown"
     )
@@ -1370,7 +1362,7 @@ async def acf_got_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ACF_COIN
     context.user_data["acf_coins"] = coins
     await update.message.reply_text(
-        f"Монеты: *{' '.join(coins)}*\\n\\nШаг 2/3: Выбери период анализа:",
+        f"Шаг 2/3: Выбери период анализа.",
         reply_markup=make_days_keyboard("acf"),
         parse_mode="Markdown"
     )
@@ -1390,7 +1382,7 @@ async def acf_days_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     days = int(q.data.split("_")[-1])
     context.user_data["acf_days"] = days
     await q.edit_message_text(
-        f"Период: *{days} дн.*\\n\\nШаг 3/3: Выбери биржу:",
+        "Шаг 3/3: Выбери биржу.",
         reply_markup=make_exchange_keyboard("acf"),
         parse_mode="Markdown"
     )
@@ -1407,7 +1399,7 @@ async def acf_days_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ACF_DAYS_NUM
     context.user_data["acf_days"] = days
     await update.message.reply_text(
-        f"Период: *{days} дн.*\\n\\nШаг 3/3: Выбери биржу:",
+        "Шаг 3/3: Выбери биржу.",
         reply_markup=make_exchange_keyboard("acf"),
         parse_mode="Markdown"
     )
@@ -1446,10 +1438,8 @@ async def fr_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await do_show(update, coins[0], days, exchange)
             return ConversationHandler.END
     await update.message.reply_text(
-        "📈 *Ставки фандинга по монете*\\n\\n"
-        "Шаг 1/3: Введи название монеты:\\n\\n"
-        "`ENJ`\\n\\n"
-        "💡 Быстрый ввод: `/funding-rates ENJ phemex 7`\\n\\n"
+        "📈 Ставки фандинга по монете\n\n"
+        "Шаг 1/3: Введи название монеты\n\n"
         "Отмена: /cancel",
         parse_mode="Markdown"
     )
@@ -1463,7 +1453,7 @@ async def fr_got_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return FR_COIN
     context.user_data["fr_coin"] = coins[0]
     await update.message.reply_text(
-        f"Монета: *{coins[0]}*\\n\\nШаг 2/3: Выбери период:",
+        "Шаг 2/3: Выбери период анализа.",
         reply_markup=make_days_keyboard("fr"),
         parse_mode="Markdown"
     )
@@ -1482,7 +1472,7 @@ async def fr_days_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     days = int(q.data.split("_")[-1])
     context.user_data["fr_days"] = days
     await q.edit_message_text(
-        f"Период: *{days} дн.*\\n\\nШаг 3/3: Выбери биржу:",
+        "Шаг 3/3: Выбери биржу.",
         reply_markup=make_exchange_keyboard("fr"),
         parse_mode="Markdown"
     )
@@ -1498,7 +1488,7 @@ async def fr_days_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return FR_DAYS_NUM
     context.user_data["fr_days"] = days
     await update.message.reply_text(
-        f"Период: *{days} дн.*\\n\\nШаг 3/3: Выбери биржу:",
+        "Шаг 3/3: Выбери биржу.",
         reply_markup=make_exchange_keyboard("fr"),
         parse_mode="Markdown"
     )
@@ -1542,10 +1532,8 @@ async def pc_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await do_calc(update, remaining[0], amount, days, exchange)
             return ConversationHandler.END
     await update.message.reply_text(
-        "💰 *Калькулятор дохода от фандинга*\\n\\n"
-        "Шаг 1/4: Введи название монеты:\\n\\n"
-        "`ENJ`\\n\\n"
-        "💡 Быстрый ввод: `/profit-calculator ENJ 25000 7 phemex`\\n\\n"
+        "💰 Калькулятор дохода от фандинга\n\n"
+        "Шаг 1/4: Введи название монеты\n\n"
         "Отмена: /cancel",
         parse_mode="Markdown"
     )
@@ -1559,7 +1547,7 @@ async def pc_got_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return PC_COIN
     context.user_data["pc_coin"] = coins[0]
     await update.message.reply_text(
-        f"Монета: *{coins[0]}*\\n\\nШаг 2/4: Выбери сумму позиции (USDT):",
+        "Шаг 2/4: Выбери сумму позиции (USDT).",
         reply_markup=make_amount_keyboard("pc"),
         parse_mode="Markdown"
     )
@@ -1733,17 +1721,6 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception:
         pass  # Если текст не изменился — игнорируем
-
-
-
-async def cmd_stopscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Останавливает текущий скан."""
-    chat_id = update.effective_chat.id
-    if _scan_running.get(chat_id):
-        _scan_running[chat_id] = False
-        await update.message.reply_text("⛔ Скан останавливается...")
-    else:
-        await update.message.reply_text("Нет активного скана.")
 
 
 # ─────────────────────────────────────────────
@@ -1972,77 +1949,6 @@ async def delta_got_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-async def deltacalc_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.args:
-        coins, days, _ = parse_tokens(" ".join(context.args))
-        amount = None
-        remaining = []
-        for p in coins:
-            try:
-                amount = float(p.replace("$", "").replace(",", ""))
-            except ValueError:
-                remaining.append(p)
-        if remaining and amount:
-            await do_delta(update, remaining, days, amount_usd=amount)
-            return ConversationHandler.END
-    await update.message.reply_text(
-        "Введи монету, сумму и (опционально) период:\n\n"
-        "`ENJ 25000` — за 7 дней (по умолчанию)\n"
-        "`ENJ 25000 /days 14` — за 14 дней\n"
-        "`ENJ JTO 25000 /days 30` — несколько монет\n\n"
-        "Отмена: /cancel",
-        parse_mode="Markdown"
-    )
-    return WAIT_DELTACALC
-
-
-async def deltacalc_got_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    coins, days, _ = parse_tokens(update.message.text.strip())
-    amount = None
-    remaining = []
-    for p in coins:
-        try:
-            amount = float(p.replace("$", "").replace(",", ""))
-        except ValueError:
-            remaining.append(p)
-    if not remaining:
-        await update.message.reply_text("Не распознал монету. Попробуй: `ENJ 25000`", parse_mode="Markdown")
-        return WAIT_DELTACALC
-    if not amount or amount <= 0:
-        await update.message.reply_text("Не распознал сумму. Попробуй: `ENJ 25000`", parse_mode="Markdown")
-        return WAIT_DELTACALC
-    await do_delta(update, remaining, days, amount_usd=amount)
-    return ConversationHandler.END
-
-
-async def do_delta(update, coins, days, amount_usd=None):
-    active = [e for e, on in EXCHANGES_ENABLED.items() if on]
-    if len(active) < 2:
-        await update.message.reply_text(
-            "❌ Нужно минимум 2 активные биржи для дельта-анализа.\n"
-            "Включи биржи: `/toggle all`",
-            parse_mode="Markdown"
-        )
-        return
-
-    ex_str = " + ".join(EXCHANGE_LABELS.get(e, e) for e in active)
-    suffix = f" | сумма ${amount_usd:,.0f}" if amount_usd else ""
-    await update.message.reply_text(
-        f"⚖️ Дельта-анализ {len(coins)} монет на {ex_str} за {days} дней{suffix}...",
-    )
-
-    for coin in coins:
-        pairs, _ = analyze_delta(coin, days, all_exchanges=active)
-        reply = fmt_delta_result(coin, pairs, days, amount_usd)
-
-        # Нарезаем если длинное
-        if len(reply) > 4000:
-            for chunk in [reply[i:i+4000] for i in range(0, len(reply), 4000)]:
-                await update.message.reply_text(chunk, parse_mode="Markdown")
-        else:
-            await update.message.reply_text(reply, parse_mode="Markdown")
-
-
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
@@ -2095,17 +2001,11 @@ def main():
     app.add_handler(CallbackQueryHandler(settings_callback, pattern="^set_"))
     app.add_handler(CommandHandler("analyze",  cmd_analyze_start))
     app.add_handler(CallbackQueryHandler(cmd_analyze_callback, pattern="^analyze_ex_"))
-    app.add_handler(CommandHandler("stopscan", cmd_stopscan))
     app.add_handler(CommandHandler("cancel",    cmd_cancel))
 
     delta_conv = ConversationHandler(
-        entry_points=[CommandHandler("delta", delta_start)],
+        entry_points=[CommandHandler("findpair", delta_start)],
         states={WAIT_DELTA_COIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, delta_got_coins)]},
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
-    )
-    deltacalc_conv = ConversationHandler(
-        entry_points=[CommandHandler("deltacalc", deltacalc_start)],
-        states={WAIT_DELTACALC: [MessageHandler(filters.TEXT & ~filters.COMMAND, deltacalc_got_input)]},
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
 
@@ -2114,7 +2014,7 @@ def main():
     app.add_handler(fr_conv)
     app.add_handler(pc_conv)
     app.add_handler(delta_conv)
-    app.add_handler(deltacalc_conv)
+    
 
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
