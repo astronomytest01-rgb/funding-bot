@@ -625,35 +625,67 @@ def get_active_exchanges(requested=None):
 
 
 def analyze_rates(rates_pct):
-    """Считает метрики по списку ставок в %."""
+    """Считает метрики по списку ставок в %.
+    Определяет направление: LONG (отрицательные ставки) или SHORT (положительные).
+    """
     if not rates_pct:
         return None
-    neg = [r for r in rates_pct if r < 0]
-    total = len(rates_pct)
-    below = sum(1 for r in rates_pct if r <= STABILITY_THRESHOLD)
-    outlier_pct = (total - below) / total * 100
-    pass_stability = outlier_pct <= MAX_OUTLIER_PCT
-    neg_avg = sum(neg) / len(neg) if neg else 0.0
-    pass_neg_avg = bool(neg) and neg_avg <= NEG_AVG_THRESHOLD
 
-    if pass_stability:
-        category = "full"
+    neg   = [r for r in rates_pct if r < 0]
+    pos   = [r for r in rates_pct if r > 0]
+    total = len(rates_pct)
+    avg   = sum(rates_pct) / total
+
+    # ── LONG: стабильно отрицательные ────────────────────────────────────
+    below_neg    = sum(1 for r in rates_pct if r <= STABILITY_THRESHOLD)
+    outlier_long = (total - below_neg) / total * 100
+    neg_avg      = sum(neg) / len(neg) if neg else 0.0
+    pass_stability_long = outlier_long <= MAX_OUTLIER_PCT
+    pass_neg_avg        = bool(neg) and neg_avg <= NEG_AVG_THRESHOLD
+
+    # ── SHORT: стабильно положительные ───────────────────────────────────
+    above_pos     = sum(1 for r in rates_pct if r >= -STABILITY_THRESHOLD)
+    outlier_short = (total - above_pos) / total * 100
+    pos_avg       = sum(pos) / len(pos) if pos else 0.0
+    pass_stability_short = outlier_short <= MAX_OUTLIER_PCT
+    pass_pos_avg         = bool(pos) and pos_avg >= -NEG_AVG_THRESHOLD
+
+    # Определяем категорию и направление
+    if pass_stability_long:
+        category  = "full"
+        direction = "LONG"
+        outlier_pct = outlier_long
+    elif pass_stability_short:
+        category  = "full"
+        direction = "SHORT"
+        outlier_pct = outlier_short
     elif pass_neg_avg:
-        category = "partial"
+        category  = "partial"
+        direction = "LONG"
+        outlier_pct = outlier_long
+    elif pass_pos_avg:
+        category  = "partial"
+        direction = "SHORT"
+        outlier_pct = outlier_short
     else:
-        category = "fail"
+        category  = "fail"
+        direction = "LONG" if avg <= 0 else "SHORT"
+        outlier_pct = outlier_long
 
     return {
-        "total": total,
-        "avg": sum(rates_pct) / total,
-        "neg_avg": neg_avg,
-        "neg_count": len(neg),
-        "min": min(rates_pct),
-        "max": max(rates_pct),
-        "outlier_pct": outlier_pct,
-        "pass_stability": pass_stability,
-        "pass_neg_avg": pass_neg_avg,
-        "category": category,
+        "total":            total,
+        "avg":              avg,
+        "neg_avg":          neg_avg,
+        "pos_avg":          pos_avg,
+        "neg_count":        len(neg),
+        "pos_count":        len(pos),
+        "min":              min(rates_pct),
+        "max":              max(rates_pct),
+        "outlier_pct":      outlier_pct,
+        "pass_stability":   pass_stability_long or pass_stability_short,
+        "pass_neg_avg":     pass_neg_avg or pass_pos_avg,
+        "category":         category,
+        "direction":        direction,
     }
 
 
@@ -723,27 +755,35 @@ def parse_tokens(text):
 def fmt_coin_line(coin, ex_results, active_exchanges):
     """Форматирует одну строку монеты для всех бирж."""
     lines = []
-    # Определяем общую категорию (лучшая из бирж)
-    categories = [r.get("category") for r in ex_results.values() if not r.get("error")]
-    if "full" in categories:
+    # Определяем общую категорию и направление (лучшая из бирж)
+    cats_dirs = [(r.get("category"), r.get("direction", "LONG"))
+                 for r in ex_results.values() if not r.get("error")]
+    if any(c == "full" for c, _ in cats_dirs):
         overall = "✅"
-    elif "partial" in categories:
+    elif any(c == "partial" for c, _ in cats_dirs):
         overall = "⚡"
-    elif categories:
+    elif cats_dirs:
         overall = "❌"
     else:
         overall = "⚠️"
 
-    lines.append(f"{overall} *{coin}*")
+    # Определяем преобладающее направление
+    dirs = [d for _, d in cats_dirs if d]
+    direction = max(set(dirs), key=dirs.count) if dirs else "LONG"
+    dir_icon  = "🟢 ЛОНГ" if direction == "LONG" else "🔴 ШОРТ"
+
+    lines.append(f"{overall} *{coin}* {dir_icon}")
     for ex in active_exchanges:
         r = ex_results.get(ex, {})
         label = EXCHANGE_LABELS.get(ex, ex.upper())
         if r.get("error"):
             lines.append(f"  `{label}`: ошибка — {r['error'][:40]}")
             continue
-        cat = {"full": "✅", "partial": "⚡", "fail": "❌"}.get(r.get("category", "fail"), "❌")
+        cat      = {"full": "✅", "partial": "⚡", "fail": "❌"}.get(r.get("category", "fail"), "❌")
+        r_dir    = r.get("direction", "LONG")
+        key_avg  = r["neg_avg"] if r_dir == "LONG" else r.get("pos_avg", 0.0)
         lines.append(
-            f"  `{label}` {cat}  avg `{r['avg']:+.4f}%`  neg\\_avg `{r['neg_avg']:+.4f}%`  выбр `{r['outlier_pct']:.0f}%`"
+            f"  `{label}` {cat}  avg `{r['avg']:+.4f}%`  key\\_avg `{key_avg:+.4f}%`  выбр `{r['outlier_pct']:.0f}%`"
         )
     return "\n".join(lines)
 
@@ -1240,14 +1280,20 @@ async def cmd_analyze_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
             rates   = [r for _, r in rows]
             total_r = len(rates)
-            below   = sum(1 for r in rates if r <= STABILITY_THRESHOLD)
-            outlier = (total_r - below) / total_r * 100
-            neg     = [r for r in rates if r < 0]
-            neg_avg = sum(neg) / len(neg) if neg else 0.0
+            if not total_r:
+                continue
+
+            r = analyze_rates(rates)
+            if not r or r["category"] == "fail":
+                continue
+
+            direction = r["direction"]
+            key_avg   = r["neg_avg"] if direction == "LONG" else r["pos_avg"]
+            outlier   = r["outlier_pct"]
 
             if outlier <= MAX_OUTLIER_PCT:
-                batch_results.append((coin, neg_avg, outlier))
-                passed.append((coin, neg_avg, outlier))
+                batch_results.append((coin, key_avg, outlier, direction))
+                passed.append((coin, key_avg, outlier, direction))
 
             time.sleep(0.15)
 
@@ -1256,8 +1302,9 @@ async def cmd_analyze_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
         if batch_results:
             lines = [f"📊 Порция {batch_idx+1}/{len(batches)} [{scanned}/{total} | осталось {remaining}]\n"]
-            for coin, na, op in batch_results:
-                lines.append(f"✅ `{coin}` neg\_avg `{na:+.4f}%` выбр `{op:.0f}%`")
+            for coin, na, op, direction in batch_results:
+                dir_icon = "🟢" if direction == "LONG" else "🔴"
+                lines.append(f"✅ {dir_icon} `{coin}` avg `{na:+.4f}%` выбр `{op:.0f}%`")
             await q.message.reply_text("\n".join(lines), parse_mode="Markdown")
         else:
             if batch_idx % 3 == 2 or batch_idx == len(batches) - 1:
@@ -1277,9 +1324,16 @@ async def cmd_analyze_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     passed.sort(key=lambda x: x[1])
     lines = [f"✅ *Скан {label} завершён* — {total} монет за {SCAN_DAYS} дней\n"]
-    lines.append(f"✅ *ПОДХОДЯТ* ({len(passed)}):")
-    for coin, na, op in passed:
-        lines.append(f"  `{coin}` neg\_avg `{na:+.4f}%` выбр `{op:.0f}%`")
+    longs  = [(c, na, op) for c, na, op, d in passed if d == "LONG"]
+    shorts = [(c, na, op) for c, na, op, d in passed if d == "SHORT"]
+    if longs:
+        lines.append(f"🟢 *ЛОНГ* ({len(longs)}):")
+        for coin, na, op in sorted(longs, key=lambda x: x[1]):
+            lines.append(f"  `{coin}` avg `{na:+.4f}%` выбр `{op:.0f}%`")
+    if shorts:
+        lines.append(f"\n🔴 *ШОРТ* ({len(shorts)}):")
+        for coin, na, op in sorted(shorts, key=lambda x: -x[1]):
+            lines.append(f"  `{coin}` avg `{na:+.4f}%` выбр `{op:.0f}%`")
 
     reply = "\n".join(lines)
     if len(reply) > 4000:
@@ -1295,8 +1349,19 @@ async def cmd_analyze_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 # HELPERS ДЛЯ КНОПОК
 # ─────────────────────────────────────────────
 
-def make_days_keyboard(cb_prefix):
-    """Кнопки выбора периода."""
+def make_days_keyboard(cb_prefix, extra_short=False):
+    """Кнопки выбора периода.
+    extra_short=True — добавляет 1 день и 3 дня (для /funding).
+    """
+    if extra_short:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("1 день",        callback_data=f"{cb_prefix}_days_1"),
+             InlineKeyboardButton("3 дня",         callback_data=f"{cb_prefix}_days_3")],
+            [InlineKeyboardButton("7 дней",        callback_data=f"{cb_prefix}_days_7"),
+             InlineKeyboardButton("14 дней",       callback_data=f"{cb_prefix}_days_14")],
+            [InlineKeyboardButton("Другой период", callback_data=f"{cb_prefix}_days_other")],
+            [InlineKeyboardButton("Отмена",        callback_data=f"{cb_prefix}_cancel")],
+        ])
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("7 дней",       callback_data=f"{cb_prefix}_days_7"),
          InlineKeyboardButton("14 дней",      callback_data=f"{cb_prefix}_days_14")],
@@ -1305,21 +1370,33 @@ def make_days_keyboard(cb_prefix):
     ])
 
 
-def make_exchange_keyboard(cb_prefix):
-    """Кнопки выбора биржи."""
+def make_exchange_keyboard(cb_prefix, selected=None):
+    """Кнопки выбора бирж с мультивыбором.
+    selected — set выбранных бирж (чекбоксы).
+    Внизу кнопки: Все / Подтвердить / Отмена.
+    """
+    if selected is None:
+        selected = set()
     buttons = []
     row = []
     for ex, label in EXCHANGE_LABELS.items():
         if not EXCHANGES_ENABLED.get(ex, False):
             continue
-        row.append(InlineKeyboardButton(label, callback_data=f"{cb_prefix}_ex_{ex}"))
+        icon = "✅ " if ex in selected else ""
+        row.append(InlineKeyboardButton(
+            f"{icon}{label}",
+            callback_data=f"{cb_prefix}_ex_{ex}"
+        ))
         if len(row) == 3:
             buttons.append(row)
             row = []
     if row:
         buttons.append(row)
-    buttons.append([InlineKeyboardButton("Все биржи", callback_data=f"{cb_prefix}_ex_all")])
-    buttons.append([InlineKeyboardButton("Отмена",    callback_data=f"{cb_prefix}_cancel")])
+    buttons.append([
+        InlineKeyboardButton("Все биржи",   callback_data=f"{cb_prefix}_ex_all"),
+        InlineKeyboardButton("Подтвердить", callback_data=f"{cb_prefix}_ex_confirm"),
+    ])
+    buttons.append([InlineKeyboardButton("Отмена", callback_data=f"{cb_prefix}_cancel")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -1407,23 +1484,52 @@ async def acf_days_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def acf_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Шаг 3: нажата кнопка биржи, запускаем анализ."""
+    """Шаг 3: мультивыбор бирж, запуск после Подтвердить."""
     q = update.callback_query
     await q.answer()
+
     if q.data == "acf_cancel":
-        await q.edit_message_text("❌ Отменено.")
+        await q.edit_message_text("Отменено.")
         return ConversationHandler.END
-    exchange = q.data.replace("acf_ex_", "")
-    coins    = context.user_data.get("acf_coins", [])
-    days     = context.user_data.get("acf_days", DEFAULT_DAYS)
-    ex_label = "все биржи" if exchange == "all" else EXCHANGE_LABELS.get(exchange, exchange)
+
+    selected = context.user_data.get("acf_selected_ex", set())
+
+    if q.data == "acf_ex_all":
+        selected = set(ex for ex in EXCHANGES_ENABLED if EXCHANGES_ENABLED[ex])
+        context.user_data["acf_selected_ex"] = selected
+        await q.edit_message_text(
+            "Шаг 3/3: Выбери биржу.",
+            reply_markup=make_exchange_keyboard("acf", selected),
+            parse_mode="Markdown"
+        )
+        return ACF_EXCH
+
+    if q.data == "acf_ex_confirm":
+        if not selected:
+            selected = set(ex for ex in EXCHANGES_ENABLED if EXCHANGES_ENABLED[ex])
+        coins    = context.user_data.get("acf_coins", [])
+        days     = context.user_data.get("acf_days", DEFAULT_DAYS)
+        ex_label = ", ".join(EXCHANGE_LABELS.get(e, e) for e in selected)
+        await q.edit_message_text(
+            f"Анализирую {' '.join(coins)} за {days}д на {ex_label}...",
+        )
+        exchange = list(selected)[0] if len(selected) == 1 else None
+        await do_analyze(q, coins, days, exchange, selected if len(selected) > 1 else None)
+        return ConversationHandler.END
+
+    # Переключаем выбор биржи
+    ex = q.data.replace("acf_ex_", "")
+    if ex in selected:
+        selected.discard(ex)
+    else:
+        selected.add(ex)
+    context.user_data["acf_selected_ex"] = selected
     await q.edit_message_text(
-        f"🔍 Анализирую *{' '.join(coins)}* за *{days}д* на *{ex_label}*...",
+        "Шаг 3/3: Выбери биржу.",
+        reply_markup=make_exchange_keyboard("acf", selected),
         parse_mode="Markdown"
     )
-    # Создаём фейковый update с message для do_analyze
-    await do_analyze(q, coins, days, None if exchange == "all" else exchange)
-    return ConversationHandler.END
+    return ACF_EXCH
 
 
 # ─────────────────────────────────────────────
@@ -1454,7 +1560,7 @@ async def fr_got_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["fr_coin"] = coins[0]
     await update.message.reply_text(
         "Шаг 2/3: Выбери период анализа.",
-        reply_markup=make_days_keyboard("fr"),
+        reply_markup=make_days_keyboard("fr", extra_short=True),
         parse_mode="Markdown"
     )
     return FR_DAYS
@@ -1498,19 +1604,46 @@ async def fr_days_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def fr_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+
     if q.data == "fr_cancel":
-        await q.edit_message_text("❌ Отменено.")
+        await q.edit_message_text("Отменено.")
         return ConversationHandler.END
-    exchange = q.data.replace("fr_ex_", "")
-    coin     = context.user_data.get("fr_coin", "")
-    days     = context.user_data.get("fr_days", DEFAULT_DAYS)
-    ex_label = "все биржи" if exchange == "all" else EXCHANGE_LABELS.get(exchange, exchange)
+
+    selected = context.user_data.get("fr_selected_ex", set())
+
+    if q.data == "fr_ex_all":
+        selected = set(ex for ex in EXCHANGES_ENABLED if EXCHANGES_ENABLED[ex])
+        context.user_data["fr_selected_ex"] = selected
+        await q.edit_message_text(
+            "Шаг 3/3: Выбери биржу.",
+            reply_markup=make_exchange_keyboard("fr", selected),
+            parse_mode="Markdown"
+        )
+        return FR_EXCH
+
+    if q.data == "fr_ex_confirm":
+        if not selected:
+            selected = set(ex for ex in EXCHANGES_ENABLED if EXCHANGES_ENABLED[ex])
+        coin     = context.user_data.get("fr_coin", "")
+        days     = context.user_data.get("fr_days", DEFAULT_DAYS)
+        ex_label = ", ".join(EXCHANGE_LABELS.get(e, e) for e in selected)
+        await q.edit_message_text(f"Загружаю ставки {coin} за {days}д на {ex_label}...")
+        exchange = list(selected)[0] if len(selected) == 1 else None
+        await do_show(q, coin, days, exchange)
+        return ConversationHandler.END
+
+    ex = q.data.replace("fr_ex_", "")
+    if ex in selected:
+        selected.discard(ex)
+    else:
+        selected.add(ex)
+    context.user_data["fr_selected_ex"] = selected
     await q.edit_message_text(
-        f"🔍 Загружаю ставки *{coin}* за *{days}д* на *{ex_label}*...",
+        "Шаг 3/3: Выбери биржу.",
+        reply_markup=make_exchange_keyboard("fr", selected),
         parse_mode="Markdown"
     )
-    await do_show(q, coin, days, None if exchange == "all" else exchange)
-    return ConversationHandler.END
+    return FR_EXCH
 
 
 # ─────────────────────────────────────────────
@@ -1627,20 +1760,47 @@ async def pc_days_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def pc_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+
     if q.data == "pc_cancel":
-        await q.edit_message_text("❌ Отменено.")
+        await q.edit_message_text("Отменено.")
         return ConversationHandler.END
-    exchange = q.data.replace("pc_ex_", "")
-    coin     = context.user_data.get("pc_coin", "")
-    amount   = context.user_data.get("pc_amount", 0)
-    days     = context.user_data.get("pc_days", DEFAULT_DAYS)
-    ex_label = "все биржи" if exchange == "all" else EXCHANGE_LABELS.get(exchange, exchange)
+
+    selected = context.user_data.get("pc_selected_ex", set())
+
+    if q.data == "pc_ex_all":
+        selected = set(ex for ex in EXCHANGES_ENABLED if EXCHANGES_ENABLED[ex])
+        context.user_data["pc_selected_ex"] = selected
+        await q.edit_message_text(
+            "Шаг 4/4: Выбери биржу.",
+            reply_markup=make_exchange_keyboard("pc", selected),
+            parse_mode="Markdown"
+        )
+        return PC_EXCH
+
+    if q.data == "pc_ex_confirm":
+        if not selected:
+            selected = set(ex for ex in EXCHANGES_ENABLED if EXCHANGES_ENABLED[ex])
+        coin   = context.user_data.get("pc_coin", "")
+        amount = context.user_data.get("pc_amount", 0)
+        days   = context.user_data.get("pc_days", DEFAULT_DAYS)
+        ex_label = ", ".join(EXCHANGE_LABELS.get(e, e) for e in selected)
+        await q.edit_message_text(f"Считаю доход {coin} ${amount:,.0f} за {days}д на {ex_label}...")
+        exchange = list(selected)[0] if len(selected) == 1 else None
+        await do_calc(q, coin, amount, days, exchange)
+        return ConversationHandler.END
+
+    ex = q.data.replace("pc_ex_", "")
+    if ex in selected:
+        selected.discard(ex)
+    else:
+        selected.add(ex)
+    context.user_data["pc_selected_ex"] = selected
     await q.edit_message_text(
-        f"🔍 Считаю доход *{coin}* ${amount:,.0f} за *{days}д* на *{ex_label}*...",
+        "Шаг 4/4: Выбери биржу.",
+        reply_markup=make_exchange_keyboard("pc", selected),
         parse_mode="Markdown"
     )
-    await do_calc(q, coin, amount, days, None if exchange == "all" else exchange)
-    return ConversationHandler.END
+    return PC_EXCH
 
 
 # ─────────────────────────────────────────────
@@ -1923,17 +2083,40 @@ def fmt_delta_result(coin, pairs, days, amount_usd=None):
 # DELTA CONVERSATION HANDLERS
 # ─────────────────────────────────────────────
 
+async def do_delta(update, coins, days):
+    """Запускает дельта-анализ для списка монет и отправляет результат."""
+    # Получаем объект message в зависимости от типа update
+    msg = update.message if hasattr(update, 'message') and update.message else update
+
+    if not coins:
+        await msg.reply_text("Не указаны монеты.")
+        return
+
+    days = days or DEFAULT_DAYS
+    await msg.reply_text(f"Анализирую дельта-нейтраль: {', '.join(coins)} за {days} дней...")
+
+    for coin in coins:
+        try:
+            pairs = analyze_delta(coin, days)
+            text  = fmt_delta_result(coin, pairs, days)
+            if len(text) > 4000:
+                for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
+                    await msg.reply_text(chunk, parse_mode="Markdown")
+            else:
+                await msg.reply_text(text, parse_mode="Markdown")
+        except Exception as e:
+            await msg.reply_text(f"Ошибка анализа {coin}: {e}")
+
+
 async def delta_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
-        coins, days, exchange = parse_tokens(" ".join(context.args))
+        coins, days, _ = parse_tokens(" ".join(context.args))
         if coins:
             await do_delta(update, coins, days)
             return ConversationHandler.END
     await update.message.reply_text(
-        "Введи монеты для дельта-анализа:\n\n"
-        "`ENJ` — за 7 дней (по умолчанию)\n"
-        "`ENJ JTO RON` — несколько монет\n"
-        "`ENJ /days 14` — за 14 дней\n\n"
+        "Поиск дельта-нейтральной пары\n\n"
+        "Введи одну или несколько монет через пробел:\n\n"
         "Отмена: /cancel",
         parse_mode="Markdown"
     )
@@ -1941,9 +2124,16 @@ async def delta_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def delta_got_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    coins, days, _ = parse_tokens(update.message.text.strip())
+    text_in = update.message.text.strip()
+    # Если вдруг пришла команда — завершаем
+    if text_in.startswith("/"):
+        return ConversationHandler.END
+    coins, days, _ = parse_tokens(text_in)
     if not coins:
-        await update.message.reply_text("Не распознал монеты. Попробуй: `ENJ JTO`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "Не распознал монеты. Введи названия монет, например: ENJ или ENJ JTO RON",
+            parse_mode="Markdown"
+        )
         return WAIT_DELTA_COIN
     await do_delta(update, coins, days)
     return ConversationHandler.END
