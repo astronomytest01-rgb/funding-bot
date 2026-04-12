@@ -1293,6 +1293,7 @@ async def cmd_analyze_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("KuCoin",  callback_data="analyze_ex_kucoin")],
         [InlineKeyboardButton("Toobit",  callback_data="analyze_ex_toobit"),
          InlineKeyboardButton("XT",      callback_data="analyze_ex_xt")],
+        [InlineKeyboardButton("CoinW",   callback_data="analyze_ex_coinw")],
         [InlineKeyboardButton("Отмена",  callback_data="analyze_ex_cancel")],
     ])
     await update.message.reply_text(
@@ -1313,7 +1314,7 @@ async def cmd_analyze_days_callback(update: Update, context: ContextTypes.DEFAUL
 
     exchange = q.data.replace("analyze_ex_", "")
     context.user_data["analyze_exchange"] = exchange
-    label = {"phemex": "Phemex", "kucoin": "KuCoin", "toobit": "Toobit", "xt": "XT"}.get(exchange, exchange)
+    label = {"phemex": "Phemex", "kucoin": "KuCoin", "toobit": "Toobit", "xt": "XT", "coinw": "CoinW"}.get(exchange, exchange)
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("7 дней",  callback_data="analyze_days_7"),
@@ -1344,11 +1345,17 @@ async def cmd_analyze_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await q.edit_message_text("⏳ Скан уже запущен.")
         return
 
-    label = {"phemex": "Phemex", "kucoin": "KuCoin", "toobit": "Toobit", "xt": "XT"}.get(exchange, exchange)
+    label = {"phemex": "Phemex", "kucoin": "KuCoin", "toobit": "Toobit", "xt": "XT", "coinw": "CoinW"}.get(exchange, exchange)
     await q.edit_message_text(f"🔍 Загружаю список монет для скана {label}...")
 
+    # Получаем список монет
     try:
-        all_coins = phemex_get_all_symbols()
+        if exchange == "coinw":
+            # Для CoinW берём список монет из их API
+            r = requests.get("https://api.coinw.com/v1/perpum/instruments", timeout=15)
+            all_coins = [x["base"].upper() for x in r.json().get("data", [])]
+        else:
+            all_coins = phemex_get_all_symbols()
     except Exception as e:
         await q.message.reply_text(f"❌ Ошибка получения списка: {e}")
         return
