@@ -18,6 +18,10 @@ from telegram.ext import (
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
+# CoinW — данные из Supabase (коллектор собирает каждые 8 часов)
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+
 DEFAULT_DAYS        = 7
 STABILITY_THRESHOLD = -0.04
 MAX_OUTLIER_PCT     = 25
@@ -38,6 +42,7 @@ EXCHANGES_ENABLED = {
     "gate":   True,
     "blofin": True,
     "weex":   True,
+    "coinw":  True,
 }
 
 # Когда анализируешь без указания биржи — используются все включённые
@@ -593,28 +598,83 @@ def weex_fetch(coin, start_ms, end_ms):
 # УНИВЕРСАЛЬНЫЙ АНАЛИЗ
 # ─────────────────────────────────────────────
 
+
+def coinw_fetch(coin, start_ms, end_ms):
+    """
+    Возвращает историю ставок фандинга CoinW из Supabase.
+    Данные собираются коллектором каждые 8 часов.
+    Формат: list of (timestamp_ms, rate_pct)
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return [], "SUPABASE_URL/KEY не заданы"
+
+    symbol = coin.upper()
+    start_iso = __import__('datetime').datetime.fromtimestamp(
+        start_ms / 1000,
+        tz=__import__('datetime').timezone.utc
+    ).isoformat()
+    end_iso = __import__('datetime').datetime.fromtimestamp(
+        end_ms / 1000,
+        tz=__import__('datetime').timezone.utc
+    ).isoformat()
+
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/funding_rates"
+        headers = {
+            "apikey":        SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+        }
+        params = {
+            "symbol":       f"eq.{symbol}",
+            "collected_at": f"gte.{start_iso}",
+            "order":        "collected_at.asc",
+            "limit":        "1000",
+            "select":       "rate_pct,collected_at",
+        }
+        r = requests.get(url, headers=headers, params=params, timeout=10)
+        r.raise_for_status()
+        rows = r.json()
+
+        if not rows:
+            return [], f"Нет данных для {symbol} в БД"
+
+        result = []
+        for row in rows:
+            # collected_at → timestamp_ms
+            from datetime import datetime, timezone
+            dt = datetime.fromisoformat(row["collected_at"].replace("Z", "+00:00"))
+            ts_ms = int(dt.timestamp() * 1000)
+            result.append((ts_ms, float(row["rate_pct"])))
+
+        return result, f"coinw_{symbol}"
+
+    except Exception as e:
+        return [], str(e)
+
 EXCHANGE_FETCHERS = {
     "phemex": phemex_fetch,
     "xt":     xt_fetch,
     "toobit": toobit_fetch,
-    "okx": okx_fetch,
-    "bingx": bingx_fetch,
+    "okx":    okx_fetch,
+    "bingx":  bingx_fetch,
     "kucoin": kucoin_fetch,
     "gate":   gate_fetch,
     "blofin": blofin_fetch,
     "weex":   weex_fetch,
+    "coinw":  coinw_fetch,
 }
 
 EXCHANGE_LABELS = {
     "phemex": "Phemex",
     "xt":     "XT",
     "toobit": "Toobit",
-    "okx": "OKX",
-    "bingx": "BingX",
+    "okx":    "OKX",
+    "bingx":  "BingX",
     "kucoin": "KuCoin",
     "gate":   "Gate.io",
     "blofin": "BloFin",
     "weex":   "WEEX",
+    "coinw":  "CoinW",
 }
 
 
