@@ -602,21 +602,16 @@ def weex_fetch(coin, start_ms, end_ms):
 def coinw_fetch(coin, start_ms, end_ms):
     """
     Возвращает историю ставок фандинга CoinW из Supabase.
-    Данные собираются коллектором каждые 8 часов.
+    Данные собираются коллектором каждые 4 часа.
+    Дедупликация по funding_time — исключает дубли для монет с 8ч интервалом.
     Формат: list of (timestamp_ms, rate_pct)
     """
     if not SUPABASE_URL or not SUPABASE_KEY:
         return [], "SUPABASE_URL/KEY не заданы"
 
     symbol = coin.upper()
-    start_iso = __import__('datetime').datetime.fromtimestamp(
-        start_ms / 1000,
-        tz=__import__('datetime').timezone.utc
-    ).isoformat()
-    end_iso = __import__('datetime').datetime.fromtimestamp(
-        end_ms / 1000,
-        tz=__import__('datetime').timezone.utc
-    ).isoformat()
+    from datetime import datetime, timezone
+    start_iso = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).isoformat()
 
     try:
         url = f"{SUPABASE_URL}/rest/v1/funding_rates"
@@ -627,9 +622,9 @@ def coinw_fetch(coin, start_ms, end_ms):
         params = {
             "symbol":       f"eq.{symbol}",
             "collected_at": f"gte.{start_iso}",
-            "order":        "collected_at.asc",
+            "order":        "funding_time.asc",
             "limit":        "1000",
-            "select":       "rate_pct,collected_at",
+            "select":       "rate_pct,collected_at,funding_time",
         }
         r = requests.get(url, headers=headers, params=params, timeout=10)
         r.raise_for_status()
@@ -638,11 +633,21 @@ def coinw_fetch(coin, start_ms, end_ms):
         if not rows:
             return [], f"Нет данных для {symbol} в БД"
 
+        # Дедупликация по funding_time — берём уникальные выплаты
+        seen_funding_times = set()
         result = []
         for row in rows:
-            # collected_at → timestamp_ms
-            from datetime import datetime, timezone
-            dt = datetime.fromisoformat(row["collected_at"].replace("Z", "+00:00"))
+            ft = row.get("funding_time")
+            if ft:
+                if ft in seen_funding_times:
+                    continue
+                seen_funding_times.add(ft)
+                dt = datetime.fromisoformat(ft.replace("Z", "+00:00"))
+            else:
+                # Старые записи без funding_time — используем collected_at
+                dt = datetime.fromisoformat(
+                    row["collected_at"].replace("Z", "+00:00")
+                )
             ts_ms = int(dt.timestamp() * 1000)
             result.append((ts_ms, float(row["rate_pct"])))
 
@@ -788,8 +793,14 @@ def analyze_coin_multi(coin, start_ms, end_ms, exchanges):
 
 def parse_tokens(text):
     """'BTC ETH /days 14 /exchange xt' -> (coins, days, exchange)
-    Поддерживает как /days и /exchange так и --days и --exchange.
+    Также поддерживает быстрый ввод без префиксов:
+    'BTC coinw 7' -> (['BTC'], 7, 'coinw')
+    'BTC ETH phemex 14' -> (['BTC', 'ETH'], 14, 'phemex')
     """
+    KNOWN_EXCHANGES = set(EXCHANGE_FETCHERS.keys()) if 'EXCHANGE_FETCHERS' in dir() else {
+        "phemex", "xt", "toobit", "okx", "bingx", "kucoin", "gate", "blofin", "weex", "coinw"
+    }
+
     parts = text.strip().split()
     days = DEFAULT_DAYS
     exchange = None
@@ -806,9 +817,17 @@ def parse_tokens(text):
         # /exchange NAME или --exchange NAME
         if p in ("/exchange", "--exchange") and i + 1 < len(parts):
             exchange = parts[i + 1].lower(); i += 2; continue
-        # пропускаем команды вида /analyze если вдруг попали в текст
+        # пропускаем команды вида /filter если вдруг попали в текст
         if p in ("/filter", "/funding", "/calculator", "/start", "/help", "/settings", "/cancel"):
             i += 1; continue
+        # Распознаём название биржи без префикса
+        if p in KNOWN_EXCHANGES:
+            exchange = p; i += 1; continue
+        # Распознаём число как количество дней
+        try:
+            days = int(parts[i]); i += 1; continue
+        except ValueError:
+            pass
         coins.append(parts[i].upper())
         i += 1
     return coins, days, exchange
