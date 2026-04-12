@@ -1289,32 +1289,55 @@ SCAN_EXCHANGE_FETCHERS = {
 async def cmd_analyze_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Шаг 1: выбор биржи для скана."""
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Phemex",  callback_data="analyze_ex_phemex"),
-         InlineKeyboardButton("📊 KuCoin",  callback_data="analyze_ex_kucoin")],
-        [InlineKeyboardButton("📊 Toobit",  callback_data="analyze_ex_toobit"),
-         InlineKeyboardButton("📊 XT",      callback_data="analyze_ex_xt")],
-        [InlineKeyboardButton("❌ Отмена",  callback_data="analyze_ex_cancel")],
+        [InlineKeyboardButton("Phemex",  callback_data="analyze_ex_phemex"),
+         InlineKeyboardButton("KuCoin",  callback_data="analyze_ex_kucoin")],
+        [InlineKeyboardButton("Toobit",  callback_data="analyze_ex_toobit"),
+         InlineKeyboardButton("XT",      callback_data="analyze_ex_xt")],
+        [InlineKeyboardButton("Отмена",  callback_data="analyze_ex_cancel")],
     ])
     await update.message.reply_text(
-        "🔍 *Скан монет по фандингу*\n\n"
-        f"Период: *{SCAN_DAYS} дней*\n"
-        f"Фильтр: только ✅ ПОДХОДЯТ\n\n"
-        "Выбери биржу для скана:",
+        "🔍 Скан монет по фандингу\n\n"
+        "Шаг 1/2: Выбери биржу для скана:",
         reply_markup=keyboard,
-        parse_mode="Markdown"
     )
 
 
-async def cmd_analyze_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Шаг 2: биржа выбрана, запускаем скан."""
+async def cmd_analyze_days_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 2: выбор периода после выбора биржи."""
     q = update.callback_query
     await q.answer()
 
     if q.data == "analyze_ex_cancel":
-        await q.edit_message_text("❌ Отменено.")
+        await q.edit_message_text("Отменено.")
         return
 
     exchange = q.data.replace("analyze_ex_", "")
+    context.user_data["analyze_exchange"] = exchange
+    label = {"phemex": "Phemex", "kucoin": "KuCoin", "toobit": "Toobit", "xt": "XT"}.get(exchange, exchange)
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("7 дней",  callback_data="analyze_days_7"),
+         InlineKeyboardButton("14 дней", callback_data="analyze_days_14")],
+        [InlineKeyboardButton("Отмена",  callback_data="analyze_days_cancel")],
+    ])
+    await q.edit_message_text(
+        f"Биржа: {label}\n\n"
+        "Шаг 2/2: Выбери период анализа:",
+        reply_markup=keyboard,
+    )
+
+
+async def cmd_analyze_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 3: период выбран, запускаем скан."""
+    q = update.callback_query
+    await q.answer()
+
+    if q.data == "analyze_days_cancel":
+        await q.edit_message_text("Отменено.")
+        return
+
+    days     = int(q.data.replace("analyze_days_", ""))
+    exchange = context.user_data.get("analyze_exchange", "phemex")
     chat_id  = q.message.chat_id
 
     if _scan_running.get(chat_id):
@@ -1333,15 +1356,14 @@ async def cmd_analyze_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     total = len(all_coins)
     await q.message.reply_text(
         f"📋 Скан *{label}* — {total} монет\n"
-        f"Период: *{SCAN_DAYS} дней* | Порции: *{SCAN_BATCH}* монет\n"
-        f"Только ✅ ПОДХОДЯТ\n\n"
-        "",
+        f"Период: *{days} дней* | Порции: *{SCAN_BATCH}* монет\n"
+        f"Только ✅ ПОДХОДЯТ\n\n",
         parse_mode="Markdown"
     )
 
     _scan_running[chat_id] = True
     now_ms   = int(time.time() * 1000)
-    start_ms = now_ms - SCAN_DAYS * 24 * 60 * 60 * 1000
+    start_ms = now_ms - days * 24 * 60 * 60 * 1000
 
     # Выбираем fetcher
     if exchange == "phemex":
@@ -1415,13 +1437,13 @@ async def cmd_analyze_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if not passed:
         await q.message.reply_text(
             f"✅ Скан {label} завершён: {total} монет\n\n"
-            f"За {SCAN_DAYS} дней ни одна монета не прошла фильтры.",
+            f"За {days} дней ни одна монета не прошла фильтры.",
             parse_mode="Markdown"
         )
         return
 
     passed.sort(key=lambda x: x[1])
-    lines = [f"✅ *Скан {label} завершён* — {total} монет за {SCAN_DAYS} дней\n"]
+    lines = [f"✅ *Скан {label} завершён* — {total} монет за {days} дней\n"]
     full_longs  = [(c, na, op) for c, na, op, d, cat in passed if d == "LONG"  and cat == "full"]
     full_shorts = [(c, na, op) for c, na, op, d, cat in passed if d == "SHORT" and cat == "full"]
     part_longs  = [(c, na, op) for c, na, op, d, cat in passed if d == "LONG"  and cat == "partial"]
@@ -2304,7 +2326,8 @@ def main():
     app.add_handler(CommandHandler("settings",  cmd_settings_new))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern="^set_"))
     app.add_handler(CommandHandler("analyze",  cmd_analyze_start))
-    app.add_handler(CallbackQueryHandler(cmd_analyze_callback, pattern="^analyze_ex_"))
+    app.add_handler(CallbackQueryHandler(cmd_analyze_days_callback, pattern="^analyze_ex_"))
+    app.add_handler(CallbackQueryHandler(cmd_analyze_callback, pattern="^analyze_days_"))
     app.add_handler(CommandHandler("cancel",    cmd_cancel))
 
     delta_conv = ConversationHandler(
