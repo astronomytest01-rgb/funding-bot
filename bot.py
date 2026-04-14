@@ -2165,6 +2165,485 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass  # Если текст не изменился — игнорируем
 
 
+
+
+# ─────────────────────────────────────────────
+# DELTA-NEUTRAL
+# ─────────────────────────────────────────────
+
+def calc_std(rates):
+    """Стандартное отклонение списка ставок."""
+    if not rates:
+        return 0.0
+    n = len(rates)
+    mean = sum(rates) / n
+    return (sum((r - mean) ** 2 for r in rates) / n) ** 0.5
+
+
+def analyze_delta(coin, days, long_exchanges=None, all_exchanges=None):
+    """
+    Ищет лучшую дельта-нейтральную связку для монеты.
+    Возвращает (best_pairs, exchange_data) или (None, {}).
+    """
+    now_ms   = int(time.time() * 1000)
+    start_ms = now_ms - days * 24 * 60 * 60 * 1000
+
+    if all_exchanges is None:
+        all_exchanges = [e for e, on in EXCHANGES_ENABLED.items() if on]
+    if long_exchanges is None:
+        long_exchanges = all_exchanges
+
+    # Собираем данные по всем биржам
+    exchange_data = {}
+    for ex in all_exchanges:
+        fetcher = EXCHANGE_FETCHERS.get(ex)
+        if not fetcher:
+            continue
+        try:
+            data, sym = fetcher(coin, start_ms, now_ms)
+            if data:
+                rates = [r for _, r in data]
+                exchange_data[ex] = {"rates": rates, "sym": sym}
+        except Exception:
+            pass
+        time.sleep(0.1)
+
+    # Ищем лонг-кандидатов
+    long_candidates = []
+    for ex in long_exchanges:
+        if ex not in exchange_data:
+            continue
+        rates = exchange_data[ex]["rates"]
+        neg   = [r for r in rates if r < 0]
+        total = len(rates)
+        if not total:
+            continue
+        below       = sum(1 for r in rates if r <= STABILITY_THRESHOLD)
+        outlier_pct = (total - below) / total * 100
+        neg_avg     = sum(neg) / len(neg) if neg else 0.0
+        neg_ratio   = len(neg) / total
+        pass_stability = outlier_pct <= MAX_OUTLIER_PCT
+        pass_neg_avg   = bool(neg) and neg_avg <= NEG_AVG_THRESHOLD and neg_ratio >= MIN_NEG_RATIO
+
+        if pass_stability or pass_neg_avg:
+            long_candidates.append({
+                "exchange":       ex,
+                "rates":          rates,
+                "avg":            sum(rates) / total,
+                "neg_avg":        neg_avg,
+                "std":            calc_std(rates),
+                "outlier_pct":    outlier_pct,
+                "pass_stability": pass_stability,
+                "pass_neg_avg":   pass_neg_avg,
+            })
+
+    if not long_candidates:
+        return None, exchange_data
+
+    # Для каждого лонга ищем лучший шорт
+    best_pairs = []
+    for long_info in long_candidates:
+        long_ex  = long_info["exchange"]
+        long_avg = long_info["avg"]
+
+        short_candidates = []
+        for ex in all_exchanges:
+            if ex == long_ex or ex not in exchange_data:
+                continue
+            rates = exchange_data[ex]["rates"]
+            total = len(rates)
+            if not total:
+                continue
+            avg = sum(rates) / total
+            std = calc_std(rates)
+            net_income_pct = abs(long_avg) + avg
+            short_candidates.append({
+                "exchange":       ex,
+                "avg":            avg,
+                "std":            std,
+                "net_income_pct": net_income_pct,
+            })
+
+        short_candidates.sort(key=lambda x: (-x["net_income_pct"], x["std"]))
+
+        for short_info in short_candidates[:3]:
+            best_pairs.append({
+                "long_ex":         long_ex,
+                "short_ex":        short_info["exchange"],
+                "long_avg":        long_avg,
+                "long_std":        long_info["std"],
+                "long_neg_avg":    long_info["neg_avg"],
+                "long_outlier_pct":long_info["outlier_pct"],
+                "short_avg":       short_info["avg"],
+                "short_std":       short_info["std"],
+                "net_income_pct":  short_info["net_income_pct"],
+                "pass_stability":  long_info["pass_stability"],
+                "pass_neg_avg":    long_info["pass_neg_avg"],
+            })
+
+    best_pairs.sort(key=lambda x: (-x["net_income_pct"], x["long_std"] + x["short_std"]))
+    return best_pairs, exchange_data
+
+
+def fmt_delta_result(coin, pairs, days, amount_usd=None):
+    """Форматирует результат дельта-анализа."""
+    if not pairs:
+        return f"⚠️ *{coin}* — не найдено подходящих бирж для лонга за {days} дней"
+
+    lines = [f"⚖️ *Дельта-нейтраль: {coin}* — {days} дней\\n"]
+    shown = {}
+
+    for p in best_pairs_top(pairs, 5):
+        key = (p["long_ex"], p["short_ex"])
+        if key in shown:
+            continue
+        shown[key] = True
+
+        long_label  = EXCHANGE_LABELS.get(p["long_ex"],  p["long_ex"].upper())
+        short_label = EXCHANGE_LABELS.get(p["short_ex"], p["short_ex"].upper())
+        long_cat    = "✅" if p["pass_stability"] else "⚡"
+        net         = p["net_income_pct"]
+
+        lines.append(
+            f"🟢 Лонг: `{long_label}` {long_cat}  avg `{p['long_avg']:+.4f}%`  std `{p['long_std']:.4f}`\\n"
+            f"🔴 Шорт: `{short_label}`  avg `{p['short_avg']:+.4f}%`  std `{p['short_std']:.4f}`\\n"
+            f"💰 Чистый доход: `{net:+.4f}%` за выплату"
+        )
+        if amount_usd:
+            approx = days * 3
+            income = amount_usd * abs(net / 100) * approx
+            lines.append(f"   ~${income:.2f} за {days} дней (${income/days:.2f}/день)")
+        lines.append("")
+
+    return "\\n".join(lines)
+
+
+def best_pairs_top(pairs, n=5):
+    seen = set()
+    result = []
+    for p in pairs:
+        key = (p["long_ex"], p["short_ex"])
+        if key not in seen:
+            seen.add(key)
+            result.append(p)
+        if len(result) >= n:
+            break
+    return result
+
+
+# ─────────────────────────────────────────────
+# DELTA CONVERSATION HANDLERS
+# ─────────────────────────────────────────────
+
+async def do_delta(update, coins, days):
+    """Запускает дельта-анализ и отправляет результат."""
+    msg = update.message if hasattr(update, "message") and update.message else update
+    if not coins:
+        await msg.reply_text("Не указаны монеты.")
+        return
+    days = days or DEFAULT_DAYS
+    await msg.reply_text(f"Анализирую дельта-нейтраль: {', '.join(coins)} за {days} дней...")
+    for coin in coins:
+        try:
+            result = analyze_delta(coin, days)
+            if isinstance(result, tuple):
+                pairs, _ = result
+            else:
+                pairs = result
+            text = fmt_delta_result(coin, pairs, days)
+            if len(text) > 4000:
+                for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
+                    await msg.reply_text(chunk, parse_mode="Markdown")
+            else:
+                await msg.reply_text(text, parse_mode="Markdown")
+        except Exception as e:
+            await msg.reply_text(f"Ошибка анализа {coin}: {e}")
+
+
+async def delta_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args:
+        coins, days, _ = parse_tokens(" ".join(context.args))
+        if coins:
+            await do_delta(update, coins, days)
+            return ConversationHandler.END
+    await update.message.reply_text(
+        "Поиск дельта-нейтральной пары\\n\\n"
+        "Введи одну или несколько монет через пробел:\\n\\n"
+        "Отмена: /cancel",
+        parse_mode="Markdown"
+    )
+    return WAIT_DELTA_COIN
+
+
+async def delta_got_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text_in = update.message.text.strip()
+    if text_in.startswith("/"):
+        return ConversationHandler.END
+    coins, days, _ = parse_tokens(text_in)
+    if not coins:
+        await update.message.reply_text(
+            "Не распознал монеты. Введи названия монет, например: ENJ или ENJ JTO RON"
+        )
+        return WAIT_DELTA_COIN
+    await do_delta(update, coins, days)
+    return ConversationHandler.END
+
+
+
+# ─────────────────────────────────────────────
+# DELTA-NEUTRAL
+# ─────────────────────────────────────────────
+
+def calc_std(rates):
+    """\u0421\u0442\u0430\u043d\u0434\u0430\u0440\u0442\u043d\u043e\u0435 \u043e\u0442\u043a\u043b\u043e\u043d\u0435\u043d\u0438\u0435 \u0441\u043f\u0438\u0441\u043a\u0430 \u0441\u0442\u0430\u0432\u043e\u043a."""
+    if not rates:
+        return 0.0
+    n = len(rates)
+    mean = sum(rates) / n
+    return (sum((r - mean) ** 2 for r in rates) / n) ** 0.5
+
+
+
+def analyze_delta(coin, days, long_exchanges=None, all_exchanges=None):
+    """
+    \u0418\u0449\u0435\u0442 \u043b\u0443\u0447\u0448\u0443\u044e \u0434\u0435\u043b\u044c\u0442\u0430-\u043d\u0435\u0439\u0442\u0440\u0430\u043b\u044c\u043d\u0443\u044e \u0441\u0432\u044f\u0437\u043a\u0443 \u0434\u043b\u044f \u043c\u043e\u043d\u0435\u0442\u044b.
+
+    \u041b\u043e\u0433\u0438\u043a\u0430:
+    1. \u041f\u0440\u043e\u0432\u0435\u0440\u044f\u0435\u043c \u043a\u0430\u0436\u0434\u0443\u044e \u0431\u0438\u0440\u0436\u0443 \u043a\u0430\u043a \u043a\u0430\u043d\u0434\u0438\u0434\u0430\u0442\u0430 \u0434\u043b\u044f \u041b\u041e\u041d\u0413\u0410:
+       \u043c\u043e\u043d\u0435\u0442\u0430 \u0434\u043e\u043b\u0436\u043d\u0430 \u043f\u0440\u043e\u0445\u043e\u0434\u0438\u0442\u044c \u0444\u0438\u043b\u044c\u0442\u0440\u044b (\u0441\u0442\u0430\u0431\u0438\u043b\u044c\u043d\u043e \u043e\u0442\u0440\u0438\u0446. \u0444\u0430\u043d\u0434\u0438\u043d\u0433).
+    2. \u0414\u043b\u044f \u043a\u0430\u0436\u0434\u043e\u0433\u043e \u043b\u043e\u043d\u0433\u0430 \u043f\u0435\u0440\u0435\u0431\u0438\u0440\u0430\u0435\u043c \u043e\u0441\u0442\u0430\u043b\u044c\u043d\u044b\u0435 \u0431\u0438\u0440\u0436\u0438 \u043a\u0430\u043a \u043a\u0430\u043d\u0434\u0438\u0434\u0430\u0442\u044b \u0434\u043b\u044f \u0428\u041e\u0420\u0422\u0410:
+       - \u0421\u0447\u0438\u0442\u0430\u0435\u043c \u0441\u0440\u0435\u0434\u043d\u0438\u0439 \u0444\u0430\u043d\u0434\u0438\u043d\u0433 \u0448\u043e\u0440\u0442\u0430 \u0438 \u0435\u0433\u043e \u0441\u0442\u0430\u0431\u0438\u043b\u044c\u043d\u043e\u0441\u0442\u044c (std)
+       - \u0427\u0438\u0441\u0442\u044b\u0439 \u0434\u043e\u0445\u043e\u0434 = avg_long_rate + avg_short_rate (\u043e\u0431\u0430 \u0432 %)
+         (long_rate \u043e\u0442\u0440\u0438\u0446\u0430\u0442\u0435\u043b\u044c\u043d\u044b\u0439 \u2192 \u043c\u044b \u043f\u043e\u043b\u0443\u0447\u0430\u0435\u043c; short_rate \u043f\u043e\u043b\u043e\u0436\u0438\u0442 \u2192 \u043f\u043e\u043b\u0443\u0447\u0430\u0435\u043c, \u043e\u0442\u0440\u0438\u0446 \u2192 \u043f\u043b\u0430\u0442\u0438\u043c)
+       - \u0421\u0442\u0430\u0431\u0438\u043b\u044c\u043d\u043e\u0441\u0442\u044c \u0441\u0432\u044f\u0437\u043a\u0438 = std_long + std_short (\u043c\u0435\u043d\u044c\u0448\u0435 = \u043b\u0443\u0447\u0448\u0435)
+    3. \u0421\u043e\u0440\u0442\u0438\u0440\u0443\u0435\u043c: \u0441\u043d\u0430\u0447\u0430\u043b\u0430 \u043f\u043e \u0447\u0438\u0441\u0442\u043e\u043c\u0443 \u0434\u043e\u0445\u043e\u0434\u0443 (\u0431\u043e\u043b\u044c\u0448\u0435 = \u043b\u0443\u0447\u0448\u0435),
+       \u043f\u0440\u0438 \u0440\u0430\u0432\u0435\u043d\u0441\u0442\u0432\u0435 \u2014 \u043f\u043e \u0441\u0442\u0430\u0431\u0438\u043b\u044c\u043d\u043e\u0441\u0442\u0438 (\u043c\u0435\u043d\u044c\u0448\u0435 std = \u043b\u0443\u0447\u0448\u0435).
+    """
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - days * 24 * 60 * 60 * 1000
+
+    if all_exchanges is None:
+        all_exchanges = [e for e, on in EXCHANGES_ENABLED.items() if on]
+    if long_exchanges is None:
+        long_exchanges = all_exchanges
+
+    # \u0421\u043e\u0431\u0438\u0440\u0430\u0435\u043c \u0434\u0430\u043d\u043d\u044b\u0435 \u043f\u043e \u0432\u0441\u0435\u043c \u0431\u0438\u0440\u0436\u0430\u043c
+    exchange_data = {}
+    for ex in all_exchanges:
+        fetcher = EXCHANGE_FETCHERS.get(ex)
+        if not fetcher:
+            continue
+        try:
+            data, sym = fetcher(coin, start_ms, now_ms)
+            if data:
+                rates = [r for _, r in data]
+                exchange_data[ex] = {"rates": rates, "sym": sym}
+        except Exception:
+            pass
+        time.sleep(0.1)
+
+    # \u0418\u0449\u0435\u043c \u043b\u043e\u043d\u0433-\u043a\u0430\u043d\u0434\u0438\u0434\u0430\u0442\u043e\u0432 (\u043f\u0440\u043e\u0445\u043e\u0434\u044f\u0442 \u043d\u0430\u0448\u0438 \u0444\u0438\u043b\u044c\u0442\u0440\u044b)
+    long_candidates = []
+    for ex in long_exchanges:
+        if ex not in exchange_data:
+            continue
+        rates = exchange_data[ex]["rates"]
+        neg = [r for r in rates if r < 0]
+        total = len(rates)
+        below = sum(1 for r in rates if r <= STABILITY_THRESHOLD)
+        outlier_pct = (total - below) / total * 100 if total else 100
+        neg_avg = sum(neg) / len(neg) if neg else 0.0
+        pass_stability = outlier_pct <= MAX_OUTLIER_PCT
+        pass_neg_avg = bool(neg) and neg_avg <= NEG_AVG_THRESHOLD
+
+        if pass_stability or pass_neg_avg:
+            long_candidates.append({
+                "exchange": ex,
+                "rates": rates,
+                "avg": sum(rates) / total if total else 0,
+                "neg_avg": neg_avg,
+                "std": calc_std(rates),
+                "outlier_pct": outlier_pct,
+                "pass_stability": pass_stability,
+                "pass_neg_avg": pass_neg_avg,
+            })
+
+    if not long_candidates:
+        return None, exchange_data
+
+    # \u0414\u043b\u044f \u043a\u0430\u0436\u0434\u043e\u0433\u043e \u043b\u043e\u043d\u0433\u0430 \u0438\u0449\u0435\u043c \u043b\u0443\u0447\u0448\u0438\u0439 \u0448\u043e\u0440\u0442
+    best_pairs = []
+
+    for long_info in long_candidates:
+        long_ex = long_info["exchange"]
+        long_avg = long_info["avg"]  # \u043e\u0442\u0440\u0438\u0446\u0430\u0442\u0435\u043b\u044c\u043d\u044b\u0439 \u2192 \u043c\u044b \u041f\u041e\u041b\u0423\u0427\u0410\u0415\u041c abs(avg)
+
+        short_candidates = []
+        for ex in all_exchanges:
+            if ex == long_ex:
+                continue
+            if ex not in exchange_data:
+                continue
+            rates = exchange_data[ex]["rates"]
+            total = len(rates)
+            if not total:
+                continue
+            avg = sum(rates) / total
+            std = calc_std(rates)
+
+            # \u0427\u0438\u0441\u0442\u044b\u0439 \u0434\u043e\u0445\u043e\u0434 \u043d\u0430 \u0448\u043e\u0440\u0442\u0435:
+            # \u0435\u0441\u043b\u0438 avg > 0 (\u043f\u043e\u043b\u043e\u0436\u0438\u0442\u0435\u043b\u044c\u043d\u044b\u0439 \u0444\u0430\u043d\u0434\u0438\u043d\u0433) \u2192 \u0448\u043e\u0440\u0442 \u041f\u041e\u041b\u0423\u0427\u0410\u0415\u0422 avg
+            # \u0435\u0441\u043b\u0438 avg < 0 (\u043e\u0442\u0440\u0438\u0446\u0430\u0442\u0435\u043b\u044c\u043d\u044b\u0439 \u0444\u0430\u043d\u0434\u0438\u043d\u0433) \u2192 \u0448\u043e\u0440\u0442 \u041f\u041b\u0410\u0422\u0418\u0422 abs(avg)
+            # \u0418\u0442\u043e\u0433\u043e \u0437\u0430 \u043f\u0435\u0440\u0438\u043e\u0434: long \u043f\u043e\u043b\u0443\u0447\u0430\u0435\u0442 abs(long_avg), \u0448\u043e\u0440\u0442 \u043f\u043e\u043b\u0443\u0447\u0430\u0435\u0442 avg_short
+            # net_income_pct = abs(long_avg) + avg_short
+            net_income_pct = abs(long_avg) + avg  # avg \u0448\u043e\u0440\u0442\u0430: + = \u0445\u043e\u0440\u043e\u0448\u043e, - = \u043f\u043b\u043e\u0445\u043e
+
+            short_candidates.append({
+                "exchange": ex,
+                "avg": avg,
+                "std": std,
+                "net_income_pct": net_income_pct,
+                "rates": rates,
+            })
+
+        # \u0421\u043e\u0440\u0442\u0438\u0440\u0443\u0435\u043c \u0448\u043e\u0440\u0442-\u043a\u0430\u043d\u0434\u0438\u0434\u0430\u0442\u043e\u0432: \u0431\u043e\u043b\u044c\u0448\u0438\u0439 net_income, \u0437\u0430\u0442\u0435\u043c \u043c\u0435\u043d\u044c\u0448\u0438\u0439 std
+        short_candidates.sort(key=lambda x: (-x["net_income_pct"], x["std"]))
+
+        for short_info in short_candidates[:3]:  # \u0442\u043e\u043f-3 \u0432\u0430\u0440\u0438\u0430\u043d\u0442\u0430 \u0448\u043e\u0440\u0442\u0430
+            best_pairs.append({
+                "long_ex": long_ex,
+                "short_ex": short_info["exchange"],
+                "long_avg": long_avg,
+                "long_std": long_info["std"],
+                "long_neg_avg": long_info["neg_avg"],
+                "long_outlier_pct": long_info["outlier_pct"],
+                "short_avg": short_info["avg"],
+                "short_std": short_info["std"],
+                "net_income_pct": short_info["net_income_pct"],
+                "pass_stability": long_info["pass_stability"],
+                "pass_neg_avg": long_info["pass_neg_avg"],
+            })
+
+    # \u0424\u0438\u043d\u0430\u043b\u044c\u043d\u0430\u044f \u0441\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u043a\u0430 \u0432\u0441\u0435\u0445 \u043f\u0430\u0440
+    best_pairs.sort(key=lambda x: (-x["net_income_pct"], x["long_std"] + x["short_std"]))
+    return best_pairs, exchange_data
+
+
+
+def fmt_delta_result(coin, pairs, days, amount_usd=None):
+    """\u0424\u043e\u0440\u043c\u0430\u0442\u0438\u0440\u0443\u0435\u0442 \u0440\u0435\u0437\u0443\u043b\u044c\u0442\u0430\u0442 \u0434\u0435\u043b\u044c\u0442\u0430-\u0430\u043d\u0430\u043b\u0438\u0437\u0430."""
+    if not pairs:
+        return f"\u26a0\ufe0f *{coin}* \u2014 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u043e \u043f\u043e\u0434\u0445\u043e\u0434\u044f\u0449\u0438\u0445 \u0431\u0438\u0440\u0436 \u0434\u043b\u044f \u043b\u043e\u043d\u0433\u0430 \u0437\u0430 {days} \u0434\u043d\u0435\u0439"
+
+    lines = [f"\u2696\ufe0f *\u0414\u0435\u043b\u044c\u0442\u0430-\u043d\u0435\u0439\u0442\u0440\u0430\u043b\u044c: {coin}* \u2014 {days} \u0434\u043d\u0435\u0439\
+"]
+
+    # \u041f\u043e\u043a\u0430\u0437\u044b\u0432\u0430\u0435\u043c \u0442\u043e\u043f-3 \u043f\u0430\u0440\u044b
+    for i, p in enumerate(pairs[:3], 1):
+        long_label = EXCHANGE_LABELS.get(p["long_ex"], p["long_ex"].upper())
+        short_label = EXCHANGE_LABELS.get(p["short_ex"], p["short_ex"].upper())
+
+        # \u0418\u043a\u043e\u043d\u043a\u0430 \u0441\u0442\u0430\u0431\u0438\u043b\u044c\u043d\u043e\u0441\u0442\u0438 \u043b\u043e\u043d\u0433\u0430
+        long_cat = "\u2705" if p["pass_stability"] else "\u26a1"
+
+        # \u0417\u043d\u0430\u043a \u0434\u043b\u044f \u0448\u043e\u0440\u0442\u0430: + \u0435\u0441\u043b\u0438 \u0437\u0430\u0440\u0430\u0431\u0430\u0442\u044b\u0432\u0430\u0435\u043c \u043d\u0430 \u0448\u043e\u0440\u0442\u0435, - \u0435\u0441\u043b\u0438 \u043f\u043b\u0430\u0442\u0438\u043c
+        short_sign = "+" if p["short_avg"] >= 0 else ""
+
+        lines.append(f"*#{i}* \ud83d\udfe2 \u041b\u043e\u043d\u0433 `{long_label}` + \ud83d\udd34 \u0428\u043e\u0440\u0442 `{short_label}`")
+        lines.append(
+            f"  \u041b\u043e\u043d\u0433 {long_cat}: avg `{p['long_avg']:+.4f}%`  std `{p['long_std']:.4f}`"
+        )
+        lines.append(
+            f"  \u0428\u043e\u0440\u0442: avg `{p['short_avg']:+.4f}%`  std `{p['short_std']:.4f}`"
+        )
+        lines.append(
+            f"  \ud83d\udcc8 \u0427\u0438\u0441\u0442\u044b\u0439 \u0434\u043e\u0445\u043e\u0434/\u0441\u0442\u0430\u0432\u043a\u0443: `{p['net_income_pct']:+.4f}%`"
+        )
+
+        if amount_usd:
+            # \u0421\u0447\u0438\u0442\u0430\u0435\u043c \u0440\u0435\u0430\u043b\u044c\u043d\u044b\u0439 \u0434\u043e\u0445\u043e\u0434 \u0437\u0430 \u043f\u0435\u0440\u0438\u043e\u0434
+            # \u041a\u043e\u043b\u0438\u0447\u0435\u0441\u0442\u0432\u043e \u0441\u0442\u0430\u0432\u043e\u043a \u043f\u0440\u0438\u043c\u0435\u0440\u043d\u043e = days * 24 / interval_h (\u043e\u0431\u044b\u0447\u043d\u043e 8\u0447 = 3 \u0432 \u0434\u0435\u043d\u044c)
+            approx_payments = days * 3
+            income_long = amount_usd * abs(p["long_avg"] / 100) * approx_payments
+            income_short = amount_usd * (p["short_avg"] / 100) * approx_payments
+            net = income_long + income_short
+            lines.append(
+                f"  \ud83d\udcb0 ~${income_long:.2f} (\u043b\u043e\u043d\u0433) {'+' if income_short >= 0 else ''}"
+                f"${income_short:.2f} (\u0448\u043e\u0440\u0442) = *${net:.2f}* \u0437\u0430 {days}\u0434"
+            )
+        lines.append("")
+
+    return "\
+".join(lines)
+
+
+# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# DELTA CONVERSATION HANDLERS
+# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+
+async def delta_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args:
+        coins, days, exchange = parse_tokens(" ".join(context.args))
+        if coins:
+            await do_delta(update, coins, days)
+            return ConversationHandler.END
+    await update.message.reply_text(
+        "\u0412\u0432\u0435\u0434\u0438 \u043c\u043e\u043d\u0435\u0442\u044b \u0434\u043b\u044f \u0434\u0435\u043b\u044c\u0442\u0430-\u0430\u043d\u0430\u043b\u0438\u0437\u0430:\
+\
+"
+        "`ENJ`\
+"
+        "`ENJ JTO RON`\
+"
+        "`ENJ /days 14`\
+\
+"
+        "\u041e\u0442\u043c\u0435\u043d\u0430: /cancel",
+        parse_mode="Markdown"
+    )
+    return WAIT_DELTA_COIN
+
+
+
+async def delta_got_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    coins, days, _ = parse_tokens(update.message.text.strip())
+    if not coins:
+        await update.message.reply_text("\u041d\u0435 \u0440\u0430\u0441\u043f\u043e\u0437\u043d\u0430\u043b \u043c\u043e\u043d\u0435\u0442\u044b. \u041f\u043e\u043f\u0440\u043e\u0431\u0443\u0439: `ENJ JTO`", parse_mode="Markdown")
+        return WAIT_DELTA_COIN
+    await do_delta(update, coins, days)
+    return ConversationHandler.END
+
+
+
+async def do_delta(update, coins, days, amount_usd=None):
+    active = [e for e, on in EXCHANGES_ENABLED.items() if on]
+    if len(active) < 2:
+        await update.message.reply_text(
+            "\u274c \u041d\u0443\u0436\u043d\u043e \u043c\u0438\u043d\u0438\u043c\u0443\u043c 2 \u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0435 \u0431\u0438\u0440\u0436\u0438 \u0434\u043b\u044f \u0434\u0435\u043b\u044c\u0442\u0430-\u0430\u043d\u0430\u043b\u0438\u0437\u0430.\
+"
+            "\u0412\u043a\u043b\u044e\u0447\u0438 \u0431\u0438\u0440\u0436\u0438: `/toggle all`",
+            parse_mode="Markdown"
+        )
+        return
+
+    ex_str = " + ".join(EXCHANGE_LABELS.get(e, e) for e in active)
+    suffix = f" | \u0441\u0443\u043c\u043c\u0430 ${amount_usd:,.0f}" if amount_usd else ""
+    await update.message.reply_text(
+        f"\u2696\ufe0f \u0414\u0435\u043b\u044c\u0442\u0430-\u0430\u043d\u0430\u043b\u0438\u0437 {len(coins)} \u043c\u043e\u043d\u0435\u0442 \u043d\u0430 {ex_str} \u0437\u0430 {days} \u0434\u043d\u0435\u0439{suffix}...",
+    )
+
+    for coin in coins:
+        pairs, _ = analyze_delta(coin, days, all_exchanges=active)
+        reply = fmt_delta_result(coin, pairs, days, amount_usd)
+
+        # \u041d\u0430\u0440\u0435\u0437\u0430\u0435\u043c \u0435\u0441\u043b\u0438 \u0434\u043b\u0438\u043d\u043d\u043e\u0435
+        if len(reply) > 4000:
+            for chunk in [reply[i:i+4000] for i in range(0, len(reply), 4000)]:
+                await update.message.reply_text(chunk, parse_mode="Markdown")
+        else:
+            await update.message.reply_text(reply, parse_mode="Markdown")
+
 def main():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN не задан!")
