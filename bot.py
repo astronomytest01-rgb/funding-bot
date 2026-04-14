@@ -1728,44 +1728,65 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
 # HELPERS ДЛЯ КНОПОК
 # ─────────────────────────────────────────────
 
-def make_days_keyboard(cb_prefix):
-    """Кнопки выбора периода."""
+def make_days_keyboard(cb_prefix, extra_short=False):
+    """Кнопки выбора периода.
+    extra_short=True — добавляет 1 день и 3 дня (для /funding).
+    """
+    if extra_short:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("1 день",        callback_data=f"{cb_prefix}_days_1"),
+             InlineKeyboardButton("3 дня",         callback_data=f"{cb_prefix}_days_3")],
+            [InlineKeyboardButton("7 дней",        callback_data=f"{cb_prefix}_days_7"),
+             InlineKeyboardButton("14 дней",       callback_data=f"{cb_prefix}_days_14")],
+            [InlineKeyboardButton("Другой период", callback_data=f"{cb_prefix}_days_other")],
+            [InlineKeyboardButton("Отмена",        callback_data=f"{cb_prefix}_cancel")],
+        ])
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("1 день",  callback_data=f"{cb_prefix}_days_1"),
-         InlineKeyboardButton("3 дня",   callback_data=f"{cb_prefix}_days_3")],
-        [InlineKeyboardButton("7 дней",  callback_data=f"{cb_prefix}_days_7"),
-         InlineKeyboardButton("14 дней", callback_data=f"{cb_prefix}_days_14")],
-        [InlineKeyboardButton("✏️ Другое", callback_data=f"{cb_prefix}_days_other")],
-        [InlineKeyboardButton("❌ Отмена", callback_data=f"{cb_prefix}_cancel")],
+        [InlineKeyboardButton("7 дней",       callback_data=f"{cb_prefix}_days_7"),
+         InlineKeyboardButton("14 дней",      callback_data=f"{cb_prefix}_days_14")],
+        [InlineKeyboardButton("Другой период", callback_data=f"{cb_prefix}_days_other")],
+        [InlineKeyboardButton("Отмена",        callback_data=f"{cb_prefix}_cancel")],
     ])
 
 
-def make_exchange_keyboard(cb_prefix):
-    """Кнопки выбора биржи."""
+def make_exchange_keyboard(cb_prefix, selected=None):
+    """Кнопки выбора бирж с мультивыбором.
+    selected — set выбранных бирж (чекбоксы).
+    Внизу кнопки: Все / Подтвердить / Отмена.
+    """
+    if selected is None:
+        selected = set()
     buttons = []
     row = []
     for ex, label in EXCHANGE_LABELS.items():
         if not EXCHANGES_ENABLED.get(ex, False):
             continue
-        row.append(InlineKeyboardButton(label, callback_data=f"{cb_prefix}_ex_{ex}"))
+        icon = "✅ " if ex in selected else ""
+        row.append(InlineKeyboardButton(
+            f"{icon}{label}",
+            callback_data=f"{cb_prefix}_ex_{ex}"
+        ))
         if len(row) == 3:
             buttons.append(row)
             row = []
     if row:
         buttons.append(row)
-    buttons.append([InlineKeyboardButton("🌐 Все биржи", callback_data=f"{cb_prefix}_ex_all")])
-    buttons.append([InlineKeyboardButton("❌ Отмена",    callback_data=f"{cb_prefix}_cancel")])
+    buttons.append([
+        InlineKeyboardButton("Все биржи",   callback_data=f"{cb_prefix}_ex_all"),
+        InlineKeyboardButton("Подтвердить", callback_data=f"{cb_prefix}_ex_confirm"),
+    ])
+    buttons.append([InlineKeyboardButton("Отмена", callback_data=f"{cb_prefix}_cancel")])
     return InlineKeyboardMarkup(buttons)
 
 
 def make_amount_keyboard(cb_prefix):
     """Кнопки выбора суммы."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("$15,000", callback_data=f"{cb_prefix}_amt_15000"),
-         InlineKeyboardButton("$20,000", callback_data=f"{cb_prefix}_amt_20000")],
-        [InlineKeyboardButton("$25,000", callback_data=f"{cb_prefix}_amt_25000"),
-         InlineKeyboardButton("✏️ Другое", callback_data=f"{cb_prefix}_amt_other")],
-        [InlineKeyboardButton("❌ Отмена", callback_data=f"{cb_prefix}_cancel")],
+        [InlineKeyboardButton("15000",  callback_data=f"{cb_prefix}_amt_15000"),
+         InlineKeyboardButton("20000",  callback_data=f"{cb_prefix}_amt_20000")],
+        [InlineKeyboardButton("25000",  callback_data=f"{cb_prefix}_amt_25000"),
+         InlineKeyboardButton("Другое", callback_data=f"{cb_prefix}_amt_other")],
+        [InlineKeyboardButton("Отмена", callback_data=f"{cb_prefix}_cancel")],
     ])
 
 
@@ -1797,7 +1818,7 @@ async def acf_got_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ACF_COIN
     context.user_data["acf_coins"] = coins
     await update.message.reply_text(
-        f"Монеты: *{' '.join(coins)}*\\n\\nШаг 2/3: Выбери период анализа:",
+        f"Шаг 2/3: Выбери период анализа.",
         reply_markup=make_days_keyboard("acf"),
         parse_mode="Markdown"
     )
@@ -1817,7 +1838,7 @@ async def acf_days_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     days = int(q.data.split("_")[-1])
     context.user_data["acf_days"] = days
     await q.edit_message_text(
-        f"Период: *{days} дн.*\\n\\nШаг 3/3: Выбери биржу:",
+        "Шаг 3/3: Выбери биржу.",
         reply_markup=make_exchange_keyboard("acf"),
         parse_mode="Markdown"
     )
@@ -1834,7 +1855,7 @@ async def acf_days_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ACF_DAYS_NUM
     context.user_data["acf_days"] = days
     await update.message.reply_text(
-        f"Период: *{days} дн.*\\n\\nШаг 3/3: Выбери биржу:",
+        "Шаг 3/3: Выбери биржу.",
         reply_markup=make_exchange_keyboard("acf"),
         parse_mode="Markdown"
     )
@@ -1842,23 +1863,52 @@ async def acf_days_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def acf_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Шаг 3: нажата кнопка биржи, запускаем анализ."""
+    """Шаг 3: мультивыбор бирж, запуск после Подтвердить."""
     q = update.callback_query
     await q.answer()
+
     if q.data == "acf_cancel":
-        await q.edit_message_text("❌ Отменено.")
+        await q.edit_message_text("Отменено.")
         return ConversationHandler.END
-    exchange = q.data.replace("acf_ex_", "")
-    coins    = context.user_data.get("acf_coins", [])
-    days     = context.user_data.get("acf_days", DEFAULT_DAYS)
-    ex_label = "все биржи" if exchange == "all" else EXCHANGE_LABELS.get(exchange, exchange)
+
+    selected = context.user_data.get("acf_selected_ex", set())
+
+    if q.data == "acf_ex_all":
+        selected = set(ex for ex in EXCHANGES_ENABLED if EXCHANGES_ENABLED[ex])
+        context.user_data["acf_selected_ex"] = selected
+        await q.edit_message_text(
+            "Шаг 3/3: Выбери биржу.",
+            reply_markup=make_exchange_keyboard("acf", selected),
+            parse_mode="Markdown"
+        )
+        return ACF_EXCH
+
+    if q.data == "acf_ex_confirm":
+        if not selected:
+            selected = set(ex for ex in EXCHANGES_ENABLED if EXCHANGES_ENABLED[ex])
+        coins    = context.user_data.get("acf_coins", [])
+        days     = context.user_data.get("acf_days", DEFAULT_DAYS)
+        ex_label = ", ".join(EXCHANGE_LABELS.get(e, e) for e in selected)
+        await q.edit_message_text(
+            f"Анализирую {' '.join(coins)} за {days}д на {ex_label}...",
+        )
+        exchange = list(selected)[0] if len(selected) == 1 else None
+        await do_analyze(q, coins, days, exchange, selected if len(selected) > 1 else None)
+        return ConversationHandler.END
+
+    # Переключаем выбор биржи
+    ex = q.data.replace("acf_ex_", "")
+    if ex in selected:
+        selected.discard(ex)
+    else:
+        selected.add(ex)
+    context.user_data["acf_selected_ex"] = selected
     await q.edit_message_text(
-        f"🔍 Анализирую *{' '.join(coins)}* за *{days}д* на *{ex_label}*...",
+        "Шаг 3/3: Выбери биржу.",
+        reply_markup=make_exchange_keyboard("acf", selected),
         parse_mode="Markdown"
     )
-    # Создаём фейковый update с message для do_analyze
-    await do_analyze(q, coins, days, None if exchange == "all" else exchange)
-    return ConversationHandler.END
+    return ACF_EXCH
 
 
 # ─────────────────────────────────────────────
@@ -1888,8 +1938,8 @@ async def fr_got_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return FR_COIN
     context.user_data["fr_coin"] = coins[0]
     await update.message.reply_text(
-        f"Монета: *{coins[0]}*\\n\\nШаг 2/3: Выбери период:",
-        reply_markup=make_days_keyboard("fr"),
+        "Шаг 2/3: Выбери период анализа.",
+        reply_markup=make_days_keyboard("fr", extra_short=True),
         parse_mode="Markdown"
     )
     return FR_DAYS
@@ -1907,7 +1957,7 @@ async def fr_days_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     days = int(q.data.split("_")[-1])
     context.user_data["fr_days"] = days
     await q.edit_message_text(
-        f"Период: *{days} дн.*\\n\\nШаг 3/3: Выбери биржу:",
+        "Шаг 3/3: Выбери биржу.",
         reply_markup=make_exchange_keyboard("fr"),
         parse_mode="Markdown"
     )
@@ -1923,7 +1973,7 @@ async def fr_days_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return FR_DAYS_NUM
     context.user_data["fr_days"] = days
     await update.message.reply_text(
-        f"Период: *{days} дн.*\\n\\nШаг 3/3: Выбери биржу:",
+        "Шаг 3/3: Выбери биржу.",
         reply_markup=make_exchange_keyboard("fr"),
         parse_mode="Markdown"
     )
@@ -1933,19 +1983,46 @@ async def fr_days_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def fr_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+
     if q.data == "fr_cancel":
-        await q.edit_message_text("❌ Отменено.")
+        await q.edit_message_text("Отменено.")
         return ConversationHandler.END
-    exchange = q.data.replace("fr_ex_", "")
-    coin     = context.user_data.get("fr_coin", "")
-    days     = context.user_data.get("fr_days", DEFAULT_DAYS)
-    ex_label = "все биржи" if exchange == "all" else EXCHANGE_LABELS.get(exchange, exchange)
+
+    selected = context.user_data.get("fr_selected_ex", set())
+
+    if q.data == "fr_ex_all":
+        selected = set(ex for ex in EXCHANGES_ENABLED if EXCHANGES_ENABLED[ex])
+        context.user_data["fr_selected_ex"] = selected
+        await q.edit_message_text(
+            "Шаг 3/3: Выбери биржу.",
+            reply_markup=make_exchange_keyboard("fr", selected),
+            parse_mode="Markdown"
+        )
+        return FR_EXCH
+
+    if q.data == "fr_ex_confirm":
+        if not selected:
+            selected = set(ex for ex in EXCHANGES_ENABLED if EXCHANGES_ENABLED[ex])
+        coin     = context.user_data.get("fr_coin", "")
+        days     = context.user_data.get("fr_days", DEFAULT_DAYS)
+        ex_label = ", ".join(EXCHANGE_LABELS.get(e, e) for e in selected)
+        await q.edit_message_text(f"Загружаю ставки {coin} за {days}д на {ex_label}...")
+        exchange = list(selected)[0] if len(selected) == 1 else None
+        await do_show(q, coin, days, exchange)
+        return ConversationHandler.END
+
+    ex = q.data.replace("fr_ex_", "")
+    if ex in selected:
+        selected.discard(ex)
+    else:
+        selected.add(ex)
+    context.user_data["fr_selected_ex"] = selected
     await q.edit_message_text(
-        f"🔍 Загружаю ставки *{coin}* за *{days}д* на *{ex_label}*...",
+        "Шаг 3/3: Выбери биржу.",
+        reply_markup=make_exchange_keyboard("fr", selected),
         parse_mode="Markdown"
     )
-    await do_show(q, coin, days, None if exchange == "all" else exchange)
-    return ConversationHandler.END
+    return FR_EXCH
 
 
 # ─────────────────────────────────────────────
@@ -1982,7 +2059,7 @@ async def pc_got_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return PC_COIN
     context.user_data["pc_coin"] = coins[0]
     await update.message.reply_text(
-        f"Монета: *{coins[0]}*\\n\\nШаг 2/4: Выбери сумму позиции (USDT):",
+        "Шаг 2/4: Выбери сумму позиции (USDT).",
         reply_markup=make_amount_keyboard("pc"),
         parse_mode="Markdown"
     )
@@ -2062,20 +2139,47 @@ async def pc_days_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def pc_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+
     if q.data == "pc_cancel":
-        await q.edit_message_text("❌ Отменено.")
+        await q.edit_message_text("Отменено.")
         return ConversationHandler.END
-    exchange = q.data.replace("pc_ex_", "")
-    coin     = context.user_data.get("pc_coin", "")
-    amount   = context.user_data.get("pc_amount", 0)
-    days     = context.user_data.get("pc_days", DEFAULT_DAYS)
-    ex_label = "все биржи" if exchange == "all" else EXCHANGE_LABELS.get(exchange, exchange)
+
+    selected = context.user_data.get("pc_selected_ex", set())
+
+    if q.data == "pc_ex_all":
+        selected = set(ex for ex in EXCHANGES_ENABLED if EXCHANGES_ENABLED[ex])
+        context.user_data["pc_selected_ex"] = selected
+        await q.edit_message_text(
+            "Шаг 4/4: Выбери биржу.",
+            reply_markup=make_exchange_keyboard("pc", selected),
+            parse_mode="Markdown"
+        )
+        return PC_EXCH
+
+    if q.data == "pc_ex_confirm":
+        if not selected:
+            selected = set(ex for ex in EXCHANGES_ENABLED if EXCHANGES_ENABLED[ex])
+        coin   = context.user_data.get("pc_coin", "")
+        amount = context.user_data.get("pc_amount", 0)
+        days   = context.user_data.get("pc_days", DEFAULT_DAYS)
+        ex_label = ", ".join(EXCHANGE_LABELS.get(e, e) for e in selected)
+        await q.edit_message_text(f"Считаю доход {coin} ${amount:,.0f} за {days}д на {ex_label}...")
+        exchange = list(selected)[0] if len(selected) == 1 else None
+        await do_calc(q, coin, amount, days, exchange)
+        return ConversationHandler.END
+
+    ex = q.data.replace("pc_ex_", "")
+    if ex in selected:
+        selected.discard(ex)
+    else:
+        selected.add(ex)
+    context.user_data["pc_selected_ex"] = selected
     await q.edit_message_text(
-        f"🔍 Считаю доход *{coin}* ${amount:,.0f} за *{days}д* на *{ex_label}*...",
+        "Шаг 4/4: Выбери биржу.",
+        reply_markup=make_exchange_keyboard("pc", selected),
         parse_mode="Markdown"
     )
-    await do_calc(q, coin, amount, days, None if exchange == "all" else exchange)
-    return ConversationHandler.END
+    return PC_EXCH
 
 
 # ─────────────────────────────────────────────
@@ -2158,10 +2262,8 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass  # Если текст не изменился — игнорируем
 
 
-
-
 # ─────────────────────────────────────────────
-# DELTA-NEUTRAL
+# DELTA-NEUTRAL: поиск лучшей связки лонг/шорт
 # ─────────────────────────────────────────────
 
 def calc_std(rates):
@@ -2360,8 +2462,8 @@ async def delta_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await do_delta(update, coins, days)
             return ConversationHandler.END
     await update.message.reply_text(
-        "Поиск дельта-нейтральной пары\\n\\n"
-        "Введи одну или несколько монет через пробел:\\n\\n"
+        "Поиск дельта-нейтральной пары\n\n"
+        "Введи одну или несколько монет через пробел:\n\n"
         "Отмена: /cancel",
         parse_mode="Markdown"
     )
@@ -2370,21 +2472,22 @@ async def delta_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def delta_got_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text_in = update.message.text.strip()
+    # Если вдруг пришла команда — завершаем
     if text_in.startswith("/"):
         return ConversationHandler.END
     coins, days, _ = parse_tokens(text_in)
     if not coins:
         await update.message.reply_text(
-            "Не распознал монеты. Введи названия монет, например: ENJ или ENJ JTO RON"
+            "Не распознал монеты. Введи названия монет, например: ENJ или ENJ JTO RON",
+            parse_mode="Markdown"
         )
         return WAIT_DELTA_COIN
     await do_delta(update, coins, days)
     return ConversationHandler.END
 
 
-
 # ─────────────────────────────────────────────
-# DELTA-NEUTRAL
+# MAIN
 # ─────────────────────────────────────────────
 
 def calc_std(rates):
