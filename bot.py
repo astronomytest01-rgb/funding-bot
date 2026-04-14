@@ -43,6 +43,7 @@ EXCHANGES_ENABLED = {
     "blofin": True,
     "weex":   True,
     "coinw":  True,
+    "zoomex": True,
 }
 
 # Когда анализируешь без указания биржи — используются все включённые
@@ -603,6 +604,45 @@ def weex_fetch(coin, start_ms, end_ms):
     return [], last_err
 
 
+
+def zoomex_fetch(coin, start_ms, end_ms):
+    """Zoomex funding rate history (Bybit-compatible API).
+    Символ: BTCUSDT. Пагинация через cursor.
+    """
+    sym = f"{coin.upper()}USDT"
+    url = "https://openapi.zoomex.com/cloud/trade/v3/market/funding/history"
+    all_rows = []
+    cursor = None
+    try:
+        while True:
+            params = {"category": "linear", "symbol": sym, "limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+            r = requests.get(url, params=params, timeout=10)
+            if r.status_code != 200 or not r.text.strip():
+                return [], f"HTTP {r.status_code}"
+            data = r.json()
+            if data.get("retCode") != 0:
+                return [], data.get("retMsg", "error")
+            rows = data["result"]["list"]
+            if not rows:
+                break
+            for row in rows:
+                ts   = int(row["fundingRateTimestamp"])
+                rate = float(row["fundingRate"]) * 100
+                if ts < start_ms:
+                    return sorted(all_rows, key=lambda x: x[0]), sym
+                if ts <= end_ms:
+                    all_rows.append((ts, rate))
+            cursor = data["result"].get("nextPageCursor")
+            if not cursor:
+                break
+            time.sleep(0.1)
+        return sorted(all_rows, key=lambda x: x[0]), sym
+    except Exception as e:
+        return [], str(e)
+
+
 # ─────────────────────────────────────────────
 # УНИВЕРСАЛЬНЫЙ АНАЛИЗ
 # ─────────────────────────────────────────────
@@ -676,6 +716,7 @@ EXCHANGE_FETCHERS = {
     "blofin": blofin_fetch,
     "weex":   weex_fetch,
     "coinw":  coinw_fetch,
+    "zoomex": zoomex_fetch,
 }
 
 EXCHANGE_LABELS = {
@@ -689,6 +730,7 @@ EXCHANGE_LABELS = {
     "blofin": "BloFin",
     "weex":   "WEEX",
     "coinw":  "CoinW",
+    "zoomex": "Zoomex",
 }
 
 
@@ -1310,7 +1352,8 @@ async def cmd_analyze_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("KuCoin",  callback_data="an_ex_kucoin")],
         [InlineKeyboardButton("Toobit",  callback_data="an_ex_toobit"),
          InlineKeyboardButton("XT",      callback_data="an_ex_xt")],
-        [InlineKeyboardButton("CoinW",   callback_data="an_ex_coinw")],
+        [InlineKeyboardButton("CoinW",   callback_data="an_ex_coinw"),
+         InlineKeyboardButton("Zoomex",  callback_data="an_ex_zoomex")],
         [InlineKeyboardButton("Отмена",  callback_data="an_cancel")],
     ])
     await update.message.reply_text(
@@ -1330,7 +1373,7 @@ async def an_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     exchange = q.data.replace("an_ex_", "")
     context.user_data["an_exchange"] = exchange
     labels = {"phemex": "Phemex", "kucoin": "KuCoin", "toobit": "Toobit",
-              "xt": "XT", "coinw": "CoinW"}
+              "xt": "XT", "coinw": "CoinW", "zoomex": "Zoomex"}
     label = labels.get(exchange, exchange)
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Средняя ставка",  callback_data="an_method_rate"),
@@ -1546,7 +1589,7 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
         return
 
     labels = {"phemex": "Phemex", "kucoin": "KuCoin", "toobit": "Toobit",
-              "xt": "XT", "coinw": "CoinW"}
+              "xt": "XT", "coinw": "CoinW", "zoomex": "Zoomex"}
     label = labels.get(exchange, exchange)
     method_label = "Средняя ставка" if method == "rate" else f"Средний доход (${amount:,.0f}, ≥${threshold:.0f}/день)"
 
