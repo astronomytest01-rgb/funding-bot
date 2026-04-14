@@ -18,10 +18,6 @@ from telegram.ext import (
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
-# CoinW — данные из Supabase (коллектор собирает каждые 8 часов)
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
-
 DEFAULT_DAYS        = 7
 STABILITY_THRESHOLD = -0.04
 MAX_OUTLIER_PCT     = 25
@@ -42,7 +38,6 @@ EXCHANGES_ENABLED = {
     "gate":   True,
     "blofin": True,
     "weex":   True,
-    "coinw":  True,
 }
 
 # Когда анализируешь без указания биржи — используются все включённые
@@ -75,15 +70,6 @@ PC_AMT_NUM   = 42
 PC_DAYS      = 43
 PC_DAYS_NUM  = 44
 PC_EXCH      = 45
-
-# /analyze scan states
-AN_METHOD    = 50   # выбор метода (Средняя ставка / Средний доход)
-AN_AMT       = 51   # сумма позиции (только Средний доход)
-AN_AMT_NUM   = 52   # ввод суммы вручную
-AN_THRESH    = 53   # минимальный доход/день
-AN_THRESH_NUM= 54   # ввод порога вручную
-AN_DAYS      = 55   # выбор периода
-AN_DAYS_NUM  = 56   # ввод периода вручную
 
 # ─────────────────────────────────────────────
 # PHEMEX API
@@ -607,88 +593,28 @@ def weex_fetch(coin, start_ms, end_ms):
 # УНИВЕРСАЛЬНЫЙ АНАЛИЗ
 # ─────────────────────────────────────────────
 
-
-def coinw_fetch(coin, start_ms, end_ms):
-    """
-    Возвращает историю ставок фандинга CoinW из Supabase.
-    Данные собираются коллектором каждые 4 часа.
-    Дедупликация по funding_time — исключает дубли для монет с 8ч интервалом.
-    Формат: list of (timestamp_ms, rate_pct)
-    """
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return [], "SUPABASE_URL/KEY не заданы"
-
-    symbol = coin.upper()
-    from datetime import datetime, timezone
-    start_iso = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).isoformat()
-
-    try:
-        url = f"{SUPABASE_URL}/rest/v1/funding_rates"
-        headers = {
-            "apikey":        SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
-        }
-        params = {
-            "symbol":       f"eq.{symbol}",
-            "collected_at": f"gte.{start_iso}",
-            "order":        "funding_time.asc",
-            "limit":        "1000",
-            "select":       "rate_pct,collected_at,funding_time",
-        }
-        r = requests.get(url, headers=headers, params=params, timeout=10)
-        r.raise_for_status()
-        rows = r.json()
-
-        if not rows:
-            return [], f"Нет данных для {symbol} в БД"
-
-        # Дедупликация по funding_time — берём уникальные выплаты
-        seen_funding_times = set()
-        result = []
-        for row in rows:
-            ft = row.get("funding_time")
-            if ft:
-                if ft in seen_funding_times:
-                    continue
-                seen_funding_times.add(ft)
-                dt = datetime.fromisoformat(ft.replace("Z", "+00:00"))
-            else:
-                # Старые записи без funding_time — используем collected_at
-                dt = datetime.fromisoformat(
-                    row["collected_at"].replace("Z", "+00:00")
-                )
-            ts_ms = int(dt.timestamp() * 1000)
-            result.append((ts_ms, float(row["rate_pct"])))
-
-        return result, f"coinw_{symbol}"
-
-    except Exception as e:
-        return [], str(e)
-
 EXCHANGE_FETCHERS = {
     "phemex": phemex_fetch,
     "xt":     xt_fetch,
     "toobit": toobit_fetch,
-    "okx":    okx_fetch,
-    "bingx":  bingx_fetch,
+    "okx": okx_fetch,
+    "bingx": bingx_fetch,
     "kucoin": kucoin_fetch,
     "gate":   gate_fetch,
     "blofin": blofin_fetch,
     "weex":   weex_fetch,
-    "coinw":  coinw_fetch,
 }
 
 EXCHANGE_LABELS = {
     "phemex": "Phemex",
     "xt":     "XT",
     "toobit": "Toobit",
-    "okx":    "OKX",
-    "bingx":  "BingX",
+    "okx": "OKX",
+    "bingx": "BingX",
     "kucoin": "KuCoin",
     "gate":   "Gate.io",
     "blofin": "BloFin",
     "weex":   "WEEX",
-    "coinw":  "CoinW",
 }
 
 
@@ -802,14 +728,8 @@ def analyze_coin_multi(coin, start_ms, end_ms, exchanges):
 
 def parse_tokens(text):
     """'BTC ETH /days 14 /exchange xt' -> (coins, days, exchange)
-    Также поддерживает быстрый ввод без префиксов:
-    'BTC coinw 7' -> (['BTC'], 7, 'coinw')
-    'BTC ETH phemex 14' -> (['BTC', 'ETH'], 14, 'phemex')
+    Поддерживает как /days и /exchange так и --days и --exchange.
     """
-    KNOWN_EXCHANGES = set(EXCHANGE_FETCHERS.keys()) if 'EXCHANGE_FETCHERS' in dir() else {
-        "phemex", "xt", "toobit", "okx", "bingx", "kucoin", "gate", "blofin", "weex", "coinw"
-    }
-
     parts = text.strip().split()
     days = DEFAULT_DAYS
     exchange = None
@@ -826,17 +746,9 @@ def parse_tokens(text):
         # /exchange NAME или --exchange NAME
         if p in ("/exchange", "--exchange") and i + 1 < len(parts):
             exchange = parts[i + 1].lower(); i += 2; continue
-        # пропускаем команды вида /filter если вдруг попали в текст
+        # пропускаем команды вида /analyze если вдруг попали в текст
         if p in ("/filter", "/funding", "/calculator", "/start", "/help", "/settings", "/cancel"):
             i += 1; continue
-        # Распознаём название биржи без префикса
-        if p in KNOWN_EXCHANGES:
-            exchange = p; i += 1; continue
-        # Распознаём число как количество дней
-        try:
-            days = int(parts[i]); i += 1; continue
-        except ValueError:
-            pass
         coins.append(parts[i].upper())
         i += 1
     return coins, days, exchange
@@ -1295,287 +1207,70 @@ SCAN_EXCHANGE_FETCHERS = {
     "xt":     "xt",
 }
 
-
-# ─────────────────────────────────────────────
-# /analyze — скан монет с выбором биржи, метода и периода
-# ─────────────────────────────────────────────
-
-AN_ANOMALY_THRESHOLD = 0.8   # аномалии для метода "Средний доход" > ±0.8%
-
 async def cmd_analyze_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Шаг 1: выбор биржи."""
-    context.user_data.clear()
+    """Шаг 1: выбор биржи для скана."""
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Phemex",  callback_data="an_ex_phemex"),
-         InlineKeyboardButton("KuCoin",  callback_data="an_ex_kucoin")],
-        [InlineKeyboardButton("Toobit",  callback_data="an_ex_toobit"),
-         InlineKeyboardButton("XT",      callback_data="an_ex_xt")],
-        [InlineKeyboardButton("CoinW",   callback_data="an_ex_coinw")],
-        [InlineKeyboardButton("Отмена",  callback_data="an_cancel")],
+        [InlineKeyboardButton("📊 Phemex",  callback_data="analyze_ex_phemex"),
+         InlineKeyboardButton("📊 KuCoin",  callback_data="analyze_ex_kucoin")],
+        [InlineKeyboardButton("📊 Toobit",  callback_data="analyze_ex_toobit"),
+         InlineKeyboardButton("📊 XT",      callback_data="analyze_ex_xt")],
+        [InlineKeyboardButton("❌ Отмена",  callback_data="analyze_ex_cancel")],
     ])
     await update.message.reply_text(
-        "🔍 Скан монет по фандингу\n\nШаг 1/3: Выбери биржу:",
+        "🔍 *Скан монет по фандингу*\n\n"
+        f"Период: *{SCAN_DAYS} дней*\n"
+        f"Фильтр: только ✅ ПОДХОДЯТ\n\n"
+        "Выбери биржу для скана:",
         reply_markup=keyboard,
+        parse_mode="Markdown"
     )
-    return AN_METHOD
 
 
-async def an_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Шаг 2: биржа выбрана → выбор метода."""
+async def cmd_analyze_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 2: биржа выбрана, запускаем скан."""
     q = update.callback_query
     await q.answer()
-    if q.data == "an_cancel":
-        await q.edit_message_text("Отменено.")
-        return ConversationHandler.END
-    exchange = q.data.replace("an_ex_", "")
-    context.user_data["an_exchange"] = exchange
-    labels = {"phemex": "Phemex", "kucoin": "KuCoin", "toobit": "Toobit",
-              "xt": "XT", "coinw": "CoinW"}
-    label = labels.get(exchange, exchange)
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Средняя ставка",  callback_data="an_method_rate"),
-         InlineKeyboardButton("Средний доход",   callback_data="an_method_income")],
-        [InlineKeyboardButton("Отмена", callback_data="an_cancel")],
-    ])
-    await q.edit_message_text(
-        f"Биржа: {label}\n\nШаг 2/3: Выбери метод анализа:\n\n"
-        "Средняя ставка — стандартный фильтр\n"
-        "Средний доход — расчёт прибыли в день",
-        reply_markup=keyboard,
-    )
-    return AN_METHOD
 
-
-async def an_method_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Шаг 3a: метод выбран."""
-    q = update.callback_query
-    await q.answer()
-    if q.data == "an_cancel":
-        await q.edit_message_text("Отменено.")
-        return ConversationHandler.END
-    method = q.data.replace("an_method_", "")
-    context.user_data["an_method"] = method
-    if method == "income":
-        # Метод "Средний доход" → спрашиваем сумму
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("$15,000", callback_data="an_amt_15000"),
-             InlineKeyboardButton("$20,000", callback_data="an_amt_20000")],
-            [InlineKeyboardButton("$25,000", callback_data="an_amt_25000"),
-             InlineKeyboardButton("Другая",  callback_data="an_amt_other")],
-            [InlineKeyboardButton("Отмена",  callback_data="an_cancel")],
-        ])
-        await q.edit_message_text(
-            "Метод: Средний доход\n\nШаг: Введи сумму позиции (USDT):",
-            reply_markup=keyboard,
-        )
-        return AN_AMT
-    else:
-        # Метод "Средняя ставка" → сразу к периоду
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("3 дня",  callback_data="an_days_3"),
-             InlineKeyboardButton("7 дней", callback_data="an_days_7")],
-            [InlineKeyboardButton("14 дней", callback_data="an_days_14"),
-             InlineKeyboardButton("Другой", callback_data="an_days_other")],
-            [InlineKeyboardButton("Отмена", callback_data="an_cancel")],
-        ])
-        await q.edit_message_text(
-            "Метод: Средняя ставка\n\nШаг 3/3: Выбери период анализа:",
-            reply_markup=keyboard,
-        )
-        return AN_DAYS
-
-
-async def an_amt_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Шаг: сумма выбрана кнопкой."""
-    q = update.callback_query
-    await q.answer()
-    if q.data == "an_cancel":
-        await q.edit_message_text("Отменено.")
-        return ConversationHandler.END
-    if q.data == "an_amt_other":
-        await q.edit_message_text("Введи сумму в USDT, например `30000`:", parse_mode="Markdown")
-        return AN_AMT_NUM
-    amount = float(q.data.replace("an_amt_", ""))
-    context.user_data["an_amount"] = amount
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("$20",  callback_data="an_thr_20"),
-         InlineKeyboardButton("$25",  callback_data="an_thr_25")],
-        [InlineKeyboardButton("$40",  callback_data="an_thr_40"),
-         InlineKeyboardButton("$50",  callback_data="an_thr_50")],
-        [InlineKeyboardButton("Другое", callback_data="an_thr_other")],
-        [InlineKeyboardButton("Отмена", callback_data="an_cancel")],
-    ])
-    await q.edit_message_text(
-        f"Сумма: ${amount:,.0f}\n\nМинимальный доход в день:",
-        reply_markup=keyboard,
-    )
-    return AN_THRESH
-
-
-async def an_amt_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Шаг: сумма введена вручную."""
-    try:
-        amount = float(update.message.text.strip().replace("$","").replace(",",""))
-        if amount <= 0: raise ValueError
-    except ValueError:
-        await update.message.reply_text("Введи число, например `30000`:", parse_mode="Markdown")
-        return AN_AMT_NUM
-    context.user_data["an_amount"] = amount
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("$20",  callback_data="an_thr_20"),
-         InlineKeyboardButton("$25",  callback_data="an_thr_25")],
-        [InlineKeyboardButton("$40",  callback_data="an_thr_40"),
-         InlineKeyboardButton("$50",  callback_data="an_thr_50")],
-        [InlineKeyboardButton("Другое", callback_data="an_thr_other")],
-        [InlineKeyboardButton("Отмена", callback_data="an_cancel")],
-    ])
-    await update.message.reply_text(
-        f"Сумма: ${amount:,.0f}\n\nМинимальный доход в день:",
-        reply_markup=keyboard,
-    )
-    return AN_THRESH
-
-
-async def an_thresh_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Шаг: порог дохода выбран кнопкой."""
-    q = update.callback_query
-    await q.answer()
-    if q.data == "an_cancel":
-        await q.edit_message_text("Отменено.")
-        return ConversationHandler.END
-    if q.data == "an_thr_other":
-        await q.edit_message_text("Введи минимальный доход в день ($), например `30`:", parse_mode="Markdown")
-        return AN_THRESH_NUM
-    threshold = float(q.data.replace("an_thr_", ""))
-    context.user_data["an_threshold"] = threshold
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("3 дня",  callback_data="an_days_3"),
-         InlineKeyboardButton("7 дней", callback_data="an_days_7")],
-        [InlineKeyboardButton("14 дней", callback_data="an_days_14"),
-         InlineKeyboardButton("Другой", callback_data="an_days_other")],
-        [InlineKeyboardButton("Отмена", callback_data="an_cancel")],
-    ])
-    await q.edit_message_text(
-        f"Порог: ≥${threshold:.0f}/день\n\nШаг 3/3: Выбери период анализа:",
-        reply_markup=keyboard,
-    )
-    return AN_DAYS
-
-
-async def an_thresh_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Шаг: порог введён вручную."""
-    try:
-        threshold = float(update.message.text.strip().replace("$",""))
-        if threshold <= 0: raise ValueError
-    except ValueError:
-        await update.message.reply_text("Введи число, например `30`:", parse_mode="Markdown")
-        return AN_THRESH_NUM
-    context.user_data["an_threshold"] = threshold
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("3 дня",  callback_data="an_days_3"),
-         InlineKeyboardButton("7 дней", callback_data="an_days_7")],
-        [InlineKeyboardButton("14 дней", callback_data="an_days_14"),
-         InlineKeyboardButton("Другой", callback_data="an_days_other")],
-        [InlineKeyboardButton("Отмена", callback_data="an_cancel")],
-    ])
-    await update.message.reply_text(
-        f"Порог: ≥${threshold:.0f}/день\n\nШаг 3/3: Выбери период анализа:",
-        reply_markup=keyboard,
-    )
-    return AN_DAYS
-
-
-async def an_days_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Шаг: период выбран кнопкой."""
-    q = update.callback_query
-    await q.answer()
-    if q.data == "an_cancel":
-        await q.edit_message_text("Отменено.")
-        return ConversationHandler.END
-    if q.data == "an_days_other":
-        await q.edit_message_text("Введи количество дней числом, например `30`:", parse_mode="Markdown")
-        return AN_DAYS_NUM
-    days = int(q.data.replace("an_days_", ""))
-    context.user_data["an_days"] = days
-    await q.edit_message_text("Запускаю скан...")
-    await an_run_scan(q, context)
-    return ConversationHandler.END
-
-
-async def an_days_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Шаг: период введён вручную."""
-    try:
-        days = int(update.message.text.strip())
-        if days <= 0: raise ValueError
-    except ValueError:
-        await update.message.reply_text("Введи число, например `30`:", parse_mode="Markdown")
-        return AN_DAYS_NUM
-    context.user_data["an_days"] = days
-    await update.message.reply_text("Запускаю скан...")
-    await an_run_scan(update, context)
-    return ConversationHandler.END
-
-
-async def an_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if q:
-        await q.answer()
-        await q.edit_message_text("Отменено.")
-    else:
-        await update.message.reply_text("Отменено.")
-    return ConversationHandler.END
-
-
-async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
-    """Запускает скан с выбранными параметрами."""
-    # Получаем message для ответов
-    if hasattr(trigger, 'message'):
-        msg = trigger.message
-    else:
-        msg = trigger
-
-    exchange  = context.user_data.get("an_exchange", "phemex")
-    method    = context.user_data.get("an_method", "rate")
-    days      = context.user_data.get("an_days", SCAN_DAYS)
-    amount    = context.user_data.get("an_amount", 0)
-    threshold = context.user_data.get("an_threshold", 0)
-    chat_id   = msg.chat_id
-
-    if _scan_running.get(chat_id):
-        await msg.reply_text("⏳ Скан уже запущен.")
+    if q.data == "analyze_ex_cancel":
+        await q.edit_message_text("❌ Отменено.")
         return
 
-    labels = {"phemex": "Phemex", "kucoin": "KuCoin", "toobit": "Toobit",
-              "xt": "XT", "coinw": "CoinW"}
-    label = labels.get(exchange, exchange)
-    method_label = "Средняя ставка" if method == "rate" else f"Средний доход (${amount:,.0f}, ≥${threshold:.0f}/день)"
+    exchange = q.data.replace("analyze_ex_", "")
+    chat_id  = q.message.chat_id
 
-    # Получаем список монет
+    if _scan_running.get(chat_id):
+        await q.edit_message_text("⏳ Скан уже запущен.")
+        return
+
+    label = {"phemex": "Phemex", "kucoin": "KuCoin", "toobit": "Toobit", "xt": "XT"}.get(exchange, exchange)
+    await q.edit_message_text(f"🔍 Загружаю список монет для скана {label}...")
+
     try:
-        if exchange == "coinw":
-            r = requests.get("https://api.coinw.com/v1/perpum/instruments", timeout=15)
-            all_coins = [x["base"].upper() for x in r.json().get("data", [])]
-        else:
-            all_coins = phemex_get_all_symbols()
+        all_coins = phemex_get_all_symbols()
     except Exception as e:
-        await msg.reply_text(f"❌ Ошибка получения списка монет: {e}")
+        await q.message.reply_text(f"❌ Ошибка получения списка: {e}")
         return
 
     total = len(all_coins)
-    await msg.reply_text(
+    await q.message.reply_text(
         f"📋 Скан *{label}* — {total} монет\n"
-        f"Метод: *{method_label}*\n"
-        f"Период: *{days} дней*\n",
+        f"Период: *{SCAN_DAYS} дней* | Порции: *{SCAN_BATCH}* монет\n"
+        f"Только ✅ ПОДХОДЯТ\n\n"
+        "",
         parse_mode="Markdown"
     )
 
     _scan_running[chat_id] = True
     now_ms   = int(time.time() * 1000)
-    start_ms = now_ms - days * 24 * 60 * 60 * 1000
+    start_ms = now_ms - SCAN_DAYS * 24 * 60 * 60 * 1000
 
-    fetcher = phemex_fetch if exchange == "phemex" else EXCHANGE_FETCHERS.get(exchange)
+    # Выбираем fetcher
+    if exchange == "phemex":
+        fetcher = phemex_fetch
+    else:
+        fetcher = EXCHANGE_FETCHERS.get(exchange)
     if not fetcher:
-        await msg.reply_text(f"❌ Нет fetcher для биржи {exchange}")
+        await q.message.reply_text(f"❌ Нет fetcher для биржи {exchange}")
         _scan_running[chat_id] = False
         return
 
@@ -1584,8 +1279,9 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
 
     for batch_idx, batch in enumerate(batches):
         if not _scan_running.get(chat_id):
-            await msg.reply_text(
-                f"⛔ Скан остановлен на порции {batch_idx+1}/{len(batches)}"
+            await q.message.reply_text(
+                f"⛔ Скан остановлен на порции {batch_idx+1}/{len(batches)}\n"
+                f"Проанализировано: {batch_idx*SCAN_BATCH}/{total} монет"
             )
             return
 
@@ -1598,62 +1294,24 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 rows = []
             if not rows:
-                time.sleep(0.15)
                 continue
 
-            rates = [r for _, r in rows]
-            if not rates:
-                time.sleep(0.15)
+            rates   = [r for _, r in rows]
+            total_r = len(rates)
+            if not total_r:
                 continue
 
-            if method == "rate":
-                # ── Стандартный метод ─────────────────────────────────────
-                r = analyze_rates(rates)
-                if not r or r["category"] == "fail":
-                    time.sleep(0.15)
-                    continue
-                direction = r["direction"]
-                key_avg   = r["neg_avg"] if direction == "LONG" else r["pos_avg"]
-                outlier   = r["outlier_pct"]
-                category  = r["category"]
-                batch_results.append((coin, key_avg, outlier, direction, category, None))
-                passed.append((coin, key_avg, outlier, direction, category, None))
+            r = analyze_rates(rates)
+            if not r or r["category"] == "fail":
+                continue
 
-            else:
-                # ── Метод "Средний доход" ─────────────────────────────────
-                # Фильтр аномалий > ±0.8%
-                clean = [r for r in rates if abs(r) <= AN_ANOMALY_THRESHOLD]
-                if not clean:
-                    time.sleep(0.15)
-                    continue
+            direction = r["direction"]
+            key_avg   = r["neg_avg"] if direction == "LONG" else r["pos_avg"]
+            outlier   = r["outlier_pct"]
+            category  = r["category"]  # "full" или "partial"
 
-                neg       = [r for r in clean if r < 0]
-                neg_ratio = len(neg) / len(clean)
-
-                # Стабильность: минимум 30% отрицательных
-                if neg_ratio < MIN_NEG_RATIO:
-                    time.sleep(0.15)
-                    continue
-
-                # Среднее по всем выплатам
-                avg_rate = sum(clean) / len(clean)
-                if avg_rate >= 0:
-                    time.sleep(0.15)
-                    continue
-
-                # payments_per_day = кол-во выплат за период / кол-во дней
-                payments_per_day = len(clean) / days
-                daily_income     = amount * abs(avg_rate) / 100 * payments_per_day
-
-                if daily_income < threshold:
-                    time.sleep(0.15)
-                    continue
-
-                # outlier для отображения
-                below   = sum(1 for r in clean if r <= STABILITY_THRESHOLD)
-                outlier = (len(clean) - below) / len(clean) * 100
-                batch_results.append((coin, avg_rate, outlier, "LONG", "income", daily_income))
-                passed.append((coin, avg_rate, outlier, "LONG", "income", daily_income))
+            batch_results.append((coin, key_avg, outlier, direction, category))
+            passed.append((coin, key_avg, outlier, direction, category))
 
             time.sleep(0.15)
 
@@ -1662,65 +1320,58 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
 
         if batch_results:
             lines = [f"📊 Порция {batch_idx+1}/{len(batches)} [{scanned}/{total} | осталось {remaining}]\n"]
-            for coin, avg, op, direction, cat, income in batch_results:
+            for coin, na, op, direction, cat in batch_results:
                 dir_icon = "🟢" if direction == "LONG" else "🔴"
-                if cat == "income":
-                    lines.append(f"💰 {dir_icon} `{coin}` avg `{avg:+.4f}%` ~${income:.1f}/день")
-                else:
-                    cat_icon = "✅" if cat == "full" else "⚡"
-                    lines.append(f"{cat_icon} {dir_icon} `{coin}` avg `{avg:+.4f}%` выбр `{op:.0f}%`")
-            await msg.reply_text("\n".join(lines), parse_mode="Markdown")
+                cat_icon = "✅" if cat == "full" else "⚡"
+                lines.append(f"{cat_icon} {dir_icon} `{coin}` avg `{na:+.4f}%` выбр `{op:.0f}%`")
+            await q.message.reply_text("\n".join(lines), parse_mode="Markdown")
         else:
             if batch_idx % 3 == 2 or batch_idx == len(batches) - 1:
-                await msg.reply_text(
+                await q.message.reply_text(
                     f"⏳ {scanned}/{total} | найдено: {len(passed)} | осталось {remaining}"
                 )
 
     _scan_running[chat_id] = False
 
     if not passed:
-        await msg.reply_text(
-            f"Скан {label} завершён: {total} монет\n\nНичего не найдено за {days} дней.",
+        await q.message.reply_text(
+            f"✅ Скан {label} завершён: {total} монет\n\n"
+            f"За {SCAN_DAYS} дней ни одна монета не прошла фильтры.",
+            parse_mode="Markdown"
         )
         return
 
-    # Итоговый отчёт
-    lines = [f"✅ *Скан {label} завершён* — {total} монет за {days} дней\n"]
+    passed.sort(key=lambda x: x[1])
+    lines = [f"✅ *Скан {label} завершён* — {total} монет за {SCAN_DAYS} дней\n"]
+    full_longs  = [(c, na, op) for c, na, op, d, cat in passed if d == "LONG"  and cat == "full"]
+    full_shorts = [(c, na, op) for c, na, op, d, cat in passed if d == "SHORT" and cat == "full"]
+    part_longs  = [(c, na, op) for c, na, op, d, cat in passed if d == "LONG"  and cat == "partial"]
+    part_shorts = [(c, na, op) for c, na, op, d, cat in passed if d == "SHORT" and cat == "partial"]
 
-    if method == "income":
-        passed_sorted = sorted(passed, key=lambda x: -(x[5] or 0))
-        lines.append(f"💰 *Средний доход* ≥${threshold:.0f}/день ({len(passed_sorted)}):")
-        for coin, avg, op, direction, cat, income in passed_sorted:
-            dir_icon = "🟢" if direction == "LONG" else "🔴"
-            lines.append(f"  {dir_icon} `{coin}` avg `{avg:+.4f}%` ~${income:.1f}/день выбр `{op:.0f}%`")
-    else:
-        full_longs  = [(c,a,o) for c,a,o,d,cat,_ in passed if d=="LONG"  and cat=="full"]
-        full_shorts = [(c,a,o) for c,a,o,d,cat,_ in passed if d=="SHORT" and cat=="full"]
-        part_longs  = [(c,a,o) for c,a,o,d,cat,_ in passed if d=="LONG"  and cat=="partial"]
-        part_shorts = [(c,a,o) for c,a,o,d,cat,_ in passed if d=="SHORT" and cat=="partial"]
-        if full_longs:
-            lines.append(f"\n✅ 🟢 *ЛОНГ — ПОДХОДЯТ* ({len(full_longs)}):")
-            for c,a,o in sorted(full_longs, key=lambda x: x[1]):
-                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%`")
-        if full_shorts:
-            lines.append(f"\n✅ 🔴 *ШОРТ — ПОДХОДЯТ* ({len(full_shorts)}):")
-            for c,a,o in sorted(full_shorts, key=lambda x: -x[1]):
-                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%`")
-        if part_longs:
-            lines.append(f"\n⚡ 🟢 *ЛОНГ — ЧАСТИЧНО* ({len(part_longs)}):")
-            for c,a,o in sorted(part_longs, key=lambda x: x[1]):
-                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%`")
-        if part_shorts:
-            lines.append(f"\n⚡ 🔴 *ШОРТ — ЧАСТИЧНО* ({len(part_shorts)}):")
-            for c,a,o in sorted(part_shorts, key=lambda x: -x[1]):
-                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%`")
+    if full_longs:
+        lines.append(f"✅ 🟢 *ЛОНГ — ПОДХОДЯТ* ({len(full_longs)}):")
+        for coin, na, op in sorted(full_longs, key=lambda x: x[1]):
+            lines.append(f"  `{coin}` avg `{na:+.4f}%` выбр `{op:.0f}%`")
+    if full_shorts:
+        lines.append(f"\n✅ 🔴 *ШОРТ — ПОДХОДЯТ* ({len(full_shorts)}):")
+        for coin, na, op in sorted(full_shorts, key=lambda x: -x[1]):
+            lines.append(f"  `{coin}` avg `{na:+.4f}%` выбр `{op:.0f}%`")
+    if part_longs:
+        lines.append(f"\n⚡ 🟢 *ЛОНГ — ЧАСТИЧНО* ({len(part_longs)}):")
+        for coin, na, op in sorted(part_longs, key=lambda x: x[1]):
+            lines.append(f"  `{coin}` avg `{na:+.4f}%` выбр `{op:.0f}%`")
+    if part_shorts:
+        lines.append(f"\n⚡ 🔴 *ШОРТ — ЧАСТИЧНО* ({len(part_shorts)}):")
+        for coin, na, op in sorted(part_shorts, key=lambda x: -x[1]):
+            lines.append(f"  `{coin}` avg `{na:+.4f}%` выбр `{op:.0f}%`")
 
     reply = "\n".join(lines)
     if len(reply) > 4000:
         for chunk in [reply[i:i+4000] for i in range(0, len(reply), 4000)]:
-            await msg.reply_text(chunk, parse_mode="Markdown")
+            await q.message.reply_text(chunk, parse_mode="Markdown")
     else:
-        await msg.reply_text(reply, parse_mode="Markdown")
+        await q.message.reply_text(reply, parse_mode="Markdown")
+
 
 
 
@@ -1728,44 +1379,65 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
 # HELPERS ДЛЯ КНОПОК
 # ─────────────────────────────────────────────
 
-def make_days_keyboard(cb_prefix):
-    """Кнопки выбора периода."""
+def make_days_keyboard(cb_prefix, extra_short=False):
+    """Кнопки выбора периода.
+    extra_short=True — добавляет 1 день и 3 дня (для /funding).
+    """
+    if extra_short:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("1 день",        callback_data=f"{cb_prefix}_days_1"),
+             InlineKeyboardButton("3 дня",         callback_data=f"{cb_prefix}_days_3")],
+            [InlineKeyboardButton("7 дней",        callback_data=f"{cb_prefix}_days_7"),
+             InlineKeyboardButton("14 дней",       callback_data=f"{cb_prefix}_days_14")],
+            [InlineKeyboardButton("Другой период", callback_data=f"{cb_prefix}_days_other")],
+            [InlineKeyboardButton("Отмена",        callback_data=f"{cb_prefix}_cancel")],
+        ])
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("1 день",  callback_data=f"{cb_prefix}_days_1"),
-         InlineKeyboardButton("3 дня",   callback_data=f"{cb_prefix}_days_3")],
-        [InlineKeyboardButton("7 дней",  callback_data=f"{cb_prefix}_days_7"),
-         InlineKeyboardButton("14 дней", callback_data=f"{cb_prefix}_days_14")],
-        [InlineKeyboardButton("✏️ Другое", callback_data=f"{cb_prefix}_days_other")],
-        [InlineKeyboardButton("❌ Отмена", callback_data=f"{cb_prefix}_cancel")],
+        [InlineKeyboardButton("7 дней",       callback_data=f"{cb_prefix}_days_7"),
+         InlineKeyboardButton("14 дней",      callback_data=f"{cb_prefix}_days_14")],
+        [InlineKeyboardButton("Другой период", callback_data=f"{cb_prefix}_days_other")],
+        [InlineKeyboardButton("Отмена",        callback_data=f"{cb_prefix}_cancel")],
     ])
 
 
-def make_exchange_keyboard(cb_prefix):
-    """Кнопки выбора биржи."""
+def make_exchange_keyboard(cb_prefix, selected=None):
+    """Кнопки выбора бирж с мультивыбором.
+    selected — set выбранных бирж (чекбоксы).
+    Внизу кнопки: Все / Подтвердить / Отмена.
+    """
+    if selected is None:
+        selected = set()
     buttons = []
     row = []
     for ex, label in EXCHANGE_LABELS.items():
         if not EXCHANGES_ENABLED.get(ex, False):
             continue
-        row.append(InlineKeyboardButton(label, callback_data=f"{cb_prefix}_ex_{ex}"))
+        icon = "✅ " if ex in selected else ""
+        row.append(InlineKeyboardButton(
+            f"{icon}{label}",
+            callback_data=f"{cb_prefix}_ex_{ex}"
+        ))
         if len(row) == 3:
             buttons.append(row)
             row = []
     if row:
         buttons.append(row)
-    buttons.append([InlineKeyboardButton("🌐 Все биржи", callback_data=f"{cb_prefix}_ex_all")])
-    buttons.append([InlineKeyboardButton("❌ Отмена",    callback_data=f"{cb_prefix}_cancel")])
+    buttons.append([
+        InlineKeyboardButton("Все биржи",   callback_data=f"{cb_prefix}_ex_all"),
+        InlineKeyboardButton("Подтвердить", callback_data=f"{cb_prefix}_ex_confirm"),
+    ])
+    buttons.append([InlineKeyboardButton("Отмена", callback_data=f"{cb_prefix}_cancel")])
     return InlineKeyboardMarkup(buttons)
 
 
 def make_amount_keyboard(cb_prefix):
     """Кнопки выбора суммы."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("$15,000", callback_data=f"{cb_prefix}_amt_15000"),
-         InlineKeyboardButton("$20,000", callback_data=f"{cb_prefix}_amt_20000")],
-        [InlineKeyboardButton("$25,000", callback_data=f"{cb_prefix}_amt_25000"),
-         InlineKeyboardButton("✏️ Другое", callback_data=f"{cb_prefix}_amt_other")],
-        [InlineKeyboardButton("❌ Отмена", callback_data=f"{cb_prefix}_cancel")],
+        [InlineKeyboardButton("15000",  callback_data=f"{cb_prefix}_amt_15000"),
+         InlineKeyboardButton("20000",  callback_data=f"{cb_prefix}_amt_20000")],
+        [InlineKeyboardButton("25000",  callback_data=f"{cb_prefix}_amt_25000"),
+         InlineKeyboardButton("Другое", callback_data=f"{cb_prefix}_amt_other")],
+        [InlineKeyboardButton("Отмена", callback_data=f"{cb_prefix}_cancel")],
     ])
 
 
@@ -1781,11 +1453,8 @@ async def acf_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await do_analyze(update, coins, days, exchange)
             return ConversationHandler.END
     await update.message.reply_text(
-        "🔍 *Анализ монет по фильтрам*\\n\\n"
-        "Шаг 1/3: Введи название монеты или несколько через пробел:\\n\\n"
-        "`ENJ`\\n"
-        "`ENJ RON JTO`\\n\\n"
-        "💡 Быстрый ввод: `/analyze-coin-match-filter ENJ phemex 7`\\n\\n"
+        "🔍 Анализ монет по фильтрам\n\n"
+        "Шаг 1/3: Введи название монеты или несколько через пробел\n\n"
         "Отмена: /cancel",
         parse_mode="Markdown"
     )
@@ -1800,7 +1469,7 @@ async def acf_got_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ACF_COIN
     context.user_data["acf_coins"] = coins
     await update.message.reply_text(
-        f"Монеты: *{' '.join(coins)}*\\n\\nШаг 2/3: Выбери период анализа:",
+        f"Шаг 2/3: Выбери период анализа.",
         reply_markup=make_days_keyboard("acf"),
         parse_mode="Markdown"
     )
@@ -1820,7 +1489,7 @@ async def acf_days_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     days = int(q.data.split("_")[-1])
     context.user_data["acf_days"] = days
     await q.edit_message_text(
-        f"Период: *{days} дн.*\\n\\nШаг 3/3: Выбери биржу:",
+        "Шаг 3/3: Выбери биржу.",
         reply_markup=make_exchange_keyboard("acf"),
         parse_mode="Markdown"
     )
@@ -1837,7 +1506,7 @@ async def acf_days_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ACF_DAYS_NUM
     context.user_data["acf_days"] = days
     await update.message.reply_text(
-        f"Период: *{days} дн.*\\n\\nШаг 3/3: Выбери биржу:",
+        "Шаг 3/3: Выбери биржу.",
         reply_markup=make_exchange_keyboard("acf"),
         parse_mode="Markdown"
     )
@@ -1845,23 +1514,52 @@ async def acf_days_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def acf_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Шаг 3: нажата кнопка биржи, запускаем анализ."""
+    """Шаг 3: мультивыбор бирж, запуск после Подтвердить."""
     q = update.callback_query
     await q.answer()
+
     if q.data == "acf_cancel":
-        await q.edit_message_text("❌ Отменено.")
+        await q.edit_message_text("Отменено.")
         return ConversationHandler.END
-    exchange = q.data.replace("acf_ex_", "")
-    coins    = context.user_data.get("acf_coins", [])
-    days     = context.user_data.get("acf_days", DEFAULT_DAYS)
-    ex_label = "все биржи" if exchange == "all" else EXCHANGE_LABELS.get(exchange, exchange)
+
+    selected = context.user_data.get("acf_selected_ex", set())
+
+    if q.data == "acf_ex_all":
+        selected = set(ex for ex in EXCHANGES_ENABLED if EXCHANGES_ENABLED[ex])
+        context.user_data["acf_selected_ex"] = selected
+        await q.edit_message_text(
+            "Шаг 3/3: Выбери биржу.",
+            reply_markup=make_exchange_keyboard("acf", selected),
+            parse_mode="Markdown"
+        )
+        return ACF_EXCH
+
+    if q.data == "acf_ex_confirm":
+        if not selected:
+            selected = set(ex for ex in EXCHANGES_ENABLED if EXCHANGES_ENABLED[ex])
+        coins    = context.user_data.get("acf_coins", [])
+        days     = context.user_data.get("acf_days", DEFAULT_DAYS)
+        ex_label = ", ".join(EXCHANGE_LABELS.get(e, e) for e in selected)
+        await q.edit_message_text(
+            f"Анализирую {' '.join(coins)} за {days}д на {ex_label}...",
+        )
+        exchange = list(selected)[0] if len(selected) == 1 else None
+        await do_analyze(q, coins, days, exchange, selected if len(selected) > 1 else None)
+        return ConversationHandler.END
+
+    # Переключаем выбор биржи
+    ex = q.data.replace("acf_ex_", "")
+    if ex in selected:
+        selected.discard(ex)
+    else:
+        selected.add(ex)
+    context.user_data["acf_selected_ex"] = selected
     await q.edit_message_text(
-        f"🔍 Анализирую *{' '.join(coins)}* за *{days}д* на *{ex_label}*...",
+        "Шаг 3/3: Выбери биржу.",
+        reply_markup=make_exchange_keyboard("acf", selected),
         parse_mode="Markdown"
     )
-    # Создаём фейковый update с message для do_analyze
-    await do_analyze(q, coins, days, None if exchange == "all" else exchange)
-    return ConversationHandler.END
+    return ACF_EXCH
 
 
 # ─────────────────────────────────────────────
@@ -1876,10 +1574,8 @@ async def fr_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await do_show(update, coins[0], days, exchange)
             return ConversationHandler.END
     await update.message.reply_text(
-        "📈 *Ставки фандинга по монете*\\n\\n"
-        "Шаг 1/3: Введи название монеты:\\n\\n"
-        "`ENJ`\\n\\n"
-        "💡 Быстрый ввод: `/funding-rates ENJ phemex 7`\\n\\n"
+        "📈 Ставки фандинга по монете\n\n"
+        "Шаг 1/3: Введи название монеты\n\n"
         "Отмена: /cancel",
         parse_mode="Markdown"
     )
@@ -1893,8 +1589,8 @@ async def fr_got_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return FR_COIN
     context.user_data["fr_coin"] = coins[0]
     await update.message.reply_text(
-        f"Монета: *{coins[0]}*\\n\\nШаг 2/3: Выбери период:",
-        reply_markup=make_days_keyboard("fr"),
+        "Шаг 2/3: Выбери период анализа.",
+        reply_markup=make_days_keyboard("fr", extra_short=True),
         parse_mode="Markdown"
     )
     return FR_DAYS
@@ -1912,7 +1608,7 @@ async def fr_days_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     days = int(q.data.split("_")[-1])
     context.user_data["fr_days"] = days
     await q.edit_message_text(
-        f"Период: *{days} дн.*\\n\\nШаг 3/3: Выбери биржу:",
+        "Шаг 3/3: Выбери биржу.",
         reply_markup=make_exchange_keyboard("fr"),
         parse_mode="Markdown"
     )
@@ -1928,7 +1624,7 @@ async def fr_days_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return FR_DAYS_NUM
     context.user_data["fr_days"] = days
     await update.message.reply_text(
-        f"Период: *{days} дн.*\\n\\nШаг 3/3: Выбери биржу:",
+        "Шаг 3/3: Выбери биржу.",
         reply_markup=make_exchange_keyboard("fr"),
         parse_mode="Markdown"
     )
@@ -1938,19 +1634,46 @@ async def fr_days_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def fr_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+
     if q.data == "fr_cancel":
-        await q.edit_message_text("❌ Отменено.")
+        await q.edit_message_text("Отменено.")
         return ConversationHandler.END
-    exchange = q.data.replace("fr_ex_", "")
-    coin     = context.user_data.get("fr_coin", "")
-    days     = context.user_data.get("fr_days", DEFAULT_DAYS)
-    ex_label = "все биржи" if exchange == "all" else EXCHANGE_LABELS.get(exchange, exchange)
+
+    selected = context.user_data.get("fr_selected_ex", set())
+
+    if q.data == "fr_ex_all":
+        selected = set(ex for ex in EXCHANGES_ENABLED if EXCHANGES_ENABLED[ex])
+        context.user_data["fr_selected_ex"] = selected
+        await q.edit_message_text(
+            "Шаг 3/3: Выбери биржу.",
+            reply_markup=make_exchange_keyboard("fr", selected),
+            parse_mode="Markdown"
+        )
+        return FR_EXCH
+
+    if q.data == "fr_ex_confirm":
+        if not selected:
+            selected = set(ex for ex in EXCHANGES_ENABLED if EXCHANGES_ENABLED[ex])
+        coin     = context.user_data.get("fr_coin", "")
+        days     = context.user_data.get("fr_days", DEFAULT_DAYS)
+        ex_label = ", ".join(EXCHANGE_LABELS.get(e, e) for e in selected)
+        await q.edit_message_text(f"Загружаю ставки {coin} за {days}д на {ex_label}...")
+        exchange = list(selected)[0] if len(selected) == 1 else None
+        await do_show(q, coin, days, exchange)
+        return ConversationHandler.END
+
+    ex = q.data.replace("fr_ex_", "")
+    if ex in selected:
+        selected.discard(ex)
+    else:
+        selected.add(ex)
+    context.user_data["fr_selected_ex"] = selected
     await q.edit_message_text(
-        f"🔍 Загружаю ставки *{coin}* за *{days}д* на *{ex_label}*...",
+        "Шаг 3/3: Выбери биржу.",
+        reply_markup=make_exchange_keyboard("fr", selected),
         parse_mode="Markdown"
     )
-    await do_show(q, coin, days, None if exchange == "all" else exchange)
-    return ConversationHandler.END
+    return FR_EXCH
 
 
 # ─────────────────────────────────────────────
@@ -1972,10 +1695,8 @@ async def pc_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await do_calc(update, remaining[0], amount, days, exchange)
             return ConversationHandler.END
     await update.message.reply_text(
-        "💰 *Калькулятор дохода от фандинга*\\n\\n"
-        "Шаг 1/4: Введи название монеты:\\n\\n"
-        "`ENJ`\\n\\n"
-        "💡 Быстрый ввод: `/profit-calculator ENJ 25000 7 phemex`\\n\\n"
+        "💰 Калькулятор дохода от фандинга\n\n"
+        "Шаг 1/4: Введи название монеты\n\n"
         "Отмена: /cancel",
         parse_mode="Markdown"
     )
@@ -1989,7 +1710,7 @@ async def pc_got_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return PC_COIN
     context.user_data["pc_coin"] = coins[0]
     await update.message.reply_text(
-        f"Монета: *{coins[0]}*\\n\\nШаг 2/4: Выбери сумму позиции (USDT):",
+        "Шаг 2/4: Выбери сумму позиции (USDT).",
         reply_markup=make_amount_keyboard("pc"),
         parse_mode="Markdown"
     )
@@ -2069,20 +1790,47 @@ async def pc_days_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def pc_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+
     if q.data == "pc_cancel":
-        await q.edit_message_text("❌ Отменено.")
+        await q.edit_message_text("Отменено.")
         return ConversationHandler.END
-    exchange = q.data.replace("pc_ex_", "")
-    coin     = context.user_data.get("pc_coin", "")
-    amount   = context.user_data.get("pc_amount", 0)
-    days     = context.user_data.get("pc_days", DEFAULT_DAYS)
-    ex_label = "все биржи" if exchange == "all" else EXCHANGE_LABELS.get(exchange, exchange)
+
+    selected = context.user_data.get("pc_selected_ex", set())
+
+    if q.data == "pc_ex_all":
+        selected = set(ex for ex in EXCHANGES_ENABLED if EXCHANGES_ENABLED[ex])
+        context.user_data["pc_selected_ex"] = selected
+        await q.edit_message_text(
+            "Шаг 4/4: Выбери биржу.",
+            reply_markup=make_exchange_keyboard("pc", selected),
+            parse_mode="Markdown"
+        )
+        return PC_EXCH
+
+    if q.data == "pc_ex_confirm":
+        if not selected:
+            selected = set(ex for ex in EXCHANGES_ENABLED if EXCHANGES_ENABLED[ex])
+        coin   = context.user_data.get("pc_coin", "")
+        amount = context.user_data.get("pc_amount", 0)
+        days   = context.user_data.get("pc_days", DEFAULT_DAYS)
+        ex_label = ", ".join(EXCHANGE_LABELS.get(e, e) for e in selected)
+        await q.edit_message_text(f"Считаю доход {coin} ${amount:,.0f} за {days}д на {ex_label}...")
+        exchange = list(selected)[0] if len(selected) == 1 else None
+        await do_calc(q, coin, amount, days, exchange)
+        return ConversationHandler.END
+
+    ex = q.data.replace("pc_ex_", "")
+    if ex in selected:
+        selected.discard(ex)
+    else:
+        selected.add(ex)
+    context.user_data["pc_selected_ex"] = selected
     await q.edit_message_text(
-        f"🔍 Считаю доход *{coin}* ${amount:,.0f} за *{days}д* на *{ex_label}*...",
+        "Шаг 4/4: Выбери биржу.",
+        reply_markup=make_exchange_keyboard("pc", selected),
         parse_mode="Markdown"
     )
-    await do_calc(q, coin, amount, days, None if exchange == "all" else exchange)
-    return ConversationHandler.END
+    return PC_EXCH
 
 
 # ─────────────────────────────────────────────
@@ -2165,10 +1913,8 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass  # Если текст не изменился — игнорируем
 
 
-
-
 # ─────────────────────────────────────────────
-# DELTA-NEUTRAL
+# DELTA-NEUTRAL: поиск лучшей связки лонг/шорт
 # ─────────────────────────────────────────────
 
 def calc_std(rates):
@@ -2183,9 +1929,19 @@ def calc_std(rates):
 def analyze_delta(coin, days, long_exchanges=None, all_exchanges=None):
     """
     Ищет лучшую дельта-нейтральную связку для монеты.
-    Возвращает (best_pairs, exchange_data) или (None, {}).
+
+    Логика:
+    1. Проверяем каждую биржу как кандидата для ЛОНГА:
+       монета должна проходить фильтры (стабильно отриц. фандинг).
+    2. Для каждого лонга перебираем остальные биржи как кандидаты для ШОРТА:
+       - Считаем средний фандинг шорта и его стабильность (std)
+       - Чистый доход = avg_long_rate + avg_short_rate (оба в %)
+         (long_rate отрицательный → мы получаем; short_rate положит → получаем, отриц → платим)
+       - Стабильность связки = std_long + std_short (меньше = лучше)
+    3. Сортируем: сначала по чистому доходу (больше = лучше),
+       при равенстве — по стабильности (меньше std = лучше).
     """
-    now_ms   = int(time.time() * 1000)
+    now_ms = int(time.time() * 1000)
     start_ms = now_ms - days * 24 * 60 * 60 * 1000
 
     if all_exchanges is None:
@@ -2208,241 +1964,7 @@ def analyze_delta(coin, days, long_exchanges=None, all_exchanges=None):
             pass
         time.sleep(0.1)
 
-    # Ищем лонг-кандидатов
-    long_candidates = []
-    for ex in long_exchanges:
-        if ex not in exchange_data:
-            continue
-        rates = exchange_data[ex]["rates"]
-        neg   = [r for r in rates if r < 0]
-        total = len(rates)
-        if not total:
-            continue
-        below       = sum(1 for r in rates if r <= STABILITY_THRESHOLD)
-        outlier_pct = (total - below) / total * 100
-        neg_avg     = sum(neg) / len(neg) if neg else 0.0
-        neg_ratio   = len(neg) / total
-        pass_stability = outlier_pct <= MAX_OUTLIER_PCT
-        pass_neg_avg   = bool(neg) and neg_avg <= NEG_AVG_THRESHOLD and neg_ratio >= MIN_NEG_RATIO
-
-        if pass_stability or pass_neg_avg:
-            long_candidates.append({
-                "exchange":       ex,
-                "rates":          rates,
-                "avg":            sum(rates) / total,
-                "neg_avg":        neg_avg,
-                "std":            calc_std(rates),
-                "outlier_pct":    outlier_pct,
-                "pass_stability": pass_stability,
-                "pass_neg_avg":   pass_neg_avg,
-            })
-
-    if not long_candidates:
-        return None, exchange_data
-
-    # Для каждого лонга ищем лучший шорт
-    best_pairs = []
-    for long_info in long_candidates:
-        long_ex  = long_info["exchange"]
-        long_avg = long_info["avg"]
-
-        short_candidates = []
-        for ex in all_exchanges:
-            if ex == long_ex or ex not in exchange_data:
-                continue
-            rates = exchange_data[ex]["rates"]
-            total = len(rates)
-            if not total:
-                continue
-            avg = sum(rates) / total
-            std = calc_std(rates)
-            net_income_pct = abs(long_avg) + avg
-            short_candidates.append({
-                "exchange":       ex,
-                "avg":            avg,
-                "std":            std,
-                "net_income_pct": net_income_pct,
-            })
-
-        short_candidates.sort(key=lambda x: (-x["net_income_pct"], x["std"]))
-
-        for short_info in short_candidates[:3]:
-            best_pairs.append({
-                "long_ex":         long_ex,
-                "short_ex":        short_info["exchange"],
-                "long_avg":        long_avg,
-                "long_std":        long_info["std"],
-                "long_neg_avg":    long_info["neg_avg"],
-                "long_outlier_pct":long_info["outlier_pct"],
-                "short_avg":       short_info["avg"],
-                "short_std":       short_info["std"],
-                "net_income_pct":  short_info["net_income_pct"],
-                "pass_stability":  long_info["pass_stability"],
-                "pass_neg_avg":    long_info["pass_neg_avg"],
-            })
-
-    best_pairs.sort(key=lambda x: (-x["net_income_pct"], x["long_std"] + x["short_std"]))
-    return best_pairs, exchange_data
-
-
-def fmt_delta_result(coin, pairs, days, amount_usd=None):
-    """Форматирует результат дельта-анализа."""
-    if not pairs:
-        return f"⚠️ *{coin}* — не найдено подходящих бирж для лонга за {days} дней"
-
-    lines = [f"⚖️ *Дельта-нейтраль: {coin}* — {days} дней\\n"]
-    shown = {}
-
-    for p in best_pairs_top(pairs, 5):
-        key = (p["long_ex"], p["short_ex"])
-        if key in shown:
-            continue
-        shown[key] = True
-
-        long_label  = EXCHANGE_LABELS.get(p["long_ex"],  p["long_ex"].upper())
-        short_label = EXCHANGE_LABELS.get(p["short_ex"], p["short_ex"].upper())
-        long_cat    = "✅" if p["pass_stability"] else "⚡"
-        net         = p["net_income_pct"]
-
-        lines.append(
-            f"🟢 Лонг: `{long_label}` {long_cat}  avg `{p['long_avg']:+.4f}%`  std `{p['long_std']:.4f}`\\n"
-            f"🔴 Шорт: `{short_label}`  avg `{p['short_avg']:+.4f}%`  std `{p['short_std']:.4f}`\\n"
-            f"💰 Чистый доход: `{net:+.4f}%` за выплату"
-        )
-        if amount_usd:
-            approx = days * 3
-            income = amount_usd * abs(net / 100) * approx
-            lines.append(f"   ~${income:.2f} за {days} дней (${income/days:.2f}/день)")
-        lines.append("")
-
-    return "\\n".join(lines)
-
-
-def best_pairs_top(pairs, n=5):
-    seen = set()
-    result = []
-    for p in pairs:
-        key = (p["long_ex"], p["short_ex"])
-        if key not in seen:
-            seen.add(key)
-            result.append(p)
-        if len(result) >= n:
-            break
-    return result
-
-
-# ─────────────────────────────────────────────
-# DELTA CONVERSATION HANDLERS
-# ─────────────────────────────────────────────
-
-async def do_delta(update, coins, days):
-    """Запускает дельта-анализ и отправляет результат."""
-    msg = update.message if hasattr(update, "message") and update.message else update
-    if not coins:
-        await msg.reply_text("Не указаны монеты.")
-        return
-    days = days or DEFAULT_DAYS
-    await msg.reply_text(f"Анализирую дельта-нейтраль: {', '.join(coins)} за {days} дней...")
-    for coin in coins:
-        try:
-            result = analyze_delta(coin, days)
-            if isinstance(result, tuple):
-                pairs, _ = result
-            else:
-                pairs = result
-            text = fmt_delta_result(coin, pairs, days)
-            if len(text) > 4000:
-                for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
-                    await msg.reply_text(chunk, parse_mode="Markdown")
-            else:
-                await msg.reply_text(text, parse_mode="Markdown")
-        except Exception as e:
-            await msg.reply_text(f"Ошибка анализа {coin}: {e}")
-
-
-async def delta_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.args:
-        coins, days, _ = parse_tokens(" ".join(context.args))
-        if coins:
-            await do_delta(update, coins, days)
-            return ConversationHandler.END
-    await update.message.reply_text(
-        "Поиск дельта-нейтральной пары\\n\\n"
-        "Введи одну или несколько монет через пробел:\\n\\n"
-        "Отмена: /cancel",
-        parse_mode="Markdown"
-    )
-    return WAIT_DELTA_COIN
-
-
-async def delta_got_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text_in = update.message.text.strip()
-    if text_in.startswith("/"):
-        return ConversationHandler.END
-    coins, days, _ = parse_tokens(text_in)
-    if not coins:
-        await update.message.reply_text(
-            "Не распознал монеты. Введи названия монет, например: ENJ или ENJ JTO RON"
-        )
-        return WAIT_DELTA_COIN
-    await do_delta(update, coins, days)
-    return ConversationHandler.END
-
-
-
-# ─────────────────────────────────────────────
-# DELTA-NEUTRAL
-# ─────────────────────────────────────────────
-
-def calc_std(rates):
-    """\u0421\u0442\u0430\u043d\u0434\u0430\u0440\u0442\u043d\u043e\u0435 \u043e\u0442\u043a\u043b\u043e\u043d\u0435\u043d\u0438\u0435 \u0441\u043f\u0438\u0441\u043a\u0430 \u0441\u0442\u0430\u0432\u043e\u043a."""
-    if not rates:
-        return 0.0
-    n = len(rates)
-    mean = sum(rates) / n
-    return (sum((r - mean) ** 2 for r in rates) / n) ** 0.5
-
-
-
-def analyze_delta(coin, days, long_exchanges=None, all_exchanges=None):
-    """
-    \u0418\u0449\u0435\u0442 \u043b\u0443\u0447\u0448\u0443\u044e \u0434\u0435\u043b\u044c\u0442\u0430-\u043d\u0435\u0439\u0442\u0440\u0430\u043b\u044c\u043d\u0443\u044e \u0441\u0432\u044f\u0437\u043a\u0443 \u0434\u043b\u044f \u043c\u043e\u043d\u0435\u0442\u044b.
-
-    \u041b\u043e\u0433\u0438\u043a\u0430:
-    1. \u041f\u0440\u043e\u0432\u0435\u0440\u044f\u0435\u043c \u043a\u0430\u0436\u0434\u0443\u044e \u0431\u0438\u0440\u0436\u0443 \u043a\u0430\u043a \u043a\u0430\u043d\u0434\u0438\u0434\u0430\u0442\u0430 \u0434\u043b\u044f \u041b\u041e\u041d\u0413\u0410:
-       \u043c\u043e\u043d\u0435\u0442\u0430 \u0434\u043e\u043b\u0436\u043d\u0430 \u043f\u0440\u043e\u0445\u043e\u0434\u0438\u0442\u044c \u0444\u0438\u043b\u044c\u0442\u0440\u044b (\u0441\u0442\u0430\u0431\u0438\u043b\u044c\u043d\u043e \u043e\u0442\u0440\u0438\u0446. \u0444\u0430\u043d\u0434\u0438\u043d\u0433).
-    2. \u0414\u043b\u044f \u043a\u0430\u0436\u0434\u043e\u0433\u043e \u043b\u043e\u043d\u0433\u0430 \u043f\u0435\u0440\u0435\u0431\u0438\u0440\u0430\u0435\u043c \u043e\u0441\u0442\u0430\u043b\u044c\u043d\u044b\u0435 \u0431\u0438\u0440\u0436\u0438 \u043a\u0430\u043a \u043a\u0430\u043d\u0434\u0438\u0434\u0430\u0442\u044b \u0434\u043b\u044f \u0428\u041e\u0420\u0422\u0410:
-       - \u0421\u0447\u0438\u0442\u0430\u0435\u043c \u0441\u0440\u0435\u0434\u043d\u0438\u0439 \u0444\u0430\u043d\u0434\u0438\u043d\u0433 \u0448\u043e\u0440\u0442\u0430 \u0438 \u0435\u0433\u043e \u0441\u0442\u0430\u0431\u0438\u043b\u044c\u043d\u043e\u0441\u0442\u044c (std)
-       - \u0427\u0438\u0441\u0442\u044b\u0439 \u0434\u043e\u0445\u043e\u0434 = avg_long_rate + avg_short_rate (\u043e\u0431\u0430 \u0432 %)
-         (long_rate \u043e\u0442\u0440\u0438\u0446\u0430\u0442\u0435\u043b\u044c\u043d\u044b\u0439 \u2192 \u043c\u044b \u043f\u043e\u043b\u0443\u0447\u0430\u0435\u043c; short_rate \u043f\u043e\u043b\u043e\u0436\u0438\u0442 \u2192 \u043f\u043e\u043b\u0443\u0447\u0430\u0435\u043c, \u043e\u0442\u0440\u0438\u0446 \u2192 \u043f\u043b\u0430\u0442\u0438\u043c)
-       - \u0421\u0442\u0430\u0431\u0438\u043b\u044c\u043d\u043e\u0441\u0442\u044c \u0441\u0432\u044f\u0437\u043a\u0438 = std_long + std_short (\u043c\u0435\u043d\u044c\u0448\u0435 = \u043b\u0443\u0447\u0448\u0435)
-    3. \u0421\u043e\u0440\u0442\u0438\u0440\u0443\u0435\u043c: \u0441\u043d\u0430\u0447\u0430\u043b\u0430 \u043f\u043e \u0447\u0438\u0441\u0442\u043e\u043c\u0443 \u0434\u043e\u0445\u043e\u0434\u0443 (\u0431\u043e\u043b\u044c\u0448\u0435 = \u043b\u0443\u0447\u0448\u0435),
-       \u043f\u0440\u0438 \u0440\u0430\u0432\u0435\u043d\u0441\u0442\u0432\u0435 \u2014 \u043f\u043e \u0441\u0442\u0430\u0431\u0438\u043b\u044c\u043d\u043e\u0441\u0442\u0438 (\u043c\u0435\u043d\u044c\u0448\u0435 std = \u043b\u0443\u0447\u0448\u0435).
-    """
-    now_ms = int(time.time() * 1000)
-    start_ms = now_ms - days * 24 * 60 * 60 * 1000
-
-    if all_exchanges is None:
-        all_exchanges = [e for e, on in EXCHANGES_ENABLED.items() if on]
-    if long_exchanges is None:
-        long_exchanges = all_exchanges
-
-    # \u0421\u043e\u0431\u0438\u0440\u0430\u0435\u043c \u0434\u0430\u043d\u043d\u044b\u0435 \u043f\u043e \u0432\u0441\u0435\u043c \u0431\u0438\u0440\u0436\u0430\u043c
-    exchange_data = {}
-    for ex in all_exchanges:
-        fetcher = EXCHANGE_FETCHERS.get(ex)
-        if not fetcher:
-            continue
-        try:
-            data, sym = fetcher(coin, start_ms, now_ms)
-            if data:
-                rates = [r for _, r in data]
-                exchange_data[ex] = {"rates": rates, "sym": sym}
-        except Exception:
-            pass
-        time.sleep(0.1)
-
-    # \u0418\u0449\u0435\u043c \u043b\u043e\u043d\u0433-\u043a\u0430\u043d\u0434\u0438\u0434\u0430\u0442\u043e\u0432 (\u043f\u0440\u043e\u0445\u043e\u0434\u044f\u0442 \u043d\u0430\u0448\u0438 \u0444\u0438\u043b\u044c\u0442\u0440\u044b)
+    # Ищем лонг-кандидатов (проходят наши фильтры)
     long_candidates = []
     for ex in long_exchanges:
         if ex not in exchange_data:
@@ -2471,12 +1993,12 @@ def analyze_delta(coin, days, long_exchanges=None, all_exchanges=None):
     if not long_candidates:
         return None, exchange_data
 
-    # \u0414\u043b\u044f \u043a\u0430\u0436\u0434\u043e\u0433\u043e \u043b\u043e\u043d\u0433\u0430 \u0438\u0449\u0435\u043c \u043b\u0443\u0447\u0448\u0438\u0439 \u0448\u043e\u0440\u0442
+    # Для каждого лонга ищем лучший шорт
     best_pairs = []
 
     for long_info in long_candidates:
         long_ex = long_info["exchange"]
-        long_avg = long_info["avg"]  # \u043e\u0442\u0440\u0438\u0446\u0430\u0442\u0435\u043b\u044c\u043d\u044b\u0439 \u2192 \u043c\u044b \u041f\u041e\u041b\u0423\u0427\u0410\u0415\u041c abs(avg)
+        long_avg = long_info["avg"]  # отрицательный → мы ПОЛУЧАЕМ abs(avg)
 
         short_candidates = []
         for ex in all_exchanges:
@@ -2491,12 +2013,12 @@ def analyze_delta(coin, days, long_exchanges=None, all_exchanges=None):
             avg = sum(rates) / total
             std = calc_std(rates)
 
-            # \u0427\u0438\u0441\u0442\u044b\u0439 \u0434\u043e\u0445\u043e\u0434 \u043d\u0430 \u0448\u043e\u0440\u0442\u0435:
-            # \u0435\u0441\u043b\u0438 avg > 0 (\u043f\u043e\u043b\u043e\u0436\u0438\u0442\u0435\u043b\u044c\u043d\u044b\u0439 \u0444\u0430\u043d\u0434\u0438\u043d\u0433) \u2192 \u0448\u043e\u0440\u0442 \u041f\u041e\u041b\u0423\u0427\u0410\u0415\u0422 avg
-            # \u0435\u0441\u043b\u0438 avg < 0 (\u043e\u0442\u0440\u0438\u0446\u0430\u0442\u0435\u043b\u044c\u043d\u044b\u0439 \u0444\u0430\u043d\u0434\u0438\u043d\u0433) \u2192 \u0448\u043e\u0440\u0442 \u041f\u041b\u0410\u0422\u0418\u0422 abs(avg)
-            # \u0418\u0442\u043e\u0433\u043e \u0437\u0430 \u043f\u0435\u0440\u0438\u043e\u0434: long \u043f\u043e\u043b\u0443\u0447\u0430\u0435\u0442 abs(long_avg), \u0448\u043e\u0440\u0442 \u043f\u043e\u043b\u0443\u0447\u0430\u0435\u0442 avg_short
+            # Чистый доход на шорте:
+            # если avg > 0 (положительный фандинг) → шорт ПОЛУЧАЕТ avg
+            # если avg < 0 (отрицательный фандинг) → шорт ПЛАТИТ abs(avg)
+            # Итого за период: long получает abs(long_avg), шорт получает avg_short
             # net_income_pct = abs(long_avg) + avg_short
-            net_income_pct = abs(long_avg) + avg  # avg \u0448\u043e\u0440\u0442\u0430: + = \u0445\u043e\u0440\u043e\u0448\u043e, - = \u043f\u043b\u043e\u0445\u043e
+            net_income_pct = abs(long_avg) + avg  # avg шорта: + = хорошо, - = плохо
 
             short_candidates.append({
                 "exchange": ex,
@@ -2506,10 +2028,10 @@ def analyze_delta(coin, days, long_exchanges=None, all_exchanges=None):
                 "rates": rates,
             })
 
-        # \u0421\u043e\u0440\u0442\u0438\u0440\u0443\u0435\u043c \u0448\u043e\u0440\u0442-\u043a\u0430\u043d\u0434\u0438\u0434\u0430\u0442\u043e\u0432: \u0431\u043e\u043b\u044c\u0448\u0438\u0439 net_income, \u0437\u0430\u0442\u0435\u043c \u043c\u0435\u043d\u044c\u0448\u0438\u0439 std
+        # Сортируем шорт-кандидатов: больший net_income, затем меньший std
         short_candidates.sort(key=lambda x: (-x["net_income_pct"], x["std"]))
 
-        for short_info in short_candidates[:3]:  # \u0442\u043e\u043f-3 \u0432\u0430\u0440\u0438\u0430\u043d\u0442\u0430 \u0448\u043e\u0440\u0442\u0430
+        for short_info in short_candidates[:3]:  # топ-3 варианта шорта
             best_pairs.append({
                 "long_ex": long_ex,
                 "short_ex": short_info["exchange"],
@@ -2524,125 +2046,137 @@ def analyze_delta(coin, days, long_exchanges=None, all_exchanges=None):
                 "pass_neg_avg": long_info["pass_neg_avg"],
             })
 
-    # \u0424\u0438\u043d\u0430\u043b\u044c\u043d\u0430\u044f \u0441\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u043a\u0430 \u0432\u0441\u0435\u0445 \u043f\u0430\u0440
+    # Финальная сортировка всех пар
     best_pairs.sort(key=lambda x: (-x["net_income_pct"], x["long_std"] + x["short_std"]))
     return best_pairs, exchange_data
 
 
-
 def fmt_delta_result(coin, pairs, days, amount_usd=None):
-    """\u0424\u043e\u0440\u043c\u0430\u0442\u0438\u0440\u0443\u0435\u0442 \u0440\u0435\u0437\u0443\u043b\u044c\u0442\u0430\u0442 \u0434\u0435\u043b\u044c\u0442\u0430-\u0430\u043d\u0430\u043b\u0438\u0437\u0430."""
+    """Форматирует результат дельта-анализа."""
     if not pairs:
-        return f"\u26a0\ufe0f *{coin}* \u2014 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u043e \u043f\u043e\u0434\u0445\u043e\u0434\u044f\u0449\u0438\u0445 \u0431\u0438\u0440\u0436 \u0434\u043b\u044f \u043b\u043e\u043d\u0433\u0430 \u0437\u0430 {days} \u0434\u043d\u0435\u0439"
+        return f"⚠️ *{coin}* — не найдено подходящих бирж для лонга за {days} дней"
 
-    lines = [f"\u2696\ufe0f *\u0414\u0435\u043b\u044c\u0442\u0430-\u043d\u0435\u0439\u0442\u0440\u0430\u043b\u044c: {coin}* \u2014 {days} \u0434\u043d\u0435\u0439\
-"]
+    lines = [f"⚖️ *Дельта-нейтраль: {coin}* — {days} дней\n"]
 
-    # \u041f\u043e\u043a\u0430\u0437\u044b\u0432\u0430\u0435\u043c \u0442\u043e\u043f-3 \u043f\u0430\u0440\u044b
+    # Показываем топ-3 пары
     for i, p in enumerate(pairs[:3], 1):
         long_label = EXCHANGE_LABELS.get(p["long_ex"], p["long_ex"].upper())
         short_label = EXCHANGE_LABELS.get(p["short_ex"], p["short_ex"].upper())
 
-        # \u0418\u043a\u043e\u043d\u043a\u0430 \u0441\u0442\u0430\u0431\u0438\u043b\u044c\u043d\u043e\u0441\u0442\u0438 \u043b\u043e\u043d\u0433\u0430
-        long_cat = "\u2705" if p["pass_stability"] else "\u26a1"
+        # Иконка стабильности лонга
+        long_cat = "✅" if p["pass_stability"] else "⚡"
 
-        # \u0417\u043d\u0430\u043a \u0434\u043b\u044f \u0448\u043e\u0440\u0442\u0430: + \u0435\u0441\u043b\u0438 \u0437\u0430\u0440\u0430\u0431\u0430\u0442\u044b\u0432\u0430\u0435\u043c \u043d\u0430 \u0448\u043e\u0440\u0442\u0435, - \u0435\u0441\u043b\u0438 \u043f\u043b\u0430\u0442\u0438\u043c
+        # Знак для шорта: + если зарабатываем на шорте, - если платим
         short_sign = "+" if p["short_avg"] >= 0 else ""
 
-        lines.append(f"*#{i}* \ud83d\udfe2 \u041b\u043e\u043d\u0433 `{long_label}` + \ud83d\udd34 \u0428\u043e\u0440\u0442 `{short_label}`")
+        lines.append(f"*#{i}* 🟢 Лонг `{long_label}` + 🔴 Шорт `{short_label}`")
         lines.append(
-            f"  \u041b\u043e\u043d\u0433 {long_cat}: avg `{p['long_avg']:+.4f}%`  std `{p['long_std']:.4f}`"
+            f"  Лонг {long_cat}: avg `{p['long_avg']:+.4f}%`  std `{p['long_std']:.4f}`"
         )
         lines.append(
-            f"  \u0428\u043e\u0440\u0442: avg `{p['short_avg']:+.4f}%`  std `{p['short_std']:.4f}`"
+            f"  Шорт: avg `{p['short_avg']:+.4f}%`  std `{p['short_std']:.4f}`"
         )
         lines.append(
-            f"  \ud83d\udcc8 \u0427\u0438\u0441\u0442\u044b\u0439 \u0434\u043e\u0445\u043e\u0434/\u0441\u0442\u0430\u0432\u043a\u0443: `{p['net_income_pct']:+.4f}%`"
+            f"  📈 Чистый доход/ставку: `{p['net_income_pct']:+.4f}%`"
         )
 
         if amount_usd:
-            # \u0421\u0447\u0438\u0442\u0430\u0435\u043c \u0440\u0435\u0430\u043b\u044c\u043d\u044b\u0439 \u0434\u043e\u0445\u043e\u0434 \u0437\u0430 \u043f\u0435\u0440\u0438\u043e\u0434
-            # \u041a\u043e\u043b\u0438\u0447\u0435\u0441\u0442\u0432\u043e \u0441\u0442\u0430\u0432\u043e\u043a \u043f\u0440\u0438\u043c\u0435\u0440\u043d\u043e = days * 24 / interval_h (\u043e\u0431\u044b\u0447\u043d\u043e 8\u0447 = 3 \u0432 \u0434\u0435\u043d\u044c)
+            # Считаем реальный доход за период
+            # Количество ставок примерно = days * 3 (обычно 3 ставки/день при 8ч интервале)
             approx_payments = days * 3
             income_long = amount_usd * abs(p["long_avg"] / 100) * approx_payments
             income_short = amount_usd * (p["short_avg"] / 100) * approx_payments
             net = income_long + income_short
+            net_per_day = net / days if days > 0 else 0
+            income_long_day = income_long / days if days > 0 else 0
+            income_short_day = income_short / days if days > 0 else 0
+            short_str = (f"+${income_short:.2f}" if income_short >= 0 else f"-${abs(income_short):.2f}")
+            short_day_str = (f"+${income_short_day:.2f}" if income_short_day >= 0 else f"-${abs(income_short_day):.2f}")
             lines.append(
-                f"  \ud83d\udcb0 ~${income_long:.2f} (\u043b\u043e\u043d\u0433) {'+' if income_short >= 0 else ''}"
-                f"${income_short:.2f} (\u0448\u043e\u0440\u0442) = *${net:.2f}* \u0437\u0430 {days}\u0434"
+                f"  💰 *За {days} дней:*"
+            )
+            lines.append(
+                f"  Лонг: `+${income_long:.2f}`  Шорт: `{short_str}`"
+            )
+            lines.append(
+                f"  Итого: *${net:.2f}*"
+            )
+            lines.append(
+                f"  📅 *В день:* лонг `+${income_long_day:.2f}` шорт `{short_day_str}` итого `${net_per_day:.2f}`"
             )
         lines.append("")
 
-    return "\
-".join(lines)
+    return "\n".join(lines)
 
 
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# ─────────────────────────────────────────────
 # DELTA CONVERSATION HANDLERS
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# ─────────────────────────────────────────────
+
+async def do_delta(update, coins, days):
+    """Запускает дельта-анализ для списка монет и отправляет результат."""
+    msg = update.message if hasattr(update, 'message') and update.message else update
+
+    if not coins:
+        await msg.reply_text("Не указаны монеты.")
+        return
+
+    days = days or DEFAULT_DAYS
+    await msg.reply_text(f"Анализирую дельта-нейтраль: {', '.join(coins)} за {days} дней...")
+
+    for coin in coins:
+        try:
+            result = analyze_delta(coin, days)
+            # analyze_delta возвращает (pairs, exchange_data) или None
+            if isinstance(result, tuple):
+                pairs, _ = result
+            else:
+                pairs = result
+
+            text = fmt_delta_result(coin, pairs, days)
+            if len(text) > 4000:
+                for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
+                    await msg.reply_text(chunk, parse_mode="Markdown")
+            else:
+                await msg.reply_text(text, parse_mode="Markdown")
+        except Exception as e:
+            await msg.reply_text(f"Ошибка анализа {coin}: {e}")
 
 
 async def delta_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
-        coins, days, exchange = parse_tokens(" ".join(context.args))
+        coins, days, _ = parse_tokens(" ".join(context.args))
         if coins:
             await do_delta(update, coins, days)
             return ConversationHandler.END
     await update.message.reply_text(
-        "\u0412\u0432\u0435\u0434\u0438 \u043c\u043e\u043d\u0435\u0442\u044b \u0434\u043b\u044f \u0434\u0435\u043b\u044c\u0442\u0430-\u0430\u043d\u0430\u043b\u0438\u0437\u0430:\
-\
-"
-        "`ENJ`\
-"
-        "`ENJ JTO RON`\
-"
-        "`ENJ /days 14`\
-\
-"
-        "\u041e\u0442\u043c\u0435\u043d\u0430: /cancel",
+        "Поиск дельта-нейтральной пары\n\n"
+        "Введи одну или несколько монет через пробел:\n\n"
+        "Отмена: /cancel",
         parse_mode="Markdown"
     )
     return WAIT_DELTA_COIN
 
 
-
 async def delta_got_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    coins, days, _ = parse_tokens(update.message.text.strip())
+    text_in = update.message.text.strip()
+    # Если вдруг пришла команда — завершаем
+    if text_in.startswith("/"):
+        return ConversationHandler.END
+    coins, days, _ = parse_tokens(text_in)
     if not coins:
-        await update.message.reply_text("\u041d\u0435 \u0440\u0430\u0441\u043f\u043e\u0437\u043d\u0430\u043b \u043c\u043e\u043d\u0435\u0442\u044b. \u041f\u043e\u043f\u0440\u043e\u0431\u0443\u0439: `ENJ JTO`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "Не распознал монеты. Введи названия монет, например: ENJ или ENJ JTO RON",
+            parse_mode="Markdown"
+        )
         return WAIT_DELTA_COIN
     await do_delta(update, coins, days)
     return ConversationHandler.END
 
 
-
-async def do_delta(update, coins, days, amount_usd=None):
-    active = [e for e, on in EXCHANGES_ENABLED.items() if on]
-    if len(active) < 2:
-        await update.message.reply_text(
-            "\u274c \u041d\u0443\u0436\u043d\u043e \u043c\u0438\u043d\u0438\u043c\u0443\u043c 2 \u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0435 \u0431\u0438\u0440\u0436\u0438 \u0434\u043b\u044f \u0434\u0435\u043b\u044c\u0442\u0430-\u0430\u043d\u0430\u043b\u0438\u0437\u0430.\
-"
-            "\u0412\u043a\u043b\u044e\u0447\u0438 \u0431\u0438\u0440\u0436\u0438: `/toggle all`",
-            parse_mode="Markdown"
-        )
-        return
-
-    ex_str = " + ".join(EXCHANGE_LABELS.get(e, e) for e in active)
-    suffix = f" | \u0441\u0443\u043c\u043c\u0430 ${amount_usd:,.0f}" if amount_usd else ""
-    await update.message.reply_text(
-        f"\u2696\ufe0f \u0414\u0435\u043b\u044c\u0442\u0430-\u0430\u043d\u0430\u043b\u0438\u0437 {len(coins)} \u043c\u043e\u043d\u0435\u0442 \u043d\u0430 {ex_str} \u0437\u0430 {days} \u0434\u043d\u0435\u0439{suffix}...",
-    )
-
-    for coin in coins:
-        pairs, _ = analyze_delta(coin, days, all_exchanges=active)
-        reply = fmt_delta_result(coin, pairs, days, amount_usd)
-
-        # \u041d\u0430\u0440\u0435\u0437\u0430\u0435\u043c \u0435\u0441\u043b\u0438 \u0434\u043b\u0438\u043d\u043d\u043e\u0435
-        if len(reply) > 4000:
-            for chunk in [reply[i:i+4000] for i in range(0, len(reply), 4000)]:
-                await update.message.reply_text(chunk, parse_mode="Markdown")
-        else:
-            await update.message.reply_text(reply, parse_mode="Markdown")
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
 
 def main():
     if not BOT_TOKEN:
@@ -2690,26 +2224,8 @@ def main():
     app.add_handler(CommandHandler("help",      cmd_help))
     app.add_handler(CommandHandler("settings",  cmd_settings_new))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern="^set_"))
-    # /analyze ConversationHandler
-    analyze_conv = ConversationHandler(
-        entry_points=[CommandHandler("analyze", cmd_analyze_start)],
-        states={
-            AN_METHOD:     [CallbackQueryHandler(an_exchange_btn,  pattern="^an_ex_"),
-                            CallbackQueryHandler(an_method_btn,    pattern="^an_method_"),
-                            CallbackQueryHandler(an_cancel,        pattern="^an_cancel$")],
-            AN_AMT:        [CallbackQueryHandler(an_amt_btn,       pattern="^an_amt_"),
-                            CallbackQueryHandler(an_cancel,        pattern="^an_cancel$")],
-            AN_AMT_NUM:    [MessageHandler(filters.TEXT & ~filters.COMMAND, an_amt_num)],
-            AN_THRESH:     [CallbackQueryHandler(an_thresh_btn,    pattern="^an_thr_"),
-                            CallbackQueryHandler(an_cancel,        pattern="^an_cancel$")],
-            AN_THRESH_NUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, an_thresh_num)],
-            AN_DAYS:       [CallbackQueryHandler(an_days_btn,      pattern="^an_days_"),
-                            CallbackQueryHandler(an_cancel,        pattern="^an_cancel$")],
-            AN_DAYS_NUM:   [MessageHandler(filters.TEXT & ~filters.COMMAND, an_days_num)],
-        },
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
-    )
-    app.add_handler(analyze_conv)
+    app.add_handler(CommandHandler("analyze",  cmd_analyze_start))
+    app.add_handler(CallbackQueryHandler(cmd_analyze_callback, pattern="^analyze_ex_"))
     app.add_handler(CommandHandler("cancel",    cmd_cancel))
 
     delta_conv = ConversationHandler(
