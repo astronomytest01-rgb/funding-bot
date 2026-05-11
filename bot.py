@@ -1,5 +1,5 @@
 """
-Phemex + XT Funding Rate Telegram Bot
+Phemex + XT Funding Rate Telegram Bot v2
 """
 
 import os
