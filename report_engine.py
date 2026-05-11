@@ -81,145 +81,118 @@ _report_running = False
 
 import os
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     "gemini-2.0-flash:generateContent"
 )
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
 def gemini_analyze(coin: str, direction: str, avg_rate: float,
                    main_ex: str, hedge_ex: str,
                    vol_main: float = 0, vol_hedge: float = 0,
                    days_stable: int = 0) -> dict:
-    """
-    Отправляет монету в Gemini для анализа надёжности.
-    Использует системный промпт с протоколом дельта-нейтрального анализа.
-    Возвращает dict:
-      {
-        "approved": True/False,
-        "leverage": 2/3/4 или None,
-        "risk": "низкий"/"средний"/"высокий",
-        "summary": "краткий обзор проекта и риска",
-        "reason": "почему отклонено (если approved=False)"
-      }
-    Если GEMINI_API_KEY не задан — возвращает approved=True без анализа.
-    """
-    if not GEMINI_API_KEY:
+    """AI анализ монеты через Groq (primary) или Gemini (fallback)."""
+
+    if not GROQ_API_KEY and not GEMINI_API_KEY:
         return {"approved": True, "leverage": None, "risk": "—",
-                "summary": "Gemini API ключ не задан", "reason": ""}
+                "summary": "AI ключ не задан", "reason": ""}
 
     dir_text    = "ЛОНГ" if direction == "LONG" else "ШОРТ"
     funding_dir = "отрицательный (шорт платит лонгу)" if direction == "LONG" else "положительный (лонг платит шорту)"
-    daily_pct   = abs(avg_rate) * 3  # 3 выплаты в день (каждые 8ч)
+    daily_pct   = abs(avg_rate) * 3
+    vol_m_str   = f"${vol_main/1_000_000:.2f}M" if vol_main < 999_999_990 else "неизвестен"
+    vol_h_str   = f"${vol_hedge/1_000_000:.2f}M" if vol_hedge < 999_999_990 else "неизвестен"
+    days_str    = f"{days_stable} дней" if days_stable > 0 else "неизвестно"
 
-    # Объём — форматируем для промпта
-    vol_m_str = f"${vol_main/1_000_000:.2f}M" if vol_main < 999_999_990 else "неизвестен"
-    vol_h_str = f"${vol_hedge/1_000_000:.2f}M" if vol_hedge < 999_999_990 else "неизвестен"
-    days_str  = f"{days_stable} дней" if days_stable > 0 else "неизвестно"
+    SYSTEM_PROMPT = """Ты — профессиональный крипто-трейдер с глубокими знаниями рынка, специализирующийся на дельта-нейтральных стратегиях сбора фандинга (фьючерс-фьючерс). Горизонт позиций — 1-4 недели. Стиль — «поставил и забыл».
 
-    SYSTEM_PROMPT = """Ты — профессиональный крипто-трейдер, специализирующийся на дельта-нейтральных стратегиях сбора фандинга (фьючерс-фьючерс и фьючерс-спот). Горизонт позиций — от 1 до 4 недель. Стиль — «поставил и забыл», минимум вмешательства.
+ВАЖНО: Используй свои знания о монетах. "Нет информации" — НЕ причина для отклонения. Оценивай монету по её природе, возрасту, ликвидности и репутации на рынке.
 
-Твой протокол анализа каждой монеты включает 5 обязательных фильтров:
+Протокол анализа (5 фильтров):
+1. РИСК ЛИКВИДАЦИИ: если монета исторически даёт свечи 30%+ за час → плечо не выше х2
+2. СТРЕСС-ТЕСТ: х2=50% запас, х3=33%, х4=25% — сопоставь с реальной волатильностью монеты
+3. ФУНДАМЕНТАЛ:
+   ОТКЛОНЯЙ только если: монета явно <3 мес И малоизвестная, ИЛИ явный риск делистинга, ИЛИ это pump&dump схема без сообщества
+   ОДОБРЯЙ если: монета существует >6 мес, есть на CoinGecko/CMC, торгуется на крупных биржах
+   Оценивай каждую монету независимо на основе текущих знаний — прошлая стабильность не гарантирует будущую
+4. ДОХОДНОСТЬ: считай прибыль на $20k позиции в день
+5. ПЛЕЧО: х1-2 для мем/новых/волатильных, х2-3 для зрелых альтов, х3-4 только для топ ликвидных (BTC, ETH, SOL, крупные DeFi)
 
-1. РИСК ЛИКВИДАЦИИ (Wick Risk)
-   - Проверяешь историческую волатильность: максимальные ценовые движения за 1ч, 24ч, 7 дней
-   - Для ШОРТА: оцениваешь риск шорт-сквиза (резкий памп который ликвидирует шорт)
-   - Для ЛОНГА: оцениваешь риск резкого дампа
-   - Если монета может дать свечу 20%+ за 1-2 часа — плечо выше х2 запрещено
+НЕ отклоняй монету из-за "отсутствия информации" — это запрещено. Используй свои знания о крипторынке.
+Отвечай СТРОГО в формате JSON без markdown."""
 
-2. СТРЕСС-ТЕСТ ВОЛАТИЛЬНОСТИ
-   - Рассчитываешь «запас прочности» при разных плечах
-   - х2 = выдерживает движение 50% против позиции
-   - х3 = выдерживает 33%
-   - х4 = выдерживает 25%
-   - Сопоставляешь с реальной волатильностью монеты
+    USER_PROMPT = f"""Монета: {coin}
+Направление: {dir_text} на {main_ex}, хедж на {hedge_ex}
+Фандинг: {funding_dir}, ставка {avg_rate:+.4f}%/выплату (каждые 8ч)
+Доходность ~{daily_pct:.3f}%/день от позиции
+Объём {main_ex}: {vol_m_str}/24h, {hedge_ex}: {vol_h_str}/24h
+Фандинг держится: {days_str}
 
-3. ФУНДАМЕНТАЛЬНЫЙ ФИЛЬТР (главное — не потерять капитал)
-   - ОТКЛОНЯЕШЬ если: монета < 3 месяцев + малоизвестная, инсайдеры контролируют >50% supply, высокий риск делистинга, монета уже в режиме параболического роста/падения без фундамента
-   - ОДОБРЯЕШЬ если: монета > 6 месяцев, есть реальное сообщество или технология (мем-коины с большой капой тоже ок), достаточная ликвидность для выхода
+Используй свои знания о монете {coin} для оценки рисков.
+Ответ строго JSON без markdown:
+{{"approved": true/false, "leverage": 2/3/4 или null, "risk": "низкий"/"средний"/"высокий", "summary": "2-3 предложения: что за проект, почему подходит или нет для удержания 1-4 недели с плечом", "reason": "если отклонено — конкретная причина (не 'нет информации'); если одобрено — пустая строка"}}"""
 
-4. МАТЕМАТИКА ДОХОДНОСТИ
-   - Считаешь чистую прибыль в день и неделю на $5,000 маржи при разных плечах
-   - Учитываешь что доход = avg_rate_per_payment * payments_per_day * position_size
+    import re as _re, json as _json
 
-5. РЕКОМЕНДАЦИЯ ПО ПЛЕЧУ
-   - х1-х2: новые/мем/волатильные монеты или параболический рост
-   - х2-х3: зрелые монеты с умеренной волатильностью
-   - х3-х4: только ликвидные, зрелые, предсказуемые монеты (BTC, ETH, крупные альты)
-
-ВАЖНО: Ты анализируешь стратегию Futures-Futures (не спот). Обе ноги — фьючерсы на разных биржах. Хедж-биржа нужна для нейтрализации направленного риска."""
-
-    USER_PROMPT = f"""Проанализируй монету для дельта-нейтральной стратегии сбора фандинга.
-
-ДАННЫЕ:
-- Монета: {coin}
-- Направление на основной бирже: {dir_text} на {main_ex}
-- Хедж: противоположная позиция на {hedge_ex}
-- Фандинг: {funding_dir}
-- Средняя ставка: {avg_rate:+.4f}% за выплату (каждые 8ч)
-- Доходность в сутки: ~{daily_pct:.3f}% от объёма позиции
-- Объём торгов {main_ex}: {vol_m_str}/24h
-- Объём торгов {hedge_ex}: {vol_h_str}/24h
-- Фандинг держится стабильно: {days_str}
-
-ЗАДАЧА: Применить протокол из 5 фильтров и дать финальное решение.
-
-Ответь СТРОГО в формате JSON, без markdown-обёрток, без пояснений вне JSON:
-{{
-  "approved": true или false,
-  "leverage": 2 или 3 или 4 (максимально безопасное плечо; null если отклонено),
-  "risk": "низкий" или "средний" или "высокий",
-  "summary": "2-3 предложения: что за проект/технология, почему волатильность такая, стоит ли доверять этому фандингу долгосрочно",
-  "reason": "если approved=false — одна конкретная причина отклонения; если approved=true — пустая строка"
-}}"""
-
-    try:
-        payload = {
-            "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-            "contents": [{"parts": [{"text": USER_PROMPT}]}],
-            "generationConfig": {
-                "temperature": 0.2,
-                "maxOutputTokens": 500,
-            }
-        }
-        # Retry до 3 раз при rate limit
-        for attempt in range(3):
+    # ── Groq (primary) ────────────────────────────────────────────────────────
+    if GROQ_API_KEY:
+        try:
             r = requests.post(
-                GEMINI_URL,
-                params={"key": GEMINI_API_KEY},
-                json=payload,
+                GROQ_URL,
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}",
+                         "Content-Type": "application/json"},
+                json={"model": GROQ_MODEL,
+                      "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+                                   {"role": "user",   "content": USER_PROMPT}],
+                      "temperature": 0.2, "max_tokens": 500},
                 timeout=25
             )
-            if r.status_code == 429:
-                wait = 15 * (attempt + 1)  # 15с, 30с, 45с
-                logger.warning(f"Gemini rate limit {coin}, ждём {wait}с...")
-                time.sleep(wait)
-                continue
-            r.raise_for_status()
-            break
-        else:
-            raise Exception("Rate limit — превышено число попыток")
-        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-        # Убираем возможные markdown-обёртки типа ```json ... ```
-        import re as _re
-        text = _re.sub(r"```(?:json)?", "", text).strip()
-        import json as _json
-        result = _json.loads(text)
-        return {
-            "approved": bool(result.get("approved", True)),
-            "leverage": result.get("leverage"),
-            "risk":     result.get("risk", "—"),
-            "summary":  result.get("summary", ""),
-            "reason":   result.get("reason", ""),
-        }
-    except Exception as e:
-        logger.warning(f"Gemini analyze {coin}: {e}")
-        # При ошибке — одобряем чтобы не терять монеты из отчёта
-        return {"approved": True, "leverage": None, "risk": "—",
-                "summary": f"Ошибка AI анализа: {e}", "reason": ""}
+            if r.status_code == 200:
+                text = _re.sub(r"```(?:json)?", "", r.json()["choices"][0]["message"]["content"]).strip()
+                result = _json.loads(text)
+                return {"approved": bool(result.get("approved", True)),
+                        "leverage": result.get("leverage"),
+                        "risk":     result.get("risk", "—"),
+                        "summary":  result.get("summary", ""),
+                        "reason":   result.get("reason", "")}
+            elif r.status_code == 429:
+                logger.warning(f"Groq rate limit {coin}, ждём 15с...")
+                time.sleep(15)
+        except Exception as e:
+            logger.warning(f"Groq error {coin}: {e}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# СИМВОЛЫ ДЛЯ ORDERBOOK / TICKER — конвертация coin → формат биржи
-# ─────────────────────────────────────────────────────────────────────────────
+    # ── Gemini (fallback) ─────────────────────────────────────────────────────
+    if GEMINI_API_KEY:
+        try:
+            payload = {
+                "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+                "contents": [{"parts": [{"text": USER_PROMPT}]}],
+                "generationConfig": {"temperature": 0.2, "maxOutputTokens": 500}
+            }
+            for attempt in range(3):
+                r = requests.post(GEMINI_URL, params={"key": GEMINI_API_KEY},
+                                  json=payload, timeout=25)
+                if r.status_code == 429:
+                    time.sleep(15 * (attempt + 1))
+                    continue
+                r.raise_for_status()
+                break
+            else:
+                raise Exception("Gemini rate limit")
+            text = _re.sub(r"```(?:json)?", "", r.json()["candidates"][0]["content"]["parts"][0]["text"]).strip()
+            result = _json.loads(text)
+            return {"approved": bool(result.get("approved", True)),
+                    "leverage": result.get("leverage"),
+                    "risk":     result.get("risk", "—"),
+                    "summary":  result.get("summary", ""),
+                    "reason":   result.get("reason", "")}
+        except Exception as e:
+            logger.warning(f"Gemini error {coin}: {e}")
+
+    return {"approved": True, "leverage": None, "risk": "—",
+            "summary": "Ошибка AI анализа", "reason": ""}
 
 def _sym_phemex(coin: str) -> str:
     return f"{coin.upper()}USDT"
@@ -242,6 +215,66 @@ def _sym_coinw(coin: str) -> str:
     return f"{coin.upper()}USDT"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# ВОЛАТИЛЬНОСТЬ: дневная и недельная из OHLCV
+# Берём дневные свечи с Phemex (самый надёжный публичный OHLCV API)
+# Волатильность = среднее (high-low)/open * 100 за N свечей
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_volatility(coin: str) -> dict:
+    """
+    Возвращает волатильность монеты в процентах:
+    {
+        "day_pct":  float,  # средняя дневная волатильность за 7 дней
+        "week_pct": float,  # недельная волатильность (high-low за 7 дней)
+    }
+    Использует Phemex OHLCV (дневные свечи).
+    Возвращает {"day_pct": 0, "week_pct": 0} при ошибке.
+    """
+    try:
+        sym = f"{coin.upper()}USDT"
+        r = requests.get(
+            "https://api.phemex.com/md/v2/kline",
+            params={
+                "symbol":     sym,
+                "resolution": 86400,   # дневные свечи
+                "limit":      8,       # 8 свечей = ~7 торговых дней
+            },
+            timeout=10
+        )
+        data = r.json().get("result", {})
+        rows = data.get("rows", [])
+        # Phemex OHLCV: [timestamp, interval, last_close, open, high, low, close, volume, turnover]
+        if not rows or len(rows) < 2:
+            return {"day_pct": 0, "week_pct": 0}
+
+        day_vols = []
+        highs = []
+        lows  = []
+        for row in rows[-7:]:  # последние 7 дней
+            try:
+                open_p = float(row[3]) / 1e4
+                high_p = float(row[4]) / 1e4
+                low_p  = float(row[5]) / 1e4
+                if open_p > 0:
+                    day_vols.append((high_p - low_p) / open_p * 100)
+                highs.append(high_p)
+                lows.append(low_p)
+            except Exception:
+                continue
+
+        if not day_vols:
+            return {"day_pct": 0, "week_pct": 0}
+
+        day_pct  = sum(day_vols) / len(day_vols)
+        week_pct = (max(highs) - min(lows)) / min(lows) * 100 if min(lows) > 0 else 0
+
+        return {"day_pct": round(day_pct, 1), "week_pct": round(week_pct, 1)}
+
+    except Exception:
+        return {"day_pct": 0, "week_pct": 0}
+
+
 # ФАЗА 2: ОБЪЁМ ТОРГОВ 24H
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -778,6 +811,11 @@ async def run_report(bot, chat_id: int):
         main_lbl = labels.get(c["exchange"], c["exchange"])
         hedge_lbl = labels.get(c["hedge"]["exchange"], c["hedge"]["exchange"])
 
+        # Волатильность
+        volat = get_volatility(coin)
+        c["volatility"] = volat
+        await asyncio.sleep(0.2)
+
         analysis = gemini_analyze(
             coin       = coin,
             direction  = c["direction"],
@@ -877,9 +915,15 @@ async def run_report(bot, chat_id: int):
 
         # AI блок
         risk_emoji = {"низкий": "🟢", "средний": "🟡", "высокий": "🔴"}.get(ai["risk"], "⚪")
+        volat     = c.get("volatility", {})
+        day_pct   = volat.get("day_pct", 0)
+        week_pct  = volat.get("week_pct", 0)
+        day_icon  = "🟢" if day_pct < 5 else ("🟡" if day_pct < 10 else "🔴")
+        week_icon = "🟢" if week_pct < 20 else ("🟡" if week_pct < 40 else "🔴")
         ai_block = (
             f"\n🤖 *AI анализ:*\n"
             f"{risk_emoji} Риск: {ai['risk']} | Плечо: x{rec_lev}\n"
+            f"{day_icon} Волатильность: день=`{day_pct:.1f}%` · неделя=`{week_pct:.1f}%`\n"
             f"_{ai['summary']}_"
         )
 
