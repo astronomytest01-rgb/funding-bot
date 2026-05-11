@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 # Биржи для скана фандинга (фаза 1)
 # Toobit: список монет берётся из Phemex, fetcher фандинга работает
-REPORT_EXCHANGES = ["coinw", "xt", "phemex", "toobit", "bingx", "gate"]
+REPORT_EXCHANGES = ["coinw", "xt", "phemex", "toobit", "bingx", "gate", "kucoin", "zoomex"]
 
 # Период анализа фандинга
 REPORT_DAYS = 7
@@ -327,6 +327,27 @@ def get_volume_24h(coin: str, exchange: str) -> float:
                 return float(items[0].get("volume_24h_quote", 0) or 0)
             return 0.0
 
+        elif exchange == "kucoin":
+            sym = f"{coin.upper()}USDTM"
+            r = requests.get(
+                f"https://api-futures.kucoin.com/api/v1/ticker?symbol={sym}",
+                timeout=8
+            )
+            d = r.json().get("data", {})
+            return float(d.get("turnoverOf24h", 0) or 0)
+
+        elif exchange == "zoomex":
+            sym = f"{coin.upper()}USDT"
+            r = requests.get(
+                "https://openapi.zoomex.com/cloud/trade/v3/market/tickers",
+                params={"category": "linear", "symbol": sym},
+                timeout=8
+            )
+            items = r.json().get("result", {}).get("list", [])
+            if items:
+                return float(items[0].get("turnover24h", 0) or 0)
+            return 0.0
+
         elif exchange in ("toobit", "coinw"):
             # Toobit: /quote/v1/ticker/24hr с символом BTCUSDT, поле qv
             # CoinW: публичный API объёма недоступен
@@ -404,6 +425,27 @@ def get_orderbook_top5(coin: str, exchange: str) -> dict:
             d = r.json()
             bids = [float(x["p"]) for x in (d.get("bids") or [])[:5]]
             asks = [float(x["p"]) for x in (d.get("asks") or [])[:5]]
+
+        elif exchange == "kucoin":
+            sym = f"{coin.upper()}USDTM"
+            r = requests.get(
+                f"https://api-futures.kucoin.com/api/v1/ticker?symbol={sym}",
+                timeout=8
+            )
+            d = r.json().get("data", {})
+            return float(d.get("turnoverOf24h", 0) or 0)
+
+        elif exchange == "zoomex":
+            sym = f"{coin.upper()}USDT"
+            r = requests.get(
+                "https://openapi.zoomex.com/cloud/trade/v3/market/tickers",
+                params={"category": "linear", "symbol": sym},
+                timeout=8
+            )
+            items = r.json().get("result", {}).get("list", [])
+            if items:
+                return float(items[0].get("turnover24h", 0) or 0)
+            return 0.0
 
         elif exchange in ("toobit", "coinw"):
             # Публичный orderbook API недоступен — спред не считаем
@@ -528,6 +570,31 @@ def get_coins_for_exchange(exchange: str) -> list[str]:
             )
             items = r.json().get("data", [])
             return [x["base"].upper() for x in items if x.get("base")]
+
+        elif exchange == "kucoin":
+            r = requests.get(
+                "https://api-futures.kucoin.com/api/v1/contracts/active",
+                timeout=15
+            )
+            items = r.json().get("data", [])
+            return [
+                x["symbol"].replace("USDTM", "").upper()
+                for x in items
+                if x.get("symbol", "").endswith("USDTM")
+            ]
+
+        elif exchange == "zoomex":
+            r = requests.get(
+                "https://openapi.zoomex.com/cloud/trade/v3/market/instruments-info",
+                params={"category": "linear"},
+                timeout=15
+            )
+            items = r.json().get("result", {}).get("list", [])
+            return [
+                x["symbol"].replace("USDT", "").upper()
+                for x in items
+                if x.get("symbol", "").endswith("USDT")
+            ]
 
     except Exception as e:
         logger.warning(f"get_coins_for_exchange({exchange}): {e}")
@@ -829,27 +896,18 @@ async def run_report(bot, chat_id: int):
         c["ai"] = analysis
         await asyncio.sleep(5)   # Gemini free tier: 15 req/min → 4с минимум, берём 5с
 
-        if analysis["approved"]:
-            ai_passed.append(c)
-            ok_lev = f"рекомендую x{analysis['leverage']}" if analysis["leverage"] else ""
-            await bot.send_message(
-                chat_id,
-                f"✅ {coin}: одобрено — риск {analysis['risk']} {ok_lev}"
-            )
-        else:
-            await bot.send_message(
-                chat_id,
-                f"❌ {coin}: отклонено — {analysis['reason']}"
-            )
-
-    if not ai_passed:
-        await bot.send_message(chat_id, "😔 Фаза 5: все монеты отклонены AI анализом.")
-        _report_running = False
-        return
+        # AI не фильтрует — все монеты идут в отчёт, AI только комментирует
+        ai_passed.append(c)
+        ok_lev = f"x{analysis['leverage']}" if analysis["leverage"] else "—"
+        verdict = "✅ одобрено" if analysis["approved"] else "⚠️ осторожно"
+        await bot.send_message(
+            chat_id,
+            f"{verdict} {coin}: риск {analysis['risk']} | плечо {ok_lev}"
+        )
 
     await bot.send_message(
         chat_id,
-        f"✅ Фаза 5: {len(ai_passed)} монет прошли AI анализ\n"
+        f"✅ Фаза 5: AI проанализировал {len(ai_passed)} монет\n"
         f"⏳ Формирую финальный отчёт..."
     )
 
@@ -914,17 +972,20 @@ async def run_report(bot, chat_id: int):
         hedge_warn = " ⚠️ ставка > 0.05%" if c["hedge"].get("warning") else ""
 
         # AI блок
+        approved_icon = "✅" if ai.get("approved", True) else "⚠️"
         risk_emoji = {"низкий": "🟢", "средний": "🟡", "высокий": "🔴"}.get(ai["risk"], "⚪")
         volat     = c.get("volatility", {})
         day_pct   = volat.get("day_pct", 0)
         week_pct  = volat.get("week_pct", 0)
         day_icon  = "🟢" if day_pct < 5 else ("🟡" if day_pct < 10 else "🔴")
         week_icon = "🟢" if week_pct < 20 else ("🟡" if week_pct < 40 else "🔴")
+        reason_line = f"\n⚠️ _{ai['reason']}_" if not ai.get("approved", True) and ai.get("reason") else ""
         ai_block = (
-            f"\n🤖 *AI анализ:*\n"
+            f"\n🤖 *AI анализ:* {approved_icon}\n"
             f"{risk_emoji} Риск: {ai['risk']} | Плечо: x{rec_lev}\n"
             f"{day_icon} Волатильность: день=`{day_pct:.1f}%` · неделя=`{week_pct:.1f}%`\n"
             f"_{ai['summary']}_"
+            f"{reason_line}"
         )
 
         card = (
