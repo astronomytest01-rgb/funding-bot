@@ -2866,13 +2866,13 @@ def main():
 
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
-    print("Бот запущен...")
-    
+print("Бот запущен...")
+
     # ── REPORT ENGINE ──────────────────────────────────
     from report_engine import register_report_handlers
     register_report_handlers(app, report_chat_id=141770005)
     # ───────────────────────────────────────────────────
-    
+
     app.run_polling()
 
 
