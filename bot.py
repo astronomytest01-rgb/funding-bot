@@ -6,6 +6,7 @@ import os
 import time
 import requests
 from datetime import datetime, timezone
+from report_engine import register_report_handlers
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -2866,13 +2867,8 @@ def main():
 
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
-print("Бот запущен...")
-
-    # ── REPORT ENGINE ──────────────────────────────────
-    from report_engine import register_report_handlers
+    print("Бот запущен...")
     register_report_handlers(app, report_chat_id=141770005)
-    # ───────────────────────────────────────────────────
-
     app.run_polling()
 
 
