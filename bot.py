@@ -6,6 +6,7 @@ import os
 import time
 import requests
 from datetime import datetime, timezone
+from report_engine import register_report_handlers
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -38,7 +39,12 @@ EXCHANGES_ENABLED = {
     "toobit": True,
     "okx":    True,
     "bingx":  True,
+    "kucoin": True,
+    "gate":   True,
+    "blofin": True,
+    "weex":   True,
     "coinw":  True,
+    "zoomex": True,
 }
 
 # Когда анализируешь без указания биржи — используются все включённые
@@ -367,6 +373,277 @@ def bingx_fetch(coin, start_ms, end_ms):
 
     return [], last_err
 
+
+# ─────────────────────────────────────────────
+# KUCOIN API
+# ─────────────────────────────────────────────
+
+def kucoin_fetch(coin, start_ms, end_ms):
+    """Возвращает list of (timestamp_ms, rate_pct).
+
+    Формат ответа KuCoin:
+    {"code": "200000", "data": [
+      {"symbol": "ENJUSDTM", "fundingRate": -0.001, "timepoint": 1570708800000}
+    ]}
+    Символ формата: ENJUSDTM (без дефисов, M на конце).
+    Авторизация не нужна.
+    """
+    coin = coin.upper()
+    if coin.endswith("USDT"):
+        sym = coin + "M"
+    elif coin.endswith("USD"):
+        sym = coin + "TM"
+    else:
+        sym = f"{coin}USDTM"
+
+    last_err = None
+    try:
+        url = "https://api-futures.kucoin.com/api/v1/contract/funding-rates"
+        params = {"symbol": sym, "from": start_ms, "to": end_ms}
+        r = requests.get(url, params=params, timeout=10)
+
+        if r.status_code == 451:
+            return [], "KuCoin заблокирован в вашем регионе (ошибка 451)"
+        if r.status_code == 403:
+            return [], "KuCoin недоступен (ошибка 403)"
+
+        r.raise_for_status()
+        data = r.json()
+
+        if data.get("code") != "200000":
+            raise ValueError(data.get("msg", f"API error code: {data.get('code')}"))
+
+        items = data.get("data", [])
+        if not items:
+            return [], f"Нет данных (символ: {sym})"
+
+        # KuCoin возвращает данные от новых к старым, разворачиваем
+        filtered = []
+        for x in items:
+            ts = int(x.get("timepoint", 0))
+            rate = float(x.get("fundingRate", 0)) * 100
+            filtered.append((ts, rate))
+
+        if not filtered:
+            return [], f"Нет данных за период (символ: {sym})"
+
+        return filtered, sym
+
+    except Exception as e:
+        last_err = str(e)
+
+    return [], last_err
+
+
+# ─────────────────────────────────────────────
+# GATE.IO API
+# ─────────────────────────────────────────────
+
+def gate_fetch(coin, start_ms, end_ms):
+    """Возвращает list of (timestamp_ms, rate_pct).
+
+    Формат ответа Gate.io:
+    [{"t": 1547706332, "r": "0.000100"}]
+    t — unix timestamp в секундах, r — ставка в долях.
+    Символ формата: ENJ_USDT
+    Авторизация не нужна.
+    """
+    coin = coin.upper()
+    if coin.endswith("USDT"):
+        sym = coin
+    elif coin.endswith("USD"):
+        sym = coin + "T"
+    else:
+        sym = f"{coin}_USDT"
+
+    last_err = None
+    try:
+        url = "https://api.gateio.ws/api/v4/futures/usdt/funding_rate"
+        params = {
+            "contract": sym,
+            "from": start_ms // 1000,  # Gate принимает unix секунды
+            "to": end_ms // 1000,
+            "limit": 1000,
+        }
+        r = requests.get(url, params=params, timeout=10)
+
+        if r.status_code == 451:
+            return [], "Gate.io заблокирован в вашем регионе (ошибка 451)"
+        if r.status_code == 403:
+            return [], "Gate.io недоступен (ошибка 403)"
+
+        r.raise_for_status()
+        data = r.json()
+
+        if not isinstance(data, list):
+            raise ValueError(f"Unexpected format: {str(data)[:100]}")
+
+        if not data:
+            return [], f"Нет данных (символ: {sym})"
+
+        filtered = []
+        for x in data:
+            ts = int(x.get("t", 0)) * 1000  # конвертируем в ms
+            rate = float(x.get("r", 0)) * 100
+            if ts >= start_ms:
+                filtered.append((ts, rate))
+
+        if not filtered:
+            return [], f"Нет данных за период (символ: {sym}, всего: {len(data)})"
+
+        return filtered, sym
+
+    except Exception as e:
+        last_err = str(e)
+
+    return [], last_err
+
+# ─────────────────────────────────────────────
+# BLOFIN API
+# ─────────────────────────────────────────────
+
+def blofin_fetch(coin, start_ms, end_ms):
+    """Формат: {"code":"0","data":[{"instId":"ENJ-USDT","fundingRate":"0.0001","fundingTime":"1703462400000"}]}
+    Символ: ENJ-USDT. Авторизация не нужна.
+    """
+    coin = coin.upper()
+    if coin.endswith("USDT"):
+        sym = coin[:-4] + "-USDT"
+    elif coin.endswith("USD"):
+        sym = coin[:-3] + "-USDT"
+    else:
+        sym = f"{coin}-USDT"
+
+    last_err = None
+    try:
+        url = "https://openapi.blofin.com/api/v1/market/funding-rate-history"
+        params = {"instId": sym, "limit": 100}
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code in (451, 403):
+            return [], f"BloFin недоступен (ошибка {r.status_code})"
+        r.raise_for_status()
+        data = r.json()
+        if data.get("code") != "0":
+            raise ValueError(data.get("msg", "API error"))
+        items = data.get("data", [])
+        if not items:
+            return [], f"Нет данных (символ: {sym})"
+        filtered = [(int(x["fundingTime"]), float(x["fundingRate"]) * 100)
+                    for x in items if int(x["fundingTime"]) >= start_ms]
+        if not filtered:
+            return [], f"Нет данных за период (символ: {sym}, всего: {len(items)})"
+        return filtered, sym
+    except Exception as e:
+        last_err = str(e)
+    return [], last_err
+
+
+# ─────────────────────────────────────────────
+# WEEX API
+# ─────────────────────────────────────────────
+
+def weex_fetch(coin, start_ms, end_ms):
+    """Формат: [{"symbol":"ENJUSDT","fundingRate":"0.0001","fundingTime":1703462400000}]
+    Символ: ENJUSDT. Лимит 7 дней на запрос — делаем несколько запросов если нужно.
+    Авторизация не нужна.
+    """
+    coin = coin.upper()
+    if coin.endswith("USDT"):
+        sym = coin
+    elif coin.endswith("USD"):
+        sym = coin + "T"
+    else:
+        sym = f"{coin}USDT"
+
+    # WEEX ограничивает 7 дней на запрос, нарезаем на чанки
+    SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000
+    all_rows = []
+    last_err = None
+    chunk_start = start_ms
+
+    try:
+        while chunk_start < end_ms:
+            chunk_end = min(chunk_start + SEVEN_DAYS_MS, end_ms)
+            url = "https://api-contract.weex.com/capi/v3/market/fundingRate"
+            params = {"symbol": sym, "startTime": chunk_start, "endTime": chunk_end, "limit": 1000}
+            r = requests.get(url, params=params, timeout=10)
+            if r.status_code in (451, 403):
+                return [], f"WEEX недоступен (ошибка {r.status_code})"
+            r.raise_for_status()
+            data = r.json()
+            # WEEX возвращает массив напрямую
+            if isinstance(data, list):
+                all_rows.extend(data)
+            elif isinstance(data, dict):
+                if data.get("code") not in (None, 0, "0", "200"):
+                    raise ValueError(str(data.get("msg", data)))
+                rows = data.get("data", [])
+                if isinstance(rows, list):
+                    all_rows.extend(rows)
+            chunk_start = chunk_end + 1
+            time.sleep(0.1)
+
+        if not all_rows:
+            return [], f"Нет данных (символ: {sym})"
+
+        filtered = []
+        for x in all_rows:
+            ts = int(x.get("fundingTime", 0))
+            rate = float(x.get("fundingRate", 0)) * 100
+            if start_ms <= ts <= end_ms:
+                filtered.append((ts, rate))
+
+        # убираем дубли и сортируем
+        filtered = sorted(set(filtered), key=lambda x: x[0])
+
+        if not filtered:
+            return [], f"Нет данных за период (символ: {sym})"
+        return filtered, sym
+
+    except Exception as e:
+        last_err = str(e)
+    return [], last_err
+
+
+
+def zoomex_fetch(coin, start_ms, end_ms):
+    """Zoomex funding rate history (Bybit-compatible API).
+    Символ: BTCUSDT. Пагинация через cursor.
+    """
+    sym = f"{coin.upper()}USDT"
+    url = "https://openapi.zoomex.com/cloud/trade/v3/market/funding/history"
+    all_rows = []
+    cursor = None
+    try:
+        while True:
+            params = {"category": "linear", "symbol": sym, "limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+            r = requests.get(url, params=params, timeout=10)
+            if r.status_code != 200 or not r.text.strip():
+                return [], f"HTTP {r.status_code}"
+            data = r.json()
+            if data.get("retCode") != 0:
+                return [], data.get("retMsg", "error")
+            rows = data["result"]["list"]
+            if not rows:
+                break
+            for row in rows:
+                ts   = int(row["fundingRateTimestamp"])
+                rate = float(row["fundingRate"]) * 100
+                if ts < start_ms:
+                    return sorted(all_rows, key=lambda x: x[0]), sym
+                if ts <= end_ms:
+                    all_rows.append((ts, rate))
+            cursor = data["result"].get("nextPageCursor")
+            if not cursor:
+                break
+            time.sleep(0.1)
+        return sorted(all_rows, key=lambda x: x[0]), sym
+    except Exception as e:
+        return [], str(e)
+
+
 # ─────────────────────────────────────────────
 # УНИВЕРСАЛЬНЫЙ АНАЛИЗ
 # ─────────────────────────────────────────────
@@ -435,7 +712,12 @@ EXCHANGE_FETCHERS = {
     "toobit": toobit_fetch,
     "okx":    okx_fetch,
     "bingx":  bingx_fetch,
+    "kucoin": kucoin_fetch,
+    "gate":   gate_fetch,
+    "blofin": blofin_fetch,
+    "weex":   weex_fetch,
     "coinw":  coinw_fetch,
+    "zoomex": zoomex_fetch,
 }
 
 EXCHANGE_LABELS = {
@@ -444,7 +726,12 @@ EXCHANGE_LABELS = {
     "toobit": "Toobit",
     "okx":    "OKX",
     "bingx":  "BingX",
+    "kucoin": "KuCoin",
+    "gate":   "Gate.io",
+    "blofin": "BloFin",
+    "weex":   "WEEX",
     "coinw":  "CoinW",
+    "zoomex": "Zoomex",
 }
 
 
@@ -563,7 +850,7 @@ def parse_tokens(text):
     'BTC ETH phemex 14' -> (['BTC', 'ETH'], 14, 'phemex')
     """
     KNOWN_EXCHANGES = set(EXCHANGE_FETCHERS.keys()) if 'EXCHANGE_FETCHERS' in dir() else {
-        "phemex", "xt", "toobit", "okx", "bingx", "coinw"
+        "phemex", "xt", "toobit", "okx", "bingx", "kucoin", "gate", "blofin", "weex", "coinw"
     }
 
     parts = text.strip().split()
@@ -1046,6 +1333,7 @@ def phemex_get_all_symbols():
 
 SCAN_EXCHANGE_FETCHERS = {
     "phemex": None,       # особая обработка — список монет с Phemex
+    "kucoin": "kucoin",
     "toobit": "toobit",
     "xt":     "xt",
 }
@@ -1062,9 +1350,11 @@ async def cmd_analyze_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Phemex",  callback_data="an_ex_phemex"),
-         InlineKeyboardButton("Toobit",  callback_data="an_ex_toobit")],
-        [InlineKeyboardButton("XT",      callback_data="an_ex_xt"),
-         InlineKeyboardButton("CoinW",   callback_data="an_ex_coinw")],
+         InlineKeyboardButton("KuCoin",  callback_data="an_ex_kucoin")],
+        [InlineKeyboardButton("Toobit",  callback_data="an_ex_toobit"),
+         InlineKeyboardButton("XT",      callback_data="an_ex_xt")],
+        [InlineKeyboardButton("CoinW",   callback_data="an_ex_coinw"),
+         InlineKeyboardButton("Zoomex",  callback_data="an_ex_zoomex")],
         [InlineKeyboardButton("Отмена",  callback_data="an_cancel")],
     ])
     await update.message.reply_text(
@@ -1083,8 +1373,8 @@ async def an_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     exchange = q.data.replace("an_ex_", "")
     context.user_data["an_exchange"] = exchange
-    labels = {"phemex": "Phemex", "toobit": "Toobit",
-              "xt": "XT", "coinw": "CoinW"}
+    labels = {"phemex": "Phemex", "kucoin": "KuCoin", "toobit": "Toobit",
+              "xt": "XT", "coinw": "CoinW", "zoomex": "Zoomex"}
     label = labels.get(exchange, exchange)
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Средняя ставка",  callback_data="an_method_rate"),
@@ -1299,8 +1589,8 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("⏳ Скан уже запущен.")
         return
 
-    labels = {"phemex": "Phemex", "toobit": "Toobit",
-              "xt": "XT", "coinw": "CoinW"}
+    labels = {"phemex": "Phemex", "kucoin": "KuCoin", "toobit": "Toobit",
+              "xt": "XT", "coinw": "CoinW", "zoomex": "Zoomex"}
     label = labels.get(exchange, exchange)
     method_label = "Средняя ставка" if method == "rate" else f"Средний доход (${amount:,.0f}, ≥${threshold:.0f}/день)"
 
@@ -1382,37 +1672,32 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
                     continue
 
                 neg       = [r for r in clean if r < 0]
-                pos       = [r for r in clean if r > 0]
                 neg_ratio = len(neg) / len(clean)
-                pos_ratio = len(pos) / len(clean)
-                avg_rate  = sum(clean) / len(clean)
 
-                # ── ЛОНГ: минимум 30% отрицательных и среднее < 0 ────────
-                if neg_ratio >= MIN_NEG_RATIO and avg_rate < 0:
-                    payments_per_day = len(clean) / days
-                    daily_income     = amount * abs(avg_rate) / 100 * payments_per_day
-                    if daily_income >= threshold:
-                        below   = sum(1 for r in clean if r <= STABILITY_THRESHOLD)
-                        outlier = (len(clean) - below) / len(clean) * 100
-                        batch_results.append((coin, avg_rate, outlier, "LONG", "income", daily_income))
-                        passed.append((coin, avg_rate, outlier, "LONG", "income", daily_income))
+                # Стабильность: минимум 30% отрицательных
+                if neg_ratio < MIN_NEG_RATIO:
                     time.sleep(0.15)
                     continue
 
-                # ── ШОРТ: минимум 30% положительных и среднее > 0 ────────
-                if pos_ratio >= MIN_POS_RATIO and avg_rate > 0:
-                    payments_per_day = len(clean) / days
-                    daily_income     = amount * abs(avg_rate) / 100 * payments_per_day
-                    if daily_income >= threshold:
-                        above   = sum(1 for r in clean if r >= -STABILITY_THRESHOLD)
-                        outlier = (len(clean) - above) / len(clean) * 100
-                        batch_results.append((coin, avg_rate, outlier, "SHORT", "income", daily_income))
-                        passed.append((coin, avg_rate, outlier, "SHORT", "income", daily_income))
+                # Среднее по всем выплатам
+                avg_rate = sum(clean) / len(clean)
+                if avg_rate >= 0:
                     time.sleep(0.15)
                     continue
 
-                time.sleep(0.15)
-                continue
+                # payments_per_day = кол-во выплат за период / кол-во дней
+                payments_per_day = len(clean) / days
+                daily_income     = amount * abs(avg_rate) / 100 * payments_per_day
+
+                if daily_income < threshold:
+                    time.sleep(0.15)
+                    continue
+
+                # outlier для отображения
+                below   = sum(1 for r in clean if r <= STABILITY_THRESHOLD)
+                outlier = (len(clean) - below) / len(clean) * 100
+                batch_results.append((coin, avg_rate, outlier, "LONG", "income", daily_income))
+                passed.append((coin, avg_rate, outlier, "LONG", "income", daily_income))
 
             time.sleep(0.15)
 
@@ -1447,18 +1732,11 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"✅ *Скан {label} завершён* — {total} монет за {days} дней\n"]
 
     if method == "income":
-        income_longs  = [(c,a,o,i) for c,a,o,d,cat,i in passed if d == "LONG"]
-        income_shorts = [(c,a,o,i) for c,a,o,d,cat,i in passed if d == "SHORT"]
-        total_income  = len(income_longs) + len(income_shorts)
-        lines.append(f"💰 *Средний доход* ≥${threshold:.0f}/день ({total_income}):")
-        if income_longs:
-            lines.append(f"\n🟢 *ЛОНГ* ({len(income_longs)}):")
-            for c,a,o,i in sorted(income_longs, key=lambda x: -x[3]):
-                lines.append(f"  `{c}` avg `{a:+.4f}%` ~${i:.1f}/день выбр `{o:.0f}%`")
-        if income_shorts:
-            lines.append(f"\n🔴 *ШОРТ* ({len(income_shorts)}):")
-            for c,a,o,i in sorted(income_shorts, key=lambda x: -x[3]):
-                lines.append(f"  `{c}` avg `{a:+.4f}%` ~${i:.1f}/день выбр `{o:.0f}%`")
+        passed_sorted = sorted(passed, key=lambda x: -(x[5] or 0))
+        lines.append(f"💰 *Средний доход* ≥${threshold:.0f}/день ({len(passed_sorted)}):")
+        for coin, avg, op, direction, cat, income in passed_sorted:
+            dir_icon = "🟢" if direction == "LONG" else "🔴"
+            lines.append(f"  {dir_icon} `{coin}` avg `{avg:+.4f}%` ~${income:.1f}/день выбр `{op:.0f}%`")
     else:
         full_longs  = [(c,a,o) for c,a,o,d,cat,_ in passed if d=="LONG"  and cat=="full"]
         full_shorts = [(c,a,o) for c,a,o,d,cat,_ in passed if d=="SHORT" and cat=="full"]
@@ -2590,6 +2868,7 @@ def main():
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
     print("Бот запущен...")
+    register_report_handlers(app, report_chat_id=141770005)
     app.run_polling()
 
 
