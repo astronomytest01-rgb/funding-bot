@@ -340,8 +340,11 @@ def main():
     # Report engine — должен быть ДО unknown handler
     register_report_handlers(app, report_chat_id=REPORT_CHAT_ID)
 
-    # unknown — последним всегда
-    app.add_handler(MessageHandler(filters.COMMAND, unknown))
+    # unknown — последним, исключаем известные команды
+    app.add_handler(MessageHandler(
+        filters.COMMAND & ~filters.Regex(r'^/report'),
+        unknown
+    ))
 
     print("Бот запущен...")
 
