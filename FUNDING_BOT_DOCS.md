@@ -27,6 +27,18 @@
 - Supabase REST API для CoinW
 - Gemini API `gemini-2.5-flash`
 
+## GitHub / Railway
+
+```text
+Repository: https://github.com/astronomytest01-rgb/funding-bot
+Branch: main
+Railway: deploy from GitHub main
+Runtime: Python 3.11
+Worker command: python bot.py
+```
+
+После правок: обновить код, обновить `BOTS_DOCS.md` и `FUNDING_BOT_DOCS.md`, сделать commit, push в `main`, затем redeploy Railway.
+
 ## Деплой
 
 ```bash
@@ -99,6 +111,14 @@ CoinW берётся из Supabase таблицы `funding_rates`:
 symbol, rate_pct, collected_at, funding_time
 ```
 
+## Gemini AI
+
+Gemini используется как фундаментальный риск-фильтр, а не как источник расчёта funding.
+
+`/ai` анализирует актив без ставок фандинга: инфраструктура, ликвидность, волатильность, риск 30%+ движения за сутки, scam-risk.
+
+`/analyze` и вечерний отчёт передают в Gemini только монеты, уже прошедшие funding-фильтры. Формат bulk-ответа: `[ЭМОДЖИ] [МОНЕТА] — [причина 3-6 слов]`. Направление фиксируется из расчёта бота: 🟢 LONG, 🔴 SHORT. Если Gemini ставит неверный emoji, код исправляет его через `enforce_direction_emojis()`.
+
 ## Команды бота
 
 - `/filter` — ручной анализ монет.
@@ -109,6 +129,16 @@ symbol, rate_pct, collected_at, funding_time
 - `/findpair` — дельта-нейтральная пара.
 - `/settings` — inline-настройки бирж.
 - `/help` — справка.
+
+## Telegram сценарии
+
+- `/filter`: монеты -> период -> мультивыбор бирж.
+- `/funding`: монета -> период `1/3/7/14 дней` или ручной ввод -> биржи.
+- `/calculator`: монета -> сумма `15000/20000/25000/Другое` -> период -> биржи.
+- `/analyze`: биржа -> метод -> период -> batch progress -> итог -> Gemini.
+- `/settings`: inline-переключение бирж и кнопки `Все ВКЛ/ВЫКЛ`.
+
+Пошаговые кнопки и тексты Telegram считаются частью продукта, их нельзя упрощать без отдельного решения.
 
 ## Архитектура кода
 
@@ -137,6 +167,19 @@ reports.py   - evening report job
 Запускается в 20:00 Europe/Kyiv, если задан `REPORT_CHAT_ID`.
 
 Берёт только `full`-монеты, применяет фильтр последних 4 ставок, затем Gemini с сохранением направления 🟢 LONG / 🔴 SHORT, затем ищет лучшую дельта-нейтральную пару.
+
+## QA checklist
+
+Перед деплоем проверять:
+
+1. Компиляция Python-файлов.
+2. Нет потерянных импортов после разбиения `bot.py`.
+3. CoinW работает через Supabase для исторических данных.
+4. `/analyze` `Средний доход` ищет обе стороны: LONG и SHORT.
+5. Trend-фильтр использует последние 4 ставки и правило 2 из 4.
+6. Gemini prompt и emoji-направления работают корректно.
+7. Вечерний отчёт запускается в 20:00 Europe/Kyiv при наличии `REPORT_CHAT_ID`.
+8. Документация обновлена перед push.
 
 ## Известные ограничения
 
