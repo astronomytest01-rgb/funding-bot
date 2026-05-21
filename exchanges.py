@@ -1,10 +1,18 @@
 import time
 import requests
 from datetime import datetime, timezone
-from config import SUPABASE_URL, SUPABASE_KEY
+
+from config import SUPABASE_KEY, SUPABASE_URL
 
 def phemex_fetch(coin, start_ms, end_ms):
-    candidates = [f".{coin}FR8H"] if coin.endswith("USDT") or coin.endswith("USD") else [f".{coin}USDTFR8H", f".{coin}USDFR8H"]
+    """Возвращает list of (timestamp_ms, rate_pct) или raises"""
+    candidates = []
+    coin = coin.upper()
+    if coin.endswith("USDT") or coin.endswith("USD"):
+        candidates = [f".{coin}FR8H"]
+    else:
+        candidates = [f".{coin}USDTFR8H", f".{coin}USDFR8H"]
+
     last_err = None
     for sym in candidates:
         try:
@@ -13,185 +21,424 @@ def phemex_fetch(coin, start_ms, end_ms):
             r = requests.get(url, params=params, timeout=10)
             r.raise_for_status()
             data = r.json()
-            if data.get("code") != 0: raise ValueError(data.get("msg"))
-            rows = [x for x in data.get("data", {}).get("rows", []) if x["fundingTime"] >= start_ms and abs(float(x["fundingRate"])) < 0.01]
-            if rows: return [(x["fundingTime"], float(x["fundingRate"]) * 100) for x in rows], sym
+            if data.get("code") != 0:
+                raise ValueError(data.get("msg"))
+            rows = [
+                x for x in data.get("data", {}).get("rows", [])
+                if x["fundingTime"] >= start_ms
+                and abs(float(x["fundingRate"])) < 0.01  # фильтр аномалий > ±1%
+            ]
+            if rows:
+                return [(x["fundingTime"], float(x["fundingRate"]) * 100) for x in rows], sym
         except Exception as e:
             last_err = str(e)
         time.sleep(0.15)
     return [], last_err
 
+
+# ─────────────────────────────────────────────
+# XT API
+# ─────────────────────────────────────────────
+
+
 def xt_fetch(coin, start_ms, end_ms):
-    sym = coin.lower() if coin.endswith("USDT") else (coin.lower() + "t" if coin.endswith("USD") else f"{coin.lower()}_usdt")
+    """Возвращает list of (timestamp_ms, rate_pct).
+
+    Реальный формат ответа XT:
+    {
+      "returnCode": 0,
+      "result": {
+        "hasNext": false,
+        "items": [
+          {"id": 123, "symbol": "enj_usdt", "fundingRate": -0.001,
+           "createdTime": 1234567890000, "collectionInternal": 14400}
+        ]
+      }
+    }
+    """
+    coin = coin.upper()
+    if coin.endswith("USDT"):
+        sym = coin.lower()
+    elif coin.endswith("USD"):
+        sym = coin.lower() + "t"
+    else:
+        sym = f"{coin.lower()}_usdt"
+
+    last_err = None
     try:
         url = "https://fapi.xt.com/future/market/v1/public/q/funding-rate-record"
-        r = requests.get(url, params={"symbol": sym, "limit": 500, "direction": "NEXT"}, timeout=10)
+        params = {"symbol": sym, "limit": 500, "direction": "NEXT"}
+        r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
         data = r.json()
-        if data.get("returnCode") != 0: raise ValueError("API error")
-        items = data.get("result", [])
-        if isinstance(items, dict): items = items.get("items", [])
-        filtered = [(x.get("createdTime") or x.get("settleTime") or x.get("fundingTime") or 0, float(x.get("fundingRate", 0)) * 100) for x in items]
-        filtered = [x for x in filtered if x[0] >= start_ms]
-        if filtered: return filtered, sym
-    except Exception as e: return [], str(e)
-    return [], "Нет данных"
+
+        if data.get("returnCode") != 0:
+            err = data.get("error", {})
+            msg = err.get("msg") if isinstance(err, dict) else str(err)
+            raise ValueError(msg or "API error")
+
+        result = data.get("result", {})
+        # result может быть объектом {items:[...]} или списком напрямую
+        if isinstance(result, list):
+            items = result
+        else:
+            items = result.get("items", [])
+
+        if not items:
+            return [], f"Нет данных (символ: {sym})"
+
+        filtered = []
+        for x in items:
+            ts = x.get("createdTime") or x.get("settleTime") or x.get("fundingTime") or 0
+            rate = float(x.get("fundingRate", 0)) * 100
+            if ts >= start_ms:
+                filtered.append((ts, rate))
+
+        if not filtered:
+            return [], f"Нет данных за период (символ: {sym}, всего: {len(items)})"
+
+        return filtered, sym
+
+    except Exception as e:
+        last_err = str(e)
+
+    return [], last_err
+
+
+
+# ─────────────────────────────────────────────
+# TOOBIT API
+# ─────────────────────────────────────────────
+
 
 def toobit_fetch(coin, start_ms, end_ms):
-    sym = f"{coin[:-4]}-SWAP-USDT" if coin.endswith("USDT") else (f"{coin[:-3]}-SWAP-USDT" if coin.endswith("USD") else f"{coin}-SWAP-USDT")
+    """Возвращает list of (timestamp_ms, rate_pct).
+
+    Формат ответа Toobit:
+    [
+      {"id": "123", "symbol": "BTC-SWAP-USDT",
+       "settleTime": "1570708800000", "settleRate": "0.00321", "period": "8H"}
+    ]
+    """
+    coin = coin.upper()
+    # Toobit формат: BTC-SWAP-USDT
+    if coin.endswith("USDT"):
+        base = coin[:-4]  # убираем USDT
+        sym = f"{base}-SWAP-USDT"
+    elif coin.endswith("USD"):
+        base = coin[:-3]
+        sym = f"{base}-SWAP-USDT"
+    else:
+        sym = f"{coin}-SWAP-USDT"
+
+    last_err = None
     try:
         url = "https://api.toobit.com/api/v1/futures/historyFundingRate"
-        r = requests.get(url, params={"symbol": sym, "limit": 1000}, timeout=10)
+        params = {"symbol": sym, "limit": 1000}
+        r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
         data = r.json()
-        if not isinstance(data, list): raise ValueError("Format error")
-        filtered = [(int(x.get("settleTime", 0)), float(x.get("settleRate", 0)) * 100) for x in data]
-        filtered = [x for x in filtered if x[0] >= start_ms]
-        if filtered: return filtered, sym
-    except Exception as e: return [], str(e)
-    return [], "Нет данных"
+
+        # Ответ — массив напрямую
+        if not isinstance(data, list):
+            raise ValueError(f"Unexpected response format: {str(data)[:100]}")
+
+        if not data:
+            return [], f"Нет данных (символ: {sym})"
+
+        filtered = []
+        for x in data:
+            ts = int(x.get("settleTime", 0))
+            rate = float(x.get("settleRate", 0)) * 100
+            if ts >= start_ms:
+                filtered.append((ts, rate))
+
+        if not filtered:
+            return [], f"Нет данных за период (символ: {sym}, всего: {len(data)})"
+
+        return filtered, sym
+
+    except Exception as e:
+        last_err = str(e)
+
+    return [], last_err
+
+
+
+# ─────────────────────────────────────────────
+# OKX API
+# ─────────────────────────────────────────────
+
 
 def okx_fetch(coin, start_ms, end_ms):
-    sym = f"{coin[:-4]}-USDT-SWAP" if coin.endswith("USDT") else (f"{coin[:-3]}-USDT-SWAP" if coin.endswith("USD") else f"{coin}-USDT-SWAP")
+    """Возвращает list of (timestamp_ms, rate_pct).
+
+    Формат ответа OKX:
+    {"code":"0","data":[
+      {"fundingRate":"0.0001","fundingTime":"1570708800000","instId":"BTC-USDT-SWAP",...}
+    ]}
+    Авторизация не нужна. Лимит 100 записей за запрос.
+    """
+    coin = coin.upper()
+    if coin.endswith("USDT"):
+        base = coin[:-4]
+        sym = f"{base}-USDT-SWAP"
+    elif coin.endswith("USD"):
+        base = coin[:-3]
+        sym = f"{base}-USDT-SWAP"
+    else:
+        sym = f"{coin}-USDT-SWAP"
+
+    last_err = None
     try:
         url = "https://www.okx.com/api/v5/public/funding-rate-history"
-        r = requests.get(url, params={"instId": sym, "limit": 100}, timeout=10)
-        if r.status_code in (451, 403): return [], "OKX заблокирован"
-        r.raise_for_status()
-        items = r.json().get("data", [])
-        filtered = [(int(x.get("fundingTime", 0)), float(x.get("fundingRate", 0)) * 100) for x in items]
-        filtered = [x for x in filtered if x[0] >= start_ms]
-        if filtered: return filtered, sym
-    except Exception as e: return [], str(e)
-    return [], "Нет данных"
+        # OKX возвращает макс 100 записей, фильтруем по времени на нашей стороне
+        params = {"instId": sym, "limit": 100}
+        r = requests.get(url, params=params, timeout=10)
 
-def bingx_fetch(coin, start_ms, end_ms):
-    sym = coin[:-4] + "-USDT" if coin.endswith("USDT") else (coin[:-3] + "-USDT" if coin.endswith("USD") else f"{coin}-USDT")
-    try:
-        url = "https://open-api.bingx.com/openApi/swap/v2/quote/fundingRate"
-        r = requests.get(url, params={"symbol": sym, "limit": 1000}, timeout=10)
-        if r.status_code in (451, 403): return [], "BingX заблокирован"
-        r.raise_for_status()
-        items = r.json().get("data", [])
-        filtered = [(int(x.get("fundingTime", 0)), float(x.get("fundingRate", 0)) * 100) for x in items]
-        filtered = [x for x in filtered if x[0] >= start_ms]
-        if filtered: return filtered, sym
-    except Exception as e: return [], str(e)
-    return [], "Нет данных"
+        # 451 = геоблокировка
+        if r.status_code == 451:
+            return [], "OKX заблокирован в вашем регионе (ошибка 451)"
+        if r.status_code == 403:
+            return [], "OKX недоступен (ошибка 403)"
 
-def kucoin_fetch(coin, start_ms, end_ms):
-    sym = coin + "M" if coin.endswith("USDT") else (coin + "TM" if coin.endswith("USD") else f"{coin}USDTM")
-    try:
-        url = "https://api-futures.kucoin.com/api/v1/contract/funding-rates"
-        r = requests.get(url, params={"symbol": sym, "from": start_ms, "to": end_ms}, timeout=10)
-        if r.status_code in (451, 403): return [], "KuCoin заблокирован"
-        r.raise_for_status()
-        items = r.json().get("data", [])
-        filtered = [(int(x.get("timepoint", 0)), float(x.get("fundingRate", 0)) * 100) for x in items]
-        if filtered: return filtered, sym
-    except Exception as e: return [], str(e)
-    return [], "Нет данных"
-
-def gate_fetch(coin, start_ms, end_ms):
-    sym = coin if coin.endswith("USDT") else (coin + "T" if coin.endswith("USD") else f"{coin}_USDT")
-    try:
-        url = "https://api.gateio.ws/api/v4/futures/usdt/funding_rate"
-        r = requests.get(url, params={"contract": sym, "from": start_ms // 1000, "to": end_ms // 1000, "limit": 1000}, timeout=10)
         r.raise_for_status()
         data = r.json()
-        filtered = [(int(x.get("t", 0)) * 1000, float(x.get("r", 0)) * 100) for x in data]
-        filtered = [x for x in filtered if x[0] >= start_ms]
-        if filtered: return filtered, sym
-    except Exception as e: return [], str(e)
-    return [], "Нет данных"
 
-def blofin_fetch(coin, start_ms, end_ms):
-    sym = coin[:-4] + "-USDT" if coin.endswith("USDT") else (coin[:-3] + "-USDT" if coin.endswith("USD") else f"{coin}-USDT")
+        if data.get("code") != "0":
+            raise ValueError(data.get("msg", "API error"))
+
+        items = data.get("data", [])
+        if not items:
+            return [], f"Нет данных (символ: {sym})"
+
+        filtered = []
+        for x in items:
+            ts = int(x.get("fundingTime", 0))
+            rate = float(x.get("fundingRate", 0)) * 100
+            if ts >= start_ms:
+                filtered.append((ts, rate))
+
+        if not filtered:
+            return [], f"Нет данных за период (символ: {sym}, всего: {len(items)})"
+
+        return filtered, sym
+
+    except Exception as e:
+        last_err = str(e)
+
+    return [], last_err
+
+
+# ─────────────────────────────────────────────
+# BINGX API
+# ─────────────────────────────────────────────
+
+
+def bingx_fetch(coin, start_ms, end_ms):
+    """Возвращает list of (timestamp_ms, rate_pct).
+
+    Формат ответа BingX:
+    {"code": 0, "msg": "", "data": [
+      {"symbol": "BTC-USDT", "fundingRate": "0.0001", "fundingTime": 1570708800000}
+    ]}
+    Авторизация не нужна. Символ формата BTC-USDT.
+    """
+    coin = coin.upper()
+    if coin.endswith("USDT"):
+        sym = coin[:-4] + "-USDT"
+    elif coin.endswith("USD"):
+        sym = coin[:-3] + "-USDT"
+    else:
+        sym = f"{coin}-USDT"
+
+    last_err = None
     try:
-        url = "https://openapi.blofin.com/api/v1/market/funding-rate-history"
-        r = requests.get(url, params={"instId": sym, "limit": 100}, timeout=10)
+        url = "https://open-api.bingx.com/openApi/swap/v2/quote/fundingRate"
+        params = {"symbol": sym, "limit": 1000}
+        r = requests.get(url, params=params, timeout=10)
+
+        if r.status_code == 451:
+            return [], "BingX заблокирован в вашем регионе (ошибка 451)"
+        if r.status_code == 403:
+            return [], "BingX недоступен (ошибка 403)"
+
         r.raise_for_status()
-        items = r.json().get("data", [])
-        filtered = [(int(x["fundingTime"]), float(x["fundingRate"]) * 100) for x in items if int(x["fundingTime"]) >= start_ms]
-        if filtered: return filtered, sym
-    except Exception as e: return [], str(e)
-    return [], "Нет данных"
+        data = r.json()
 
-def weex_fetch(coin, start_ms, end_ms):
-    sym = coin if coin.endswith("USDT") else (coin + "T" if coin.endswith("USD") else f"{coin}USDT")
-    SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000
-    all_rows, chunk_start = [], start_ms
-    try:
-        while chunk_start < end_ms:
-            chunk_end = min(chunk_start + SEVEN_DAYS_MS, end_ms)
-            r = requests.get("https://api-contract.weex.com/capi/v3/market/fundingRate", params={"symbol": sym, "startTime": chunk_start, "endTime": chunk_end, "limit": 1000}, timeout=10)
-            r.raise_for_status()
-            data = r.json()
-            items = data if isinstance(data, list) else data.get("data", [])
-            all_rows.extend(items)
-            chunk_start = chunk_end + 1
-            time.sleep(0.1)
-        filtered = [(int(x.get("fundingTime", 0)), float(x.get("fundingRate", 0)) * 100) for x in all_rows]
-        filtered = sorted(list(set([x for x in filtered if start_ms <= x[0] <= end_ms])), key=lambda k: k[0])
-        if filtered: return filtered, sym
-    except Exception as e: return [], str(e)
-    return [], "Нет данных"
+        if data.get("code") != 0:
+            raise ValueError(data.get("msg", "API error"))
+
+        items = data.get("data", [])
+        if not items:
+            return [], f"Нет данных (символ: {sym})"
+
+        filtered = []
+        for x in items:
+            ts = int(x.get("fundingTime", 0))
+            rate = float(x.get("fundingRate", 0)) * 100
+            if ts >= start_ms:
+                filtered.append((ts, rate))
+
+        if not filtered:
+            return [], f"Нет данных за период (символ: {sym}, всего: {len(items)})"
+
+        return filtered, sym
+
+    except Exception as e:
+        last_err = str(e)
+
+    return [], last_err
+
+
+# ─────────────────────────────────────────────
+# KUCOIN API
+# ─────────────────────────────────────────────
+
 
 def zoomex_fetch(coin, start_ms, end_ms):
+    """Zoomex funding rate history (Bybit-compatible API).
+    Символ: BTCUSDT. Пагинация через cursor.
+    """
     sym = f"{coin.upper()}USDT"
-    url, all_rows, cursor = "https://openapi.zoomex.com/cloud/trade/v3/market/funding/history", [], None
+    url = "https://openapi.zoomex.com/cloud/trade/v3/market/funding/history"
+    all_rows = []
+    cursor = None
     try:
         while True:
             params = {"category": "linear", "symbol": sym, "limit": 200}
-            if cursor: params["cursor"] = cursor
+            if cursor:
+                params["cursor"] = cursor
             r = requests.get(url, params=params, timeout=10)
+            if r.status_code != 200 or not r.text.strip():
+                return [], f"HTTP {r.status_code}"
             data = r.json()
-            rows = data.get("result", {}).get("list", [])
-            if not rows: break
+            if data.get("retCode") != 0:
+                return [], data.get("retMsg", "error")
+            rows = data["result"]["list"]
+            if not rows:
+                break
             for row in rows:
-                ts = int(row["fundingRateTimestamp"])
-                if ts < start_ms: return sorted(all_rows, key=lambda x: x[0]), sym
-                if ts <= end_ms: all_rows.append((ts, float(row["fundingRate"]) * 100))
-            cursor = data.get("result", {}).get("nextPageCursor")
-            if not cursor: break
+                ts   = int(row["fundingRateTimestamp"])
+                rate = float(row["fundingRate"]) * 100
+                if ts < start_ms:
+                    return sorted(all_rows, key=lambda x: x[0]), sym
+                if ts <= end_ms:
+                    all_rows.append((ts, rate))
+            cursor = data["result"].get("nextPageCursor")
+            if not cursor:
+                break
             time.sleep(0.1)
         return sorted(all_rows, key=lambda x: x[0]), sym
-    except Exception as e: return [], str(e)
+    except Exception as e:
+        return [], str(e)
+
+
+# ─────────────────────────────────────────────
+# УНИВЕРСАЛЬНЫЙ АНАЛИЗ
+# ─────────────────────────────────────────────
+
 
 def coinw_fetch(coin, start_ms, end_ms):
-    if not SUPABASE_URL or not SUPABASE_KEY: return [], "Supabase не задан"
+    """
+    Возвращает историю ставок фандинга CoinW из Supabase.
+    Данные собираются коллектором каждые 4 часа.
+    Дедупликация по funding_time — исключает дубли для монет с 8ч интервалом.
+    Формат: list of (timestamp_ms, rate_pct)
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return [], "SUPABASE_URL/KEY не заданы"
+
     symbol = coin.upper()
+    from datetime import datetime, time as dt_time, timezone
     start_iso = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).isoformat()
+
     try:
-        r = requests.get(f"{SUPABASE_URL}/rest/v1/funding_rates", headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, params={"symbol": f"eq.{symbol}", "collected_at": f"gte.{start_iso}", "order": "funding_time.asc", "limit": "1000", "select": "rate_pct,collected_at,funding_time"}, timeout=10)
+        url = f"{SUPABASE_URL}/rest/v1/funding_rates"
+        headers = {
+            "apikey":        SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+        }
+        params = {
+            "symbol":       f"eq.{symbol}",
+            "collected_at": f"gte.{start_iso}",
+            "order":        "funding_time.asc",
+            "limit":        "1000",
+            "select":       "rate_pct,collected_at,funding_time",
+        }
+        r = requests.get(url, headers=headers, params=params, timeout=10)
         r.raise_for_status()
-        rows, seen, result = r.json(), set(), []
+        rows = r.json()
+
+        if not rows:
+            return [], f"Нет данных для {symbol} в БД"
+
+        # Дедупликация по funding_time — берём уникальные выплаты
+        seen_funding_times = set()
+        result = []
         for row in rows:
             ft = row.get("funding_time")
             if ft:
-                if ft in seen: continue
-                seen.add(ft)
+                if ft in seen_funding_times:
+                    continue
+                seen_funding_times.add(ft)
                 dt = datetime.fromisoformat(ft.replace("Z", "+00:00"))
             else:
-                dt = datetime.fromisoformat(row["collected_at"].replace("Z", "+00:00"))
-            result.append((int(dt.timestamp() * 1000), float(row["rate_pct"])))
+                # Старые записи без funding_time — используем collected_at
+                dt = datetime.fromisoformat(
+                    row["collected_at"].replace("Z", "+00:00")
+                )
+            ts_ms = int(dt.timestamp() * 1000)
+            result.append((ts_ms, float(row["rate_pct"])))
+
         return result, f"coinw_{symbol}"
-    except Exception as e: return [], str(e)
+
+    except Exception as e:
+        return [], str(e)
+
 
 def phemex_get_all_symbols():
-    r = requests.get("https://api.phemex.com/exchange/public/cfg/v2/products", timeout=15)
+    """Получает список всех USDT-маржинальных перпетуалов с Phemex.
+    Использует /exchange/public/cfg/v2/products — там 526 Listed USDT контрактов.
+    Возвращает список строк-монет: ['BTC', 'ETH', 'ENJ', ...]
+    """
+    url = "https://api.phemex.com/exchange/public/cfg/v2/products"
+    r = requests.get(url, timeout=15)
     r.raise_for_status()
-    coins, seen = [], set()
-    for p in r.json().get("data", {}).get("products", []):
-        if p.get("type") == "PerpetualV2" and p.get("quoteCurrency") == "USDT" and p.get("status") == "Listed":
+    data = r.json()
+    products = data.get("data", {}).get("products", [])
+    coins = []
+    seen = set()
+    for p in products:
+        if (p.get("type") == "PerpetualV2"
+                and p.get("quoteCurrency") == "USDT"
+                and p.get("status") == "Listed"):
             sym = p.get("symbol", "")
-            if sym.endswith("USDT") and sym[:-4] not in seen:
-                coins.append(sym[:-4])
-                seen.add(sym[:-4])
+            # BTCUSDT -> BTC, ENJUSDT -> ENJ
+            if sym.endswith("USDT"):
+                coin = sym[:-4]
+                if coin and coin not in seen:
+                    coins.append(coin)
+                    seen.add(coin)
     return coins
 
+
 EXCHANGE_FETCHERS = {
-    "phemex": phemex_fetch, "xt": xt_fetch, "toobit": toobit_fetch, "okx": okx_fetch,
-    "bingx": bingx_fetch, "kucoin": kucoin_fetch, "gate": gate_fetch, "blofin": blofin_fetch,
-    "weex": weex_fetch, "coinw": coinw_fetch, "zoomex": zoomex_fetch,
+    "phemex": phemex_fetch,
+    "xt": xt_fetch,
+    "toobit": toobit_fetch,
+    "okx": okx_fetch,
+    "bingx": bingx_fetch,
+    "coinw": coinw_fetch,
+    "zoomex": zoomex_fetch,
+}
+
+EXCHANGE_LABELS = {
+    "phemex": "Phemex",
+    "xt": "XT",
+    "toobit": "Toobit",
+    "okx": "OKX",
+    "bingx": "BingX",
+    "coinw": "CoinW",
+    "zoomex": "Zoomex",
 }
