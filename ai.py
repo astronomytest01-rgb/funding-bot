@@ -12,7 +12,7 @@ GEMINI_BULK_PROMPT = """Действуй как риск-менеджер кри
 
 Выведи ТОЛЬКО список монет, которые ты рекомендуешь оставить.
 Формат каждой строки: [ЭМОДЖИ] [МОНЕТА] — [причина 3-6 слов].
-Используй 🟢 для ЛОНГ и 🔴 для ШОРТ. Если монета не подходит — пропусти её.
+Строго ставь 🟢 только для ЛОНГ и 🔴 только для ШОРТ по направлению из списка. Если монета не подходит — пропусти её.
 Если ни одна не подходит — напиши: Подходящих фундаментальных монет нет."""
 
 GEMINI_SINGLE_PROMPT = """Действуй как риск-менеджер криптофонда. Проанализируй {coin} как актив для стратегии заработка на ставках финансирования.
@@ -75,6 +75,28 @@ def extract_gemini_approved_coins(ai_text, candidates):
     return [coin for coin in candidates if coin.upper() in upper]
 
 
+def enforce_direction_emojis(ai_text, directions_by_coin):
+    """Fix Gemini output emoji so LONG is green and SHORT is red."""
+    if not ai_text:
+        return ai_text
+    fixed_lines = []
+    for line in ai_text.splitlines():
+        fixed = line
+        upper = line.upper()
+        for coin, direction in directions_by_coin.items():
+            if coin.upper() not in upper:
+                continue
+            expected = "🟢" if direction == "LONG" else "🔴"
+            stripped = fixed.lstrip()
+            if stripped.startswith(("🟢", "🔴")):
+                fixed = fixed[:len(fixed) - len(stripped)] + expected + stripped[1:]
+            else:
+                fixed = f"{expected} {stripped}"
+            break
+        fixed_lines.append(fixed)
+    return "\n".join(fixed_lines)
+
+
 async def send_gemini_scan_review(msg, passed, days):
     """AI-фильтр в конце /analyze. Показывает только монеты, которые Gemini оставил."""
     if not GEMINI_API_KEY or not passed:
@@ -90,12 +112,13 @@ async def send_gemini_scan_review(msg, passed, days):
         targets.append((coin, direction, f"- {coin} ({direction_label}, {category}, avg {avg:+.4f}%{income_part})"))
 
     await msg.reply_text("🤖 Gemini быстро фильтрует найденные монеты по фундаменталу...")
+    directions_by_coin = {coin: direction for coin, direction, _row in targets}
     bulk_results = []
     for i in range(0, len(targets), 15):
         chunk = targets[i:i+15]
         answer = gemini_analyze_bulk("\n".join(row for _, _, row in chunk), days)
         if answer and "Подходящих фундаментальных монет нет" not in answer:
-            bulk_results.append(answer)
+            bulk_results.append(enforce_direction_emojis(answer, directions_by_coin))
         time.sleep(3)
 
     if bulk_results:

@@ -15,8 +15,8 @@ NEG_AVG_THRESHOLD = -0.08
 MIN_NEG_RATIO = 0.30
 MIN_POS_RATIO = 0.30
 
-# Последние 6 ставок покрывают примерно последние сутки для 4-8h funding intervals.
-RECENT_TREND_RATES = 6
+# Последние 4 ставки отсеивают монеты, где funding уже развернулся.
+RECENT_TREND_RATES = 4
 RECENT_TREND_MIN_GOOD_RATIO = 0.50
 
 # Вечерний авто-отчёт: 20:00 Europe/Kyiv = 17:00 UTC.

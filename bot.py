@@ -32,6 +32,7 @@ from config import (
     GEMINI_API_KEY,
     MAX_OUTLIER_PCT,
     MIN_NEG_RATIO,
+    MIN_POS_RATIO,
     NEG_AVG_THRESHOLD,
     REPORT_CHAT_ID,
     STABILITY_THRESHOLD,
@@ -883,36 +884,39 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
                     continue
 
                 neg       = [r for r in clean if r < 0]
+                pos       = [r for r in clean if r > 0]
                 neg_ratio = len(neg) / len(clean)
+                pos_ratio = len(pos) / len(clean)
 
-                # Стабильность: минимум 30% отрицательных
-                if neg_ratio < MIN_NEG_RATIO:
-                    time.sleep(0.15)
-                    continue
-
-                # Среднее по всем выплатам
                 avg_rate = sum(clean) / len(clean)
-                if avg_rate >= 0:
+                if avg_rate < 0 and neg_ratio >= MIN_NEG_RATIO:
+                    direction = "LONG"
+                    key_avg = avg_rate
+                    below = sum(1 for r in clean if r <= STABILITY_THRESHOLD)
+                    outlier = (len(clean) - below) / len(clean) * 100
+                elif avg_rate > 0 and pos_ratio >= MIN_POS_RATIO:
+                    direction = "SHORT"
+                    key_avg = avg_rate
+                    above = sum(1 for r in clean if r >= -STABILITY_THRESHOLD)
+                    outlier = (len(clean) - above) / len(clean) * 100
+                else:
                     time.sleep(0.15)
                     continue
 
                 # payments_per_day = кол-во выплат за период / кол-во дней
                 payments_per_day = len(clean) / days
-                daily_income     = amount * abs(avg_rate) / 100 * payments_per_day
+                daily_income     = amount * abs(key_avg) / 100 * payments_per_day
 
                 if daily_income < threshold:
                     time.sleep(0.15)
                     continue
                 ordered_rates = [rate for _, rate in sorted(rows, key=lambda x: x[0])]
-                if not recent_trend_ok(ordered_rates, "LONG"):
+                if not recent_trend_ok(ordered_rates, direction):
                     time.sleep(0.15)
                     continue
 
-                # outlier для отображения
-                below   = sum(1 for r in clean if r <= STABILITY_THRESHOLD)
-                outlier = (len(clean) - below) / len(clean) * 100
-                batch_results.append((coin, avg_rate, outlier, "LONG", "income", daily_income))
-                passed.append((coin, avg_rate, outlier, "LONG", "income", daily_income))
+                batch_results.append((coin, key_avg, outlier, direction, "income", daily_income))
+                passed.append((coin, key_avg, outlier, direction, "income", daily_income))
 
             time.sleep(0.15)
 
