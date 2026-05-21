@@ -6,6 +6,7 @@ and evening report jobs are split into modules to keep future AI edits safer.
 """
 
 import time
+import requests
 from datetime import datetime, time as dt_time, timezone
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -29,10 +30,13 @@ from config import (
     DEFAULT_DAYS,
     EXCHANGES_ENABLED,
     GEMINI_API_KEY,
+    MAX_OUTLIER_PCT,
+    MIN_NEG_RATIO,
+    NEG_AVG_THRESHOLD,
     REPORT_CHAT_ID,
     STABILITY_THRESHOLD,
 )
-from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, phemex_get_all_symbols
+from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, phemex_fetch, phemex_get_all_symbols
 from reports import auto_scan_job
 
 WAIT_ANALYZE_COINS = 1
@@ -926,10 +930,9 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
                     lines.append(f"{cat_icon} {dir_icon} `{coin}` avg `{avg:+.4f}%` выбр `{op:.0f}%`")
             await msg.reply_text("\n".join(lines), parse_mode="Markdown")
         else:
-            if batch_idx % 3 == 2 or batch_idx == len(batches) - 1:
-                await msg.reply_text(
-                    f"⏳ {scanned}/{total} | найдено: {len(passed)} | осталось {remaining}"
-                )
+            await msg.reply_text(
+                f"⏳ {scanned}/{total} | найдено: {len(passed)} | осталось {remaining}"
+            )
 
     _scan_running[chat_id] = False
 
