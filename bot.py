@@ -1589,6 +1589,55 @@ async def do_delta(update, coins, days, amount_usd=None):
 
 
 
+# ─────────────────────────────────────────────
+# /ai — фундаментальный анализ монеты через Gemini
+# ─────────────────────────────────────────────
+
+async def do_ai_multiple(update, coins):
+    msg = update.message if hasattr(update, "message") and update.message else update
+    if not GEMINI_API_KEY:
+        await msg.reply_text("❌ GEMINI_API_KEY не задан. AI-анализ недоступен.")
+        return
+    clean_coins = [c.upper() for c in coins if c.strip()]
+    if not clean_coins:
+        await msg.reply_text("Введи монету, например `SOL` или `SOL ENJ`.", parse_mode="Markdown")
+        return
+
+    await msg.reply_text(f"🤖 Начинаю AI-анализ {len(clean_coins)} монет...")
+    for idx, coin in enumerate(clean_coins):
+        await msg.reply_text(f"🔍 Анализирую *{coin}*...", parse_mode="Markdown")
+        answer = gemini_analyze_single(coin)
+        if not answer:
+            await msg.reply_text(f"❌ Gemini не ответил по {coin}.")
+            continue
+        text = f"🤖 AI-анализ {coin}\n\n{answer}"
+        for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
+            await msg.reply_text(chunk)
+        if idx < len(clean_coins) - 1:
+            time.sleep(3)
+
+
+async def ai_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args:
+        await do_ai_multiple(update, context.args)
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "Введи монеты для AI-анализа, например:\n\n"
+        "`SOL`\n"
+        "`SOL ENJ RON`\n\n"
+        "AI оценивает фундаментал, ликвидность, волатильность и риски. "
+        "Ставки фандинга он не анализирует.",
+        parse_mode="Markdown",
+    )
+    return WAIT_AI_COIN
+
+
+async def ai_got_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await do_ai_multiple(update, update.message.text.split())
+    return ConversationHandler.END
+
+
+
 def main():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN не задан!")
