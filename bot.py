@@ -15,7 +15,7 @@ from telegram.ext import (
     filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 )
 
-from ai import gemini_analyze_single, send_gemini_scan_review
+from ai import gemini_analyze_single, get_last_gemini_error, send_gemini_scan_review
 from analysis import (
     analyze_coin_multi,
     analyze_delta,
@@ -1615,7 +1615,8 @@ async def do_ai_multiple(update, coins):
         await msg.reply_text(f"🔍 Анализирую *{coin}*...", parse_mode="Markdown")
         answer = gemini_analyze_single(coin)
         if not answer:
-            await msg.reply_text(f"❌ Gemini не ответил по {coin}.")
+            reason = get_last_gemini_error() or "unknown error"
+            await msg.reply_text(f"❌ Gemini не ответил по {coin}. Причина: {reason}")
             continue
         text = f"🤖 AI-анализ {coin}\n\n{answer}"
         for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:

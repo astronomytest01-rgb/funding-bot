@@ -1,7 +1,11 @@
+import logging
 import time
 import requests
 
 from config import GEMINI_API_KEY
+
+logger = logging.getLogger(__name__)
+LAST_GEMINI_ERROR = ""
 
 GEMINI_BULK_PROMPT = """Действуй как риск-менеджер криптофонда. Ниже список монет, которые прошли фильтр фандинга за {days} дней.
 Твоя задача — быстро отсеять опасные активы: мемкоины, сверхволатильные щиткоины, монеты без понятной инфраструктуры и активы с высоким риском скама.
@@ -26,9 +30,22 @@ GEMINI_SINGLE_PROMPT = """Действуй как риск-менеджер кр
 ⚖️ Риск-менеджмент: плечо, размер позиции и стопы."""
 
 
+def _set_gemini_error(message):
+    global LAST_GEMINI_ERROR
+    LAST_GEMINI_ERROR = message
+    logger.warning("Gemini request failed: %s", message)
+
+
+def get_last_gemini_error():
+    return LAST_GEMINI_ERROR
+
+
 def gemini_generate(prompt, temperature=0.3, timeout=30):
     """Возвращает текст Gemini или None. Не влияет на основную логику бота."""
+    global LAST_GEMINI_ERROR
+    LAST_GEMINI_ERROR = ""
     if not GEMINI_API_KEY:
+        _set_gemini_error("GEMINI_API_KEY is missing")
         return None
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -42,12 +59,37 @@ def gemini_generate(prompt, temperature=0.3, timeout=30):
         try:
             r = requests.post(url, json=payload, timeout=timeout)
             if r.status_code == 429:
+                _set_gemini_error("429 rate limit or quota exceeded")
                 time.sleep(15 * (attempt + 1))
                 continue
+            if r.status_code in (400, 401, 403):
+                _set_gemini_error(f"HTTP {r.status_code}: {r.text[:300]}")
+                return None
+            if r.status_code >= 500:
+                _set_gemini_error(f"HTTP {r.status_code}: Gemini server error")
+                time.sleep(5 * (attempt + 1))
+                continue
             r.raise_for_status()
-            return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-        except Exception:
+            data = r.json()
+            candidates = data.get("candidates") or []
+            if not candidates:
+                _set_gemini_error(f"empty candidates: {str(data)[:300]}")
+                return None
+            parts = candidates[0].get("content", {}).get("parts") or []
+            if not parts or not parts[0].get("text"):
+                _set_gemini_error(f"empty text: {str(data)[:300]}")
+                return None
+            LAST_GEMINI_ERROR = ""
+            return parts[0]["text"].strip()
+        except requests.Timeout:
+            _set_gemini_error("request timeout")
             time.sleep(5)
+        except requests.RequestException as e:
+            _set_gemini_error(f"network error: {e}")
+            time.sleep(5)
+        except (KeyError, ValueError, TypeError) as e:
+            _set_gemini_error(f"bad response format: {e}")
+            return None
     return None
 
 
