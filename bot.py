@@ -38,7 +38,7 @@ from config import (
     STABILITY_THRESHOLD,
 )
 from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, EXCHANGE_SYMBOL_FETCHERS, phemex_fetch, phemex_get_all_symbols
-from oi import format_oi_status, is_oi_allowed
+from oi import OI_HIDE_BELOW_USD, OI_OK_USD, format_oi_status, get_open_interest_usd, is_oi_allowed
 from reports import auto_scan_job, run_evening_report, send_entry_instructions
 
 WAIT_ANALYZE_COINS = 1
@@ -69,6 +69,8 @@ AN_THRESH = 53
 AN_THRESH_NUM = 54
 AN_DAYS = 55
 AN_DAYS_NUM = 56
+OI_COIN = 60
+OI_EXCH = 61
 
 SCAN_DAYS = 7
 SCAN_BATCH = 20
@@ -105,7 +107,7 @@ def parse_tokens(text):
         if p in ("/exchange", "--exchange") and i + 1 < len(parts):
             exchange = parts[i + 1].lower(); i += 2; continue
         # пропускаем команды вида /filter если вдруг попали в текст
-        if p in ("/filter", "/funding", "/calculator", "/start", "/help", "/settings", "/report", "/instruction", "/cancel"):
+        if p in ("/filter", "/funding", "/calculator", "/start", "/help", "/settings", "/report", "/instruction", "/oi", "/cancel"):
             i += 1; continue
         # Распознаём название активной биржи без префикса.
         if p in KNOWN_EXCHANGES:
@@ -489,6 +491,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/calculator — калькулятор дохода от фандинга\n"
         "/analyze — скан рынка + Gemini-фильтр найденных монет\n"
         "/ai — фундаментальный AI-анализ монеты без анализа фандинга\n"
+        "/oi — пошаговая проверка Open Interest по монете\n"
         "/findpair — дельта-нейтраль: найти пару лонг+шорт\n"
         "/report — запустить вечерний отчёт вручную\n"
         "/instruction — инструкция входа и риск-проверок\n"
@@ -498,6 +501,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/filter ENJ phemex 7`\n"
         "`/funding ENJ phemex 7`\n"
         "`/calculator ENJ 25000 7 phemex`\n"
+        "`/oi FLOW`\n"
         "`/ai SOL ENJ`"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -514,6 +518,119 @@ async def cmd_instruction(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_start(update, context)
+
+
+# ─────────────────────────────────────────────
+# /oi — пошаговая проверка Open Interest
+# ─────────────────────────────────────────────
+
+
+def normalize_oi_coin(text):
+    token = (text or "").strip().split()[0].upper() if (text or "").strip() else ""
+    token = token.replace("$", "").replace("/", "").replace("-", "").replace("_", "")
+    token = "".join(ch for ch in token if ch.isalnum())
+    if token.endswith("USDT"):
+        token = token[:-4]
+    elif token.endswith("USD"):
+        token = token[:-3]
+    return token
+
+
+def make_oi_exchange_keyboard():
+    buttons = []
+    row = []
+    for ex, enabled in EXCHANGES_ENABLED.items():
+        if not enabled:
+            continue
+        row.append(InlineKeyboardButton(EXCHANGE_LABELS.get(ex, ex.upper()), callback_data=f"oi_ex_{ex}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("Отмена", callback_data="oi_cancel")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def format_oi_recommendation(coin, exchange):
+    label = EXCHANGE_LABELS.get(exchange, exchange.upper())
+    oi_usd = get_open_interest_usd(exchange, coin)
+    status = format_oi_status(exchange, coin)
+    if oi_usd is None:
+        verdict = (
+            "⚠️ *Данных OI нет.* Не заходи без ручной проверки OI на самой бирже, "
+            "глубины стакана, spread, slippage и Predicted Rate."
+        )
+    elif oi_usd < OI_HIDE_BELOW_USD:
+        verdict = (
+            "🚫 *Не стоит заходить.* OI ниже `$500,000`, бот скрывает такие монеты "
+            "из `/analyze` и вечернего отчёта."
+        )
+    elif oi_usd < OI_OK_USD:
+        verdict = (
+            "⚠️ *Высокий риск.* OI между `$500,000` и `$1,000,000`: можно смотреть только "
+            "после ручной проверки стакана, но для позиции около `$15,000` лучше пропустить."
+        )
+    else:
+        verdict = (
+            "✅ *OI проходит базовый фильтр.* Это не сигнал на вход: перед сделкой всё равно проверь "
+            "spread, глубину первых 5 ордеров, slippage, Predicted Rate и стабильность фандинга."
+        )
+    return (
+        f"🐋 *Open Interest check*\n\n"
+        f"Монета: `{coin}`\n"
+        f"Биржа: *{label}*\n"
+        f"Статус: {status}\n\n"
+        f"{verdict}"
+    )
+
+
+async def oi_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args:
+        coin = normalize_oi_coin(" ".join(context.args))
+        if coin:
+            context.user_data["oi_coin"] = coin
+            await update.message.reply_text(
+                f"Монета: `{coin}`\n\nШаг 2/2: выбери биржу для проверки OI:",
+                reply_markup=make_oi_exchange_keyboard(),
+                parse_mode="Markdown",
+            )
+            return OI_EXCH
+    await update.message.reply_text(
+        "🐋 Проверка Open Interest\n\nШаг 1/2: введи монету, например `FLOW` или `JTO`.",
+        parse_mode="Markdown",
+    )
+    return OI_COIN
+
+
+async def oi_got_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    coin = normalize_oi_coin(update.message.text)
+    if not coin:
+        await update.message.reply_text("Не распознал монету. Попробуй: `FLOW`", parse_mode="Markdown")
+        return OI_COIN
+    context.user_data["oi_coin"] = coin
+    await update.message.reply_text(
+        f"Монета: `{coin}`\n\nШаг 2/2: выбери биржу для проверки OI:",
+        reply_markup=make_oi_exchange_keyboard(),
+        parse_mode="Markdown",
+    )
+    return OI_EXCH
+
+
+async def oi_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if q.data == "oi_cancel":
+        await q.edit_message_text("Отменено.")
+        return ConversationHandler.END
+    exchange = q.data.replace("oi_ex_", "")
+    coin = context.user_data.get("oi_coin")
+    if not coin:
+        await q.edit_message_text("❌ Монета не найдена. Запусти /oi заново.")
+        return ConversationHandler.END
+    await q.edit_message_text("Проверяю Open Interest...")
+    await q.message.reply_text(format_oi_recommendation(coin, exchange), parse_mode="Markdown")
+    return ConversationHandler.END
 
 
 # cmd_exchanges удалена — используй /settings
@@ -1753,12 +1870,22 @@ def main():
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
 
+    oi_conv = ConversationHandler(
+        entry_points=[CommandHandler("oi", oi_start)],
+        states={
+            OI_COIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, oi_got_coin)],
+            OI_EXCH: [CallbackQueryHandler(oi_exchange_btn, pattern="^oi_")],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+    )
+
     # ConversationHandlers — должны быть зарегистрированы до MessageHandler(unknown)
     app.add_handler(acf_conv)
     app.add_handler(fr_conv)
     app.add_handler(pc_conv)
     app.add_handler(delta_conv)
     app.add_handler(ai_conv)
+    app.add_handler(oi_conv)
 
     if REPORT_CHAT_ID and app.job_queue:
         app.job_queue.run_daily(auto_scan_job, time=dt_time(hour=17, minute=0, second=0, tzinfo=timezone.utc))
