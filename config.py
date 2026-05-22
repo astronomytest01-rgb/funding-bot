@@ -31,5 +31,6 @@ EXCHANGES_ENABLED = {
     "okx": True,
     "bingx": True,
     "coinw": True,
-    "zoomex": True,
+    "kucoin": True,
+    "bitunix": True,
 }

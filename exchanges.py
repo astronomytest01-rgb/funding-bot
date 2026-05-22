@@ -296,42 +296,119 @@ def bingx_fetch(coin, start_ms, end_ms):
 # ─────────────────────────────────────────────
 
 
-def zoomex_fetch(coin, start_ms, end_ms):
-    """Zoomex funding rate history (Bybit-compatible API).
-    Символ: BTCUSDT. Пагинация через cursor.
+def kucoin_symbol_for_coin(coin):
+    coin = coin.upper()
+    if coin.endswith("USDT"):
+        coin = coin[:-4]
+    elif coin.endswith("USD"):
+        coin = coin[:-3]
+    base = "XBT" if coin == "BTC" else coin
+    return f"{base}USDTM"
+
+
+def kucoin_fetch(coin, start_ms, end_ms):
+    """KuCoin Futures funding history.
+
+    Endpoint returns fractional rates, e.g. 0.0001 = 0.01%.
     """
-    sym = f"{coin.upper()}USDT"
-    url = "https://openapi.zoomex.com/cloud/trade/v3/market/funding/history"
-    all_rows = []
-    cursor = None
+    sym = kucoin_symbol_for_coin(coin)
     try:
-        while True:
-            params = {"category": "linear", "symbol": sym, "limit": 200}
-            if cursor:
-                params["cursor"] = cursor
-            r = requests.get(url, params=params, timeout=6)
-            if r.status_code != 200 or not r.text.strip():
-                return [], f"HTTP {r.status_code}"
-            data = r.json()
-            if data.get("retCode") != 0:
-                return [], data.get("retMsg", "error")
-            rows = data["result"]["list"]
-            if not rows:
-                break
-            for row in rows:
-                ts   = int(row["fundingRateTimestamp"])
-                rate = float(row["fundingRate"]) * 100
-                if ts < start_ms:
-                    return sorted(all_rows, key=lambda x: x[0]), sym
-                if ts <= end_ms:
-                    all_rows.append((ts, rate))
-            cursor = data["result"].get("nextPageCursor")
-            if not cursor:
-                break
-            time.sleep(0.1)
-        return sorted(all_rows, key=lambda x: x[0]), sym
+        url = "https://api-futures.kucoin.com/api/v1/contract/funding-rates"
+        params = {"symbol": sym, "from": start_ms, "to": end_ms}
+        r = requests.get(url, params=params, timeout=6)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("code") != "200000":
+            return [], data.get("msg", "API error")
+        rows = []
+        for x in data.get("data", []):
+            ts = int(x.get("timepoint") or x.get("fundingTime") or x.get("time") or 0)
+            if start_ms <= ts <= end_ms:
+                rows.append((ts, float(x.get("fundingRate", 0)) * 100))
+        return sorted(rows, key=lambda x: x[0]), sym
     except Exception as e:
         return [], str(e)
+
+
+def kucoin_get_all_symbols():
+    """Returns USDT-margined open KuCoin Futures symbols as base coins."""
+    url = "https://api-futures.kucoin.com/api/v1/contracts/active"
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("code") != "200000":
+        raise ValueError(data.get("msg", "API error"))
+    coins = []
+    seen = set()
+    for item in data.get("data", []):
+        if item.get("quoteCurrency") != "USDT" or item.get("status") != "Open":
+            continue
+        coin = item.get("displayBaseCurrency") or item.get("baseCurrency")
+        if not coin:
+            continue
+        coin = "BTC" if coin.upper() == "XBT" else coin.upper()
+        if coin not in seen:
+            coins.append(coin)
+            seen.add(coin)
+    return coins
+
+
+# ─────────────────────────────────────────────
+# BITUNIX API
+# ─────────────────────────────────────────────
+
+
+def bitunix_symbol_for_coin(coin):
+    coin = coin.upper()
+    if coin.endswith("USDT"):
+        return coin
+    if coin.endswith("USD"):
+        return f"{coin[:-3]}USDT"
+    return f"{coin}USDT"
+
+
+def bitunix_fetch(coin, start_ms, end_ms):
+    """Bitunix Futures funding history.
+
+    Endpoint returns fractional rates, e.g. 0.0001 = 0.01%.
+    """
+    sym = bitunix_symbol_for_coin(coin)
+    try:
+        url = "https://fapi.bitunix.com/api/v1/futures/market/get_funding_rate_history"
+        params = {"symbol": sym, "limit": 100}
+        r = requests.get(url, params=params, timeout=6)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("code") != 0:
+            return [], data.get("msg", "API error")
+        rows = []
+        for x in data.get("data", []):
+            ts = int(x.get("fundingTime", 0))
+            if start_ms <= ts <= end_ms:
+                rows.append((ts, float(x.get("fundingRate", 0)) * 100))
+        return sorted(rows, key=lambda x: x[0]), sym
+    except Exception as e:
+        return [], str(e)
+
+
+def bitunix_get_all_symbols():
+    """Returns open USDT perpetual symbols from Bitunix as base coins."""
+    url = "https://fapi.bitunix.com/api/v1/futures/market/trading_pairs"
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("code") != 0:
+        raise ValueError(data.get("msg", "API error"))
+    coins = []
+    seen = set()
+    for item in data.get("data", []):
+        if item.get("quote") != "USDT" or item.get("symbolStatus") != "OPEN":
+            continue
+        coin = str(item.get("base") or "").upper()
+        if coin and coin not in seen:
+            coins.append(coin)
+            seen.add(coin)
+    return coins
 
 
 # ─────────────────────────────────────────────
@@ -430,7 +507,15 @@ EXCHANGE_FETCHERS = {
     "okx": okx_fetch,
     "bingx": bingx_fetch,
     "coinw": coinw_fetch,
-    "zoomex": zoomex_fetch,
+    "kucoin": kucoin_fetch,
+    "bitunix": bitunix_fetch,
+}
+
+EXCHANGE_SYMBOL_FETCHERS = {
+    "phemex": phemex_get_all_symbols,
+    "coinw": None,
+    "kucoin": kucoin_get_all_symbols,
+    "bitunix": bitunix_get_all_symbols,
 }
 
 EXCHANGE_LABELS = {
@@ -440,5 +525,6 @@ EXCHANGE_LABELS = {
     "okx": "OKX",
     "bingx": "BingX",
     "coinw": "CoinW",
-    "zoomex": "Zoomex",
+    "kucoin": "KuCoin",
+    "bitunix": "Bitunix",
 }

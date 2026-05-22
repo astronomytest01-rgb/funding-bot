@@ -6,14 +6,14 @@ from telegram.ext import ContextTypes
 from ai import gemini_analyze_bulk
 from analysis import analyze_rates, calc_std, get_active_exchanges, recent_trend_ok
 from config import AUTO_SCAN_AMOUNT, AUTO_SCAN_DAYS, GEMINI_API_KEY, REPORT_CHAT_ID
-from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, phemex_get_all_symbols
-from oi import format_oi_status
+from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, EXCHANGE_SYMBOL_FETCHERS, phemex_get_all_symbols
+from oi import format_oi_status, is_oi_allowed
 
 ENTRY_INSTRUCTIONS = """🛡️ *Главная задача — не потерять депозит.* Заработок вторичен.
 
 📊 *Фильтры и анализ:*
 
-• 🐋 *Open Interest (OI) СТРОГО ОТ $1 млн:* До входа проверяй OI на конкретной бирже. Если там меньше *$1,000,000* — разворачивайся. Зайдя на свои *$15,000* в такой актив, ты сам проломишь пустой стакан (как было с FLOW на Toobit), оторвешь цену фьючерса от спота и алгоритм мгновенно влепит тебе штрафной отрицательный фандинг. Твой ордер не должен превышать *1–1.5%* от всего OI.
+• 🐋 *Open Interest (OI):* В боте монеты с OI ниже *$500,000* скрываются автоматически. От *$500,000* до *$1,000,000* — только ⚠️ ручная осторожность. Для входа приоритет — *$1,000,000+* на конкретной бирже. Зайдя на свои *$15,000* в слабый OI, ты сам проломишь пустой стакан (как было с FLOW на Toobit), оторвешь цену фьючерса от спота и алгоритм может влепить штрафной отрицательный фандинг. Твой ордер не должен превышать *1–1.5%* от всего OI.
 • *Прибыльность:* Фандинг стабильно *0.03% – 0.08%* (если меньше — невыгодно).
 • *Спред входа:* Строго *до -0.5%*.
 • *Ликвидность:* Смотреть суточный объем и сумму первых 5 ордеров в стакане.
@@ -48,12 +48,13 @@ async def send_entry_instructions(context, chat_id):
 
 
 def get_scan_symbols_for_exchange(exchange):
-    """Список монет для скана: CoinW берём у CoinW, остальные — из Phemex universe."""
+    """Список монет для скана: CoinW/KuCoin/Bitunix берём из их API, остальные — из Phemex universe."""
     if exchange == "coinw":
         r = requests.get("https://api.coinw.com/v1/perpum/instruments", timeout=8)
         r.raise_for_status()
         return sorted({x["base"].upper() for x in r.json().get("data", []) if x.get("base")})
-    return phemex_get_all_symbols()
+    symbol_fetcher = EXCHANGE_SYMBOL_FETCHERS.get(exchange)
+    return symbol_fetcher() if symbol_fetcher else phemex_get_all_symbols()
 
 
 def fetch_exchange_average(coin, exchange, start_ms, end_ms):
@@ -100,6 +101,8 @@ def find_delta_pair_for_signal(coin, signal, days, active_exchanges):
             if short_ex == long_ex:
                 continue
             short_avg = info["avg"]
+            if not is_oi_allowed(long_ex, coin) or not is_oi_allowed(short_ex, coin):
+                continue
             net = -long_avg + short_avg
             candidates.append((net, long_ex, short_ex, long_avg, short_avg, info["std"]))
     else:
@@ -109,6 +112,8 @@ def find_delta_pair_for_signal(coin, signal, days, active_exchanges):
             if long_ex == short_ex:
                 continue
             long_avg = info["avg"]
+            if not is_oi_allowed(long_ex, coin) or not is_oi_allowed(short_ex, coin):
+                continue
             net = -long_avg + short_avg
             candidates.append((net, long_ex, short_ex, long_avg, short_avg, info["std"]))
 
@@ -170,6 +175,9 @@ async def run_evening_report(context: ContextTypes.DEFAULT_TYPE, chat_id: int, m
             ordered_rates = [rate for _, rate in sorted(rows, key=lambda x: x[0])]
             metrics = analyze_rates(ordered_rates)
             if metrics and metrics["category"] == "full" and recent_trend_ok(ordered_rates, metrics["direction"]):
+                if not is_oi_allowed(ex, coin):
+                    time.sleep(0.1)
+                    continue
                 key_avg = metrics["neg_avg"] if metrics["direction"] == "LONG" else metrics["pos_avg"]
                 full_signals.append({
                     "coin": coin,

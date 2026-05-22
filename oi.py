@@ -1,8 +1,8 @@
 import time
 import requests
 
-OI_MIN_USD = 1_000_000
-OI_MAX_ORDER_SHARE = 0.015
+OI_HIDE_BELOW_USD = 500_000
+OI_OK_USD = 1_000_000
 
 COINGECKO_DERIVATIVE_IDS = {
     "phemex": "phemex_futures",
@@ -11,10 +11,8 @@ COINGECKO_DERIVATIVE_IDS = {
     "okx": "okex_swap",
     "bingx": "bingx_futures",
     "coinw": "coinw_futures",
-    "zoomex": "zoomex-futures",
     "bitunix": "bitunix_futures",
-    "bydfi": "bydfi-futures",
-    "fameex": "fameex_futures",
+    "kucoin": "kumex",
 }
 
 _oi_cache = {}
@@ -101,6 +99,16 @@ def get_open_interest_usd(exchange, coin):
     return oi_map.get(_normalize_coin(coin))
 
 
+def is_oi_allowed(exchange, coin):
+    """Hard filter: hide only confirmed OI below $500k.
+
+    Missing CoinGecko data is kept visible as a warning because the exchange API
+    data can still be valid while the OI provider is incomplete or rate-limited.
+    """
+    oi_usd = get_open_interest_usd(exchange, coin)
+    return oi_usd is None or oi_usd >= OI_HIDE_BELOW_USD
+
+
 def format_oi_status(exchange, coin, order_usd=15_000):
     oi_usd = get_open_interest_usd(exchange, coin)
     if oi_usd is None:
@@ -108,6 +116,6 @@ def format_oi_status(exchange, coin, order_usd=15_000):
     order_share = order_usd / oi_usd if oi_usd > 0 else 1
     oi_text = f"${oi_usd:,.0f}"
     share_text = f"{order_share * 100:.2f}%"
-    if oi_usd >= OI_MIN_USD and order_share <= OI_MAX_ORDER_SHARE:
+    if oi_usd >= OI_OK_USD:
         return f"✅ OI {oi_text} | $15k = {share_text}"
     return f"⚠️ OI {oi_text} | $15k = {share_text}"

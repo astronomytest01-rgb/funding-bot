@@ -37,8 +37,8 @@ from config import (
     REPORT_CHAT_ID,
     STABILITY_THRESHOLD,
 )
-from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, phemex_fetch, phemex_get_all_symbols
-from oi import format_oi_status
+from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, EXCHANGE_SYMBOL_FETCHERS, phemex_fetch, phemex_get_all_symbols
+from oi import format_oi_status, is_oi_allowed
 from reports import auto_scan_job, run_evening_report, send_entry_instructions
 
 WAIT_ANALYZE_COINS = 1
@@ -86,7 +86,7 @@ def parse_tokens(text):
     'BTC ETH phemex 14' -> (['BTC', 'ETH'], 14, 'phemex')
     """
     KNOWN_EXCHANGES = set(EXCHANGES_ENABLED.keys())
-    DISABLED_EXCHANGE_ALIASES = {"kucoin", "gate", "gateio", "gate.io", "blofin", "weex"}
+    DISABLED_EXCHANGE_ALIASES = {"gate", "gateio", "gate.io", "blofin", "weex"}
 
     parts = text.strip().split()
     days = DEFAULT_DAYS
@@ -556,7 +556,8 @@ SCAN_EXCHANGE_FETCHERS = {
     "okx":    "okx",
     "bingx":  "bingx",
     "coinw":  "coinw",
-    "zoomex": "zoomex",
+    "kucoin": "kucoin",
+    "bitunix": "bitunix",
 }
 
 
@@ -576,7 +577,8 @@ async def cmd_analyze_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("CoinW",   callback_data="an_ex_coinw")],
         [InlineKeyboardButton("OKX",     callback_data="an_ex_okx"),
          InlineKeyboardButton("BingX",   callback_data="an_ex_bingx")],
-        [InlineKeyboardButton("Zoomex",  callback_data="an_ex_zoomex")],
+        [InlineKeyboardButton("KuCoin",  callback_data="an_ex_kucoin"),
+         InlineKeyboardButton("Bitunix", callback_data="an_ex_bitunix")],
         [InlineKeyboardButton("Отмена",  callback_data="an_cancel")],
     ])
     await update.message.reply_text(
@@ -820,7 +822,8 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
             r = requests.get("https://api.coinw.com/v1/perpum/instruments", timeout=8)
             all_coins = [x["base"].upper() for x in r.json().get("data", [])]
         else:
-            all_coins = phemex_get_all_symbols()
+            symbol_fetcher = EXCHANGE_SYMBOL_FETCHERS.get(exchange)
+            all_coins = symbol_fetcher() if symbol_fetcher else phemex_get_all_symbols()
     except Exception as e:
         await msg.reply_text(f"❌ Ошибка получения списка монет: {e}")
         return
@@ -882,6 +885,9 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
                 if not recent_trend_ok(ordered_rates, direction):
                     time.sleep(0.15)
                     continue
+                if not is_oi_allowed(exchange, coin):
+                    time.sleep(0.15)
+                    continue
                 key_avg   = r["neg_avg"] if direction == "LONG" else r["pos_avg"]
                 outlier   = r["outlier_pct"]
                 category  = r["category"]
@@ -925,6 +931,9 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
                     continue
                 ordered_rates = [rate for _, rate in sorted(rows, key=lambda x: x[0])]
                 if not recent_trend_ok(ordered_rates, direction):
+                    time.sleep(0.15)
+                    continue
+                if not is_oi_allowed(exchange, coin):
                     time.sleep(0.15)
                     continue
 
