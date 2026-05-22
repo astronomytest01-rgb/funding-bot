@@ -18,7 +18,7 @@ def phemex_fetch(coin, start_ms, end_ms):
         try:
             url = "https://api.phemex.com/api-data/public/data/funding-rate-history"
             params = {"symbol": sym, "start": start_ms, "end": end_ms, "limit": 1000}
-            r = requests.get(url, params=params, timeout=10)
+            r = requests.get(url, params=params, timeout=6)
             r.raise_for_status()
             data = r.json()
             if data.get("code") != 0:
@@ -68,7 +68,7 @@ def xt_fetch(coin, start_ms, end_ms):
     try:
         url = "https://fapi.xt.com/future/market/v1/public/q/funding-rate-record"
         params = {"symbol": sym, "limit": 500, "direction": "NEXT"}
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(url, params=params, timeout=6)
         r.raise_for_status()
         data = r.json()
 
@@ -135,7 +135,7 @@ def toobit_fetch(coin, start_ms, end_ms):
     try:
         url = "https://api.toobit.com/api/v1/futures/historyFundingRate"
         params = {"symbol": sym, "limit": 1000}
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(url, params=params, timeout=6)
         r.raise_for_status()
         data = r.json()
 
@@ -194,7 +194,7 @@ def okx_fetch(coin, start_ms, end_ms):
         url = "https://www.okx.com/api/v5/public/funding-rate-history"
         # OKX возвращает макс 100 записей, фильтруем по времени на нашей стороне
         params = {"instId": sym, "limit": 100}
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(url, params=params, timeout=6)
 
         # 451 = геоблокировка
         if r.status_code == 451:
@@ -256,7 +256,7 @@ def bingx_fetch(coin, start_ms, end_ms):
     try:
         url = "https://open-api.bingx.com/openApi/swap/v2/quote/fundingRate"
         params = {"symbol": sym, "limit": 1000}
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(url, params=params, timeout=6)
 
         if r.status_code == 451:
             return [], "BingX заблокирован в вашем регионе (ошибка 451)"
@@ -309,7 +309,7 @@ def zoomex_fetch(coin, start_ms, end_ms):
             params = {"category": "linear", "symbol": sym, "limit": 200}
             if cursor:
                 params["cursor"] = cursor
-            r = requests.get(url, params=params, timeout=10)
+            r = requests.get(url, params=params, timeout=6)
             if r.status_code != 200 or not r.text.strip():
                 return [], f"HTTP {r.status_code}"
             data = r.json()
@@ -366,7 +366,7 @@ def coinw_fetch(coin, start_ms, end_ms):
             "limit":        "1000",
             "select":       "rate_pct,collected_at,funding_time",
         }
-        r = requests.get(url, headers=headers, params=params, timeout=10)
+        r = requests.get(url, headers=headers, params=params, timeout=4)
         r.raise_for_status()
         rows = r.json()
 
@@ -403,7 +403,7 @@ def phemex_get_all_symbols():
     Возвращает список строк-монет: ['BTC', 'ETH', 'ENJ', ...]
     """
     url = "https://api.phemex.com/exchange/public/cfg/v2/products"
-    r = requests.get(url, timeout=15)
+    r = requests.get(url, timeout=10)
     r.raise_for_status()
     data = r.json()
     products = data.get("data", {}).get("products", [])

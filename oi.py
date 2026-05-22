@@ -65,7 +65,11 @@ def get_exchange_oi_map(exchange):
         return _oi_cache[exchange]
     url = f"https://api.coingecko.com/api/v3/derivatives/exchanges/{cg_id}"
     try:
-        r = requests.get(url, params={"include_tickers": "all"}, timeout=12)
+        r = requests.get(url, params={"include_tickers": "all"}, timeout=3)
+        if r.status_code == 429:
+            _oi_cache[exchange] = {}
+            _oi_cache_ts[exchange] = now
+            return {}
         r.raise_for_status()
         data = r.json()
     except Exception:
@@ -105,5 +109,5 @@ def format_oi_status(exchange, coin, order_usd=15_000):
     oi_text = f"${oi_usd:,.0f}"
     share_text = f"{order_share * 100:.2f}%"
     if oi_usd >= OI_MIN_USD and order_share <= OI_MAX_ORDER_SHARE:
-        return f"✅ OI `{oi_text}` | ордер $15k = `{share_text}`"
-    return f"⚠️ OI `{oi_text}` | ордер $15k = `{share_text}`"
+        return f"✅ OI {oi_text} | $15k = {share_text}"
+    return f"⚠️ OI {oi_text} | $15k = {share_text}"

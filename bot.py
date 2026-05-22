@@ -817,7 +817,7 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
     # Получаем список монет
     try:
         if exchange == "coinw":
-            r = requests.get("https://api.coinw.com/v1/perpum/instruments", timeout=15)
+            r = requests.get("https://api.coinw.com/v1/perpum/instruments", timeout=8)
             all_coins = [x["base"].upper() for x in r.json().get("data", [])]
         else:
             all_coins = phemex_get_all_symbols()
@@ -853,6 +853,7 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        await msg.reply_text(f"🔎 Порция {batch_idx+1}/{len(batches)}: обрабатываю {len(batch)} монет...")
         batch_results = []
         for coin in batch:
             if not _scan_running.get(chat_id):
