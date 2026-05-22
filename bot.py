@@ -38,7 +38,7 @@ from config import (
     STABILITY_THRESHOLD,
 )
 from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, phemex_fetch, phemex_get_all_symbols
-from reports import auto_scan_job
+from reports import auto_scan_job, run_evening_report
 
 WAIT_ANALYZE_COINS = 1
 WAIT_SHOW_COIN = 3
@@ -104,7 +104,7 @@ def parse_tokens(text):
         if p in ("/exchange", "--exchange") and i + 1 < len(parts):
             exchange = parts[i + 1].lower(); i += 2; continue
         # пропускаем команды вида /filter если вдруг попали в текст
-        if p in ("/filter", "/funding", "/calculator", "/start", "/help", "/settings", "/cancel"):
+        if p in ("/filter", "/funding", "/calculator", "/start", "/help", "/settings", "/report", "/cancel"):
             i += 1; continue
         # Распознаём название активной биржи без префикса.
         if p in KNOWN_EXCHANGES:
@@ -489,6 +489,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/analyze — скан рынка + Gemini-фильтр найденных монет\n"
         "/ai — фундаментальный AI-анализ монеты без анализа фандинга\n"
         "/findpair — дельта-нейтраль: найти пару лонг+шорт\n"
+        "/report — запустить вечерний отчёт вручную\n"
         "/settings — настройки и управление биржами\n"
         "/help — справка\n\n"
         "💡 *Быстрый ввод:*\n"
@@ -498,6 +499,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/ai SOL ENJ`"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🕗 Запускаю вечерний отчёт вручную. Это может занять несколько минут.")
+    await run_evening_report(context, update.effective_chat.id, manual=True)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1691,6 +1697,7 @@ def main():
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("help",      cmd_help))
     app.add_handler(CommandHandler("settings",  cmd_settings_new))
+    app.add_handler(CommandHandler("report",    cmd_report))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern="^set_"))
     # /analyze ConversationHandler
     analyze_conv = ConversationHandler(

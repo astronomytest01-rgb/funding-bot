@@ -3,10 +3,47 @@ import time
 import requests
 from telegram.ext import ContextTypes
 
-from ai import extract_gemini_approved_coins, gemini_analyze_bulk
+from ai import gemini_analyze_bulk
 from analysis import analyze_rates, calc_std, get_active_exchanges, recent_trend_ok
 from config import AUTO_SCAN_AMOUNT, AUTO_SCAN_DAYS, GEMINI_API_KEY, REPORT_CHAT_ID
 from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, phemex_get_all_symbols
+
+ENTRY_INSTRUCTIONS = """🛡️ *Главная задача — не потерять депозит.* Заработок вторичен.
+
+📊 *Фильтры и анализ:*
+
+• *Прибыльность:* Фандинг стабильно *0.03% – 0.08%* (если меньше — невыгодно).
+• *Спред входа:* Строго *до -0.5%*.
+• *Ликвидность:* Смотреть OI, суточный объем и сумму первых 5 ордеров в стакане.
+• *arcways.io:* Проверить slippage под свой объем и как долго держится фандинг.
+• Обязательно проверять *Predicted Rate* (прогноз следующей ставки).
+
+⏳ *Набор позиции (TWAP):*
+
+• Никаких входов всем объемом. Дробить по *$500–$1000* раз в час.
+
+🪤 *Защита от ловушек алгоритмов:*
+
+• Залил 50% объема → проверил ставку с ПК и телефона (обновил пару раз) → переждал 1-2 часа → долил остаток.
+• *Избегай ловушек пустого стакана:* Это касается как неликвидных альткоинов (FLOW на Toobit), так и токенизированных акций (GOOGL на KuCoin вне торговой сессии). Если бросить рыночный ордер в пустой стакан, цена фьючерса (Mark Price) резко оторвется от спотового индекса (Index Price). Чтобы вернуть баланс, алгоритм биржи алгоритмически выкрутит тебе огромный штрафной фандинг (например, -0.3%).
+• Часто пустоту стакана можно понять только *после* того, как зашел и сломал ставку об себя же. Поэтому до входа жестко проверяй *Open Interest (OI)* — если открытых позиций в монете мало, твой объем 100% размажет по стакану и спровоцирует штраф биржи.
+
+🕸️ *Защитная сетка (SL/TP):*
+
+• Ставить 4–10 ордеров в диапазоне *60% – 72% изменения позиции* (на Binance максимум 4).
+• Указывать триггеры по *% изменения позиции* (как на Phemex) или *% цены монеты*, а не по фиксированным ценам.
+
+🤝 *Верификация:*
+
+• Выбор плеча и монеты предварительно обсуждать с Gemini.
+
+⚠️ *Акции (Осторожно!):* На выходных не торгуются. При открытии рынка в понедельник цена может резко прыгнуть на *20-40%* из-за новостей — это риск мгновенной ликвидации."""
+
+
+async def send_entry_instructions(context, chat_id):
+    for chunk in [ENTRY_INSTRUCTIONS[i:i+4000] for i in range(0, len(ENTRY_INSTRUCTIONS), 4000)]:
+        await context.bot.send_message(chat_id, chunk, parse_mode="Markdown")
+
 
 def get_scan_symbols_for_exchange(exchange):
     """Список монет для скана: CoinW берём у CoinW, остальные — из Phemex universe."""
@@ -88,11 +125,8 @@ def find_delta_pair_for_signal(coin, signal, days, active_exchanges):
     }
 
 
-async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
-    """Ежедневный отчёт: full-фильтр → Gemini → лучшая delta-neutral пара."""
-    if not REPORT_CHAT_ID:
-        return
-    chat_id = int(REPORT_CHAT_ID)
+async def run_evening_report(context: ContextTypes.DEFAULT_TYPE, chat_id: int, manual=False):
+    """Вечерний отчёт: full-фильтр → Gemini-рекомендация → лучшая delta-neutral пара."""
     active = get_active_exchanges()
     if not active:
         await context.bot.send_message(chat_id, "❌ Вечерний отчёт: нет активных бирж.")
@@ -100,8 +134,8 @@ async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_message(
         chat_id,
-        "🕗 *Вечерний авто-скан запущен*\n"
-        "Ищу только FULL-подходящие монеты, затем фильтрую через Gemini и подбираю пару.",
+        ("🕗 *Вечерний авто-скан запущен*\n" if not manual else "🕗 *Вечерний отчёт запущен вручную*\n")
+        + "Ищу FULL-подходящие монеты, подбираю пару, а Gemini показываю как рекомендацию.",
         parse_mode="Markdown",
     )
 
@@ -149,6 +183,7 @@ async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
 
     if not full_signals:
         await context.bot.send_message(chat_id, "✅ Вечерний авто-скан завершён: FULL-подходящих монет нет.")
+        await send_entry_instructions(context, chat_id)
         return
 
     best_signal_by_coin = {}
@@ -158,10 +193,10 @@ async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
         if not prev or abs(signal["key_avg"]) > abs(prev["key_avg"]):
             best_signal_by_coin[coin] = signal
 
-    approved = list(best_signal_by_coin.keys())
+    report_coins = list(best_signal_by_coin.keys())
+    gemini_chunks = []
     if GEMINI_API_KEY:
-        await context.bot.send_message(chat_id, f"🤖 Gemini фильтрует {len(approved)} монет...")
-        chunks = []
+        await context.bot.send_message(chat_id, f"🤖 Gemini готовит рекомендацию по {len(report_coins)} монетам, но не удаляет их из отчёта...")
         signals = list(best_signal_by_coin.values())
         for i in range(0, len(signals), 15):
             part = signals[i:i+15]
@@ -172,43 +207,57 @@ async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
                     f"- {s['coin']} ({direction}, {EXCHANGE_LABELS.get(s['exchange'], s['exchange'])}, avg {s['avg']:+.4f}%)"
                 )
             answer = gemini_analyze_bulk("\n".join(text_rows), AUTO_SCAN_DAYS)
-            if answer and "Подходящих фундаментальных монет нет" not in answer:
-                chunks.append(answer)
+            if answer:
+                gemini_chunks.append(answer)
             time.sleep(3)
-        ai_text = "\n".join(chunks)
-        approved = extract_gemini_approved_coins(ai_text, approved)
-        if not approved:
-            await context.bot.send_message(chat_id, "🤖 Gemini забраковал все FULL-монеты.")
-            return
     else:
-        await context.bot.send_message(chat_id, "⚠️ GEMINI_API_KEY не задан: пропускаю AI-фильтр.")
+        await context.bot.send_message(chat_id, "⚠️ GEMINI_API_KEY не задан: блок рекомендации Gemini пропущен.")
 
     pairs = []
-    for coin in approved:
+    for coin in report_coins:
         pair = find_delta_pair_for_signal(coin, best_signal_by_coin[coin], AUTO_SCAN_DAYS, active)
         if pair:
             pairs.append(pair)
 
     if not pairs:
-        await context.bot.send_message(chat_id, "⚠️ После AI-фильтра не нашёл дельта-нейтральных пар.")
+        await context.bot.send_message(chat_id, "⚠️ Не нашёл дельта-нейтральных пар по FULL-монетам.")
+        if gemini_chunks:
+            gemini_report = "🤖 *Gemini-рекомендация* — не фильтр, а ручная проверка:\n\n" + "\n".join(gemini_chunks)
+            for chunk in [gemini_report[i:i+4000] for i in range(0, len(gemini_report), 4000)]:
+                await context.bot.send_message(chat_id, chunk, parse_mode="Markdown")
+        await send_entry_instructions(context, chat_id)
         return
 
     lines = [
-        f"🤖 *ВЕЧЕРНИЙ ОТЧЁТ* — {AUTO_SCAN_DAYS} дня, сумма ${AUTO_SCAN_AMOUNT:,.0f}\n"
+        f"🤖 *ВЕЧЕРНИЙ ОТЧЁТ* — база {AUTO_SCAN_DAYS} дня, сумма ${AUTO_SCAN_AMOUNT:,.0f}\n"
     ]
     for p in sorted(pairs, key=lambda x: x["net_rate"], reverse=True)[:20]:
         long_label = EXCHANGE_LABELS.get(p["long_ex"], p["long_ex"])
         short_label = EXCHANGE_LABELS.get(p["short_ex"], p["short_ex"])
-        approx_income = AUTO_SCAN_AMOUNT * (p["net_rate"] / 100) * AUTO_SCAN_DAYS * 3
+        approx_income = AUTO_SCAN_AMOUNT * (p["net_rate"] / 100) * 3
         lines.append(
             f"*{p['coin']}*\n"
             f"  🟢 Лонг: `{long_label}` avg `{p['long_avg']:+.4f}%`\n"
             f"  🔴 Шорт: `{short_label}` avg `{p['short_avg']:+.4f}%`\n"
             f"  📈 Чистый фандинг: `{p['net_rate']:+.4f}%` / ставку\n"
-            f"  💰 Оценка: `${approx_income:.2f}` за {AUTO_SCAN_DAYS}д\n"
+            f"  💰 Оценка: `${approx_income:.2f}` за 1 день\n"
         )
 
     report = "\n".join(lines)
     for chunk in [report[i:i+4000] for i in range(0, len(report), 4000)]:
         await context.bot.send_message(chat_id, chunk, parse_mode="Markdown")
+
+
+    if gemini_chunks:
+        gemini_report = "🤖 *Gemini-рекомендация* — не фильтр, а ручная проверка:\n\n" + "\n".join(gemini_chunks)
+        for chunk in [gemini_report[i:i+4000] for i in range(0, len(gemini_report), 4000)]:
+            await context.bot.send_message(chat_id, chunk, parse_mode="Markdown")
+
+    await send_entry_instructions(context, chat_id)
+
+
+async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
+    if not REPORT_CHAT_ID:
+        return
+    await run_evening_report(context, int(REPORT_CHAT_ID))
 
