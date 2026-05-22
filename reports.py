@@ -7,6 +7,7 @@ from ai import gemini_analyze_bulk
 from analysis import analyze_rates, calc_std, get_active_exchanges, recent_trend_ok
 from config import AUTO_SCAN_AMOUNT, AUTO_SCAN_DAYS, GEMINI_API_KEY, REPORT_CHAT_ID
 from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, phemex_get_all_symbols
+from oi import format_oi_status
 
 ENTRY_INSTRUCTIONS = """🛡️ *Главная задача — не потерять депозит.* Заработок вторичен.
 
@@ -236,10 +237,12 @@ async def run_evening_report(context: ContextTypes.DEFAULT_TYPE, chat_id: int, m
         long_label = EXCHANGE_LABELS.get(p["long_ex"], p["long_ex"])
         short_label = EXCHANGE_LABELS.get(p["short_ex"], p["short_ex"])
         approx_income = AUTO_SCAN_AMOUNT * (p["net_rate"] / 100) * 3
+        long_oi = format_oi_status(p["long_ex"], p["coin"])
+        short_oi = format_oi_status(p["short_ex"], p["coin"])
         lines.append(
             f"*{p['coin']}*\n"
-            f"  🟢 Лонг: `{long_label}` avg `{p['long_avg']:+.4f}%`\n"
-            f"  🔴 Шорт: `{short_label}` avg `{p['short_avg']:+.4f}%`\n"
+            f"  🟢 Лонг: `{long_label}` avg `{p['long_avg']:+.4f}%` | {long_oi}\n"
+            f"  🔴 Шорт: `{short_label}` avg `{p['short_avg']:+.4f}%` | {short_oi}\n"
             f"  📈 Чистый фандинг: `{p['net_rate']:+.4f}%` / ставку\n"
             f"  💰 Оценка: `${approx_income:.2f}` за 1 день\n"
         )

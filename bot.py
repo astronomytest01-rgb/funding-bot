@@ -38,6 +38,7 @@ from config import (
     STABILITY_THRESHOLD,
 )
 from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, phemex_fetch, phemex_get_all_symbols
+from oi import format_oi_status
 from reports import auto_scan_job, run_evening_report, send_entry_instructions
 
 WAIT_ANALYZE_COINS = 1
@@ -939,10 +940,12 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
             for coin, avg, op, direction, cat, income in batch_results:
                 dir_icon = "🟢" if direction == "LONG" else "🔴"
                 if cat == "income":
-                    lines.append(f"💰 {dir_icon} `{coin}` avg `{avg:+.4f}%` ~${income:.1f}/день")
+                    oi_status = format_oi_status(exchange, coin)
+                    lines.append(f"💰 {dir_icon} `{coin}` avg `{avg:+.4f}%` ~${income:.1f}/день | {oi_status}")
                 else:
                     cat_icon = "✅" if cat == "full" else "⚡"
-                    lines.append(f"{cat_icon} {dir_icon} `{coin}` avg `{avg:+.4f}%` выбр `{op:.0f}%`")
+                    oi_status = format_oi_status(exchange, coin)
+                    lines.append(f"{cat_icon} {dir_icon} `{coin}` avg `{avg:+.4f}%` выбр `{op:.0f}%` | {oi_status}")
             await msg.reply_text("\n".join(lines), parse_mode="Markdown")
         else:
             await msg.reply_text(
@@ -965,7 +968,8 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"💰 *Средний доход* ≥${threshold:.0f}/день ({len(passed_sorted)}):")
         for coin, avg, op, direction, cat, income in passed_sorted:
             dir_icon = "🟢" if direction == "LONG" else "🔴"
-            lines.append(f"  {dir_icon} `{coin}` avg `{avg:+.4f}%` ~${income:.1f}/день выбр `{op:.0f}%`")
+            oi_status = format_oi_status(exchange, coin)
+            lines.append(f"  {dir_icon} `{coin}` avg `{avg:+.4f}%` ~${income:.1f}/день выбр `{op:.0f}%` | {oi_status}")
     else:
         full_longs  = [(c,a,o) for c,a,o,d,cat,_ in passed if d=="LONG"  and cat=="full"]
         full_shorts = [(c,a,o) for c,a,o,d,cat,_ in passed if d=="SHORT" and cat=="full"]
@@ -974,19 +978,19 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
         if full_longs:
             lines.append(f"\n✅ 🟢 *ЛОНГ — ПОДХОДЯТ* ({len(full_longs)}):")
             for c,a,o in sorted(full_longs, key=lambda x: x[1]):
-                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%`")
+                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%` | {format_oi_status(exchange, c)}")
         if full_shorts:
             lines.append(f"\n✅ 🔴 *ШОРТ — ПОДХОДЯТ* ({len(full_shorts)}):")
             for c,a,o in sorted(full_shorts, key=lambda x: -x[1]):
-                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%`")
+                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%` | {format_oi_status(exchange, c)}")
         if part_longs:
             lines.append(f"\n⚡ 🟢 *ЛОНГ — ЧАСТИЧНО* ({len(part_longs)}):")
             for c,a,o in sorted(part_longs, key=lambda x: x[1]):
-                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%`")
+                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%` | {format_oi_status(exchange, c)}")
         if part_shorts:
             lines.append(f"\n⚡ 🔴 *ШОРТ — ЧАСТИЧНО* ({len(part_shorts)}):")
             for c,a,o in sorted(part_shorts, key=lambda x: -x[1]):
-                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%`")
+                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%` | {format_oi_status(exchange, c)}")
 
     reply = "\n".join(lines)
     if len(reply) > 4000:
