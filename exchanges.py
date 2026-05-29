@@ -164,6 +164,32 @@ def toobit_fetch(coin, start_ms, end_ms):
     return [], last_err
 
 
+def toobit_get_all_symbols():
+    """Получает все активные USDT-M futures контракты Toobit из /api/v1/exchangeInfo.
+
+    Возвращает базовые тикеры в формате, который понимает toobit_fetch:
+    BTC-SWAP-USDT -> BTC, GER40-SWAP-USDT -> GER40.
+    """
+    url = "https://api.toobit.com/api/v1/exchangeInfo"
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    contracts = data.get("contracts", [])
+    coins = []
+    seen = set()
+    for item in contracts:
+        if item.get("status") != "TRADING" or item.get("quoteAsset") != "USDT":
+            continue
+        symbol = str(item.get("symbol") or "").upper()
+        if not symbol.endswith("-SWAP-USDT"):
+            continue
+        coin = symbol[:-len("-SWAP-USDT")]
+        if coin and coin not in seen:
+            coins.append(coin)
+            seen.add(coin)
+    return coins
+
+
 
 # ─────────────────────────────────────────────
 # OKX API
@@ -513,6 +539,7 @@ EXCHANGE_FETCHERS = {
 
 EXCHANGE_SYMBOL_FETCHERS = {
     "phemex": phemex_get_all_symbols,
+    "toobit": toobit_get_all_symbols,
     "coinw": None,
     "kucoin": kucoin_get_all_symbols,
     "bitunix": bitunix_get_all_symbols,

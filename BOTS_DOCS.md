@@ -90,6 +90,8 @@ AUTO_SCAN_DAYS = 3
 phemex, xt, toobit, okx, bingx, coinw, kucoin, bitunix
 ```
 
+Toobit `/analyze` uses native `/api/v1/exchangeInfo` futures `contracts`, not the Phemex fallback list. This includes Toobit-only TradFi/commodity contracts such as `GER40` and `NG`.
+
 ## Фильтры анализа
 
 Основной фильтр `analyze_rates`:
@@ -254,7 +256,7 @@ help - Справка
 |------|----------|----------|
 | `phemex` | Phemex | public funding-rate-history |
 | `xt` | XT | public funding-rate-record |
-| `toobit` | Toobit | public historyFundingRate |
+| `toobit` | Toobit | public historyFundingRate + native `/api/v1/exchangeInfo` futures list |
 | `okx` | OKX | public funding-rate-history |
 | `bingx` | BingX | public fundingRate |
 | `coinw` | CoinW | Supabase collector, table `funding_rates` |
@@ -266,7 +268,7 @@ help - Справка
 ```text
 bot.py       - Telegram handlers, диалоги, кнопки, тексты команд
 config.py    - env vars, фильтры, активные биржи, авто-отчёт
-exchanges.py - API fetchers бирж и phemex_get_all_symbols
+exchanges.py - API fetchers бирж и per-exchange symbol fetchers
 analysis.py  - analyze_rates, recent trend filter, delta-neutral logic
 ai.py        - Gemini prompts и API helpers
 reports.py   - evening auto_scan_job

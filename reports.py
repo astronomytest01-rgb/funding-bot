@@ -48,7 +48,7 @@ async def send_entry_instructions(context, chat_id):
 
 
 def get_scan_symbols_for_exchange(exchange):
-    """Список монет для скана: CoinW/KuCoin/Bitunix берём из их API, остальные — из Phemex universe."""
+    """Список монет для скана: CoinW/Toobit/KuCoin/Bitunix берём из их API, остальные — из Phemex universe."""
     if exchange == "coinw":
         r = requests.get("https://api.coinw.com/v1/perpum/instruments", timeout=8)
         r.raise_for_status()
