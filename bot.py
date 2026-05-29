@@ -5,6 +5,7 @@ Main Telegram handlers live here. Exchange fetchers, filter logic, Gemini AI,
 and evening report jobs are split into modules to keep future AI edits safer.
 """
 
+import asyncio
 import time
 import requests
 from datetime import datetime, time as dt_time, timezone
@@ -936,11 +937,13 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
     # Получаем список монет
     try:
         if exchange == "coinw":
-            r = requests.get("https://api.coinw.com/v1/perpum/instruments", timeout=8)
-            all_coins = [x["base"].upper() for x in r.json().get("data", [])]
+            def load_coinw_symbols():
+                r = requests.get("https://api.coinw.com/v1/perpum/instruments", timeout=8)
+                return [x["base"].upper() for x in r.json().get("data", [])]
+            all_coins = await asyncio.to_thread(load_coinw_symbols)
         else:
             symbol_fetcher = EXCHANGE_SYMBOL_FETCHERS.get(exchange)
-            all_coins = symbol_fetcher() if symbol_fetcher else phemex_get_all_symbols()
+            all_coins = await asyncio.to_thread(symbol_fetcher if symbol_fetcher else phemex_get_all_symbols)
     except Exception as e:
         await msg.reply_text(f"❌ Ошибка получения списка монет: {e}")
         return
@@ -979,31 +982,31 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
             if not _scan_running.get(chat_id):
                 break
             try:
-                rows, sym = fetcher(coin, start_ms, now_ms)
+                rows, sym = await asyncio.to_thread(fetcher, coin, start_ms, now_ms)
             except Exception:
                 rows = []
             if not rows:
-                time.sleep(0.15)
+                await asyncio.sleep(0.05)
                 continue
 
             rates = [r for _, r in rows]
             if not rates:
-                time.sleep(0.15)
+                await asyncio.sleep(0.05)
                 continue
 
             if method == "rate":
                 # ── Стандартный метод ─────────────────────────────────────
                 r = analyze_rates(rates)
                 if not r or r["category"] == "fail":
-                    time.sleep(0.15)
+                    await asyncio.sleep(0.05)
                     continue
                 direction = r["direction"]
                 ordered_rates = [rate for _, rate in sorted(rows, key=lambda x: x[0])]
                 if not recent_trend_ok(ordered_rates, direction):
-                    time.sleep(0.15)
+                    await asyncio.sleep(0.05)
                     continue
-                if not is_oi_allowed(exchange, coin):
-                    time.sleep(0.15)
+                if not await asyncio.to_thread(is_oi_allowed, exchange, coin):
+                    await asyncio.sleep(0.05)
                     continue
                 key_avg   = r["neg_avg"] if direction == "LONG" else r["pos_avg"]
                 outlier   = r["outlier_pct"]
@@ -1016,7 +1019,7 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
                 # Фильтр аномалий > ±0.8%
                 clean = [r for r in rates if abs(r) <= AN_ANOMALY_THRESHOLD]
                 if not clean:
-                    time.sleep(0.15)
+                    await asyncio.sleep(0.05)
                     continue
 
                 neg       = [r for r in clean if r < 0]
@@ -1036,7 +1039,7 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
                     above = sum(1 for r in clean if r >= -STABILITY_THRESHOLD)
                     outlier = (len(clean) - above) / len(clean) * 100
                 else:
-                    time.sleep(0.15)
+                    await asyncio.sleep(0.05)
                     continue
 
                 # payments_per_day = кол-во выплат за период / кол-во дней
@@ -1044,20 +1047,20 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
                 daily_income     = amount * abs(key_avg) / 100 * payments_per_day
 
                 if daily_income < threshold:
-                    time.sleep(0.15)
+                    await asyncio.sleep(0.05)
                     continue
                 ordered_rates = [rate for _, rate in sorted(rows, key=lambda x: x[0])]
                 if not recent_trend_ok(ordered_rates, direction):
-                    time.sleep(0.15)
+                    await asyncio.sleep(0.05)
                     continue
-                if not is_oi_allowed(exchange, coin):
-                    time.sleep(0.15)
+                if not await asyncio.to_thread(is_oi_allowed, exchange, coin):
+                    await asyncio.sleep(0.05)
                     continue
 
                 batch_results.append((coin, key_avg, outlier, direction, "income", daily_income))
                 passed.append((coin, key_avg, outlier, direction, "income", daily_income))
 
-            time.sleep(0.15)
+            await asyncio.sleep(0.05)
 
         scanned   = min((batch_idx + 1) * SCAN_BATCH, total)
         remaining = total - scanned
@@ -1067,11 +1070,11 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
             for coin, avg, op, direction, cat, income in batch_results:
                 dir_icon = "🟢" if direction == "LONG" else "🔴"
                 if cat == "income":
-                    oi_status = format_oi_status(exchange, coin)
+                    oi_status = await asyncio.to_thread(format_oi_status, exchange, coin)
                     lines.append(f"💰 {dir_icon} `{coin}` avg `{avg:+.4f}%` ~${income:.1f}/день | {oi_status}")
                 else:
                     cat_icon = "✅" if cat == "full" else "⚡"
-                    oi_status = format_oi_status(exchange, coin)
+                    oi_status = await asyncio.to_thread(format_oi_status, exchange, coin)
                     lines.append(f"{cat_icon} {dir_icon} `{coin}` avg `{avg:+.4f}%` выбр `{op:.0f}%` | {oi_status}")
             await msg.reply_text("\n".join(lines), parse_mode="Markdown")
         else:
@@ -1095,7 +1098,7 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"💰 *Средний доход* ≥${threshold:.0f}/день ({len(passed_sorted)}):")
         for coin, avg, op, direction, cat, income in passed_sorted:
             dir_icon = "🟢" if direction == "LONG" else "🔴"
-            oi_status = format_oi_status(exchange, coin)
+            oi_status = await asyncio.to_thread(format_oi_status, exchange, coin)
             lines.append(f"  {dir_icon} `{coin}` avg `{avg:+.4f}%` ~${income:.1f}/день выбр `{op:.0f}%` | {oi_status}")
     else:
         full_longs  = [(c,a,o) for c,a,o,d,cat,_ in passed if d=="LONG"  and cat=="full"]
@@ -1105,19 +1108,23 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
         if full_longs:
             lines.append(f"\n✅ 🟢 *ЛОНГ — ПОДХОДЯТ* ({len(full_longs)}):")
             for c,a,o in sorted(full_longs, key=lambda x: x[1]):
-                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%` | {format_oi_status(exchange, c)}")
+                oi_status = await asyncio.to_thread(format_oi_status, exchange, c)
+                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%` | {oi_status}")
         if full_shorts:
             lines.append(f"\n✅ 🔴 *ШОРТ — ПОДХОДЯТ* ({len(full_shorts)}):")
             for c,a,o in sorted(full_shorts, key=lambda x: -x[1]):
-                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%` | {format_oi_status(exchange, c)}")
+                oi_status = await asyncio.to_thread(format_oi_status, exchange, c)
+                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%` | {oi_status}")
         if part_longs:
             lines.append(f"\n⚡ 🟢 *ЛОНГ — ЧАСТИЧНО* ({len(part_longs)}):")
             for c,a,o in sorted(part_longs, key=lambda x: x[1]):
-                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%` | {format_oi_status(exchange, c)}")
+                oi_status = await asyncio.to_thread(format_oi_status, exchange, c)
+                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%` | {oi_status}")
         if part_shorts:
             lines.append(f"\n⚡ 🔴 *ШОРТ — ЧАСТИЧНО* ({len(part_shorts)}):")
             for c,a,o in sorted(part_shorts, key=lambda x: -x[1]):
-                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%` | {format_oi_status(exchange, c)}")
+                oi_status = await asyncio.to_thread(format_oi_status, exchange, c)
+                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%` | {oi_status}")
 
     reply = "\n".join(lines)
     if len(reply) > 4000:
