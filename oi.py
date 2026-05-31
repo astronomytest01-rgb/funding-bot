@@ -63,17 +63,15 @@ def get_exchange_oi_map(exchange):
         return _oi_cache[exchange]
     url = f"https://api.coingecko.com/api/v3/derivatives/exchanges/{cg_id}"
     try:
-        r = requests.get(url, params={"include_tickers": "all"}, timeout=3)
+        r = requests.get(url, params={"include_tickers": "all"}, timeout=8)
         if r.status_code == 429:
-            _oi_cache[exchange] = {}
-            _oi_cache_ts[exchange] = now
-            return {}
+            # Do not poison the cache with an empty map on rate limits.
+            return _oi_cache.get(exchange, {})
         r.raise_for_status()
         data = r.json()
     except Exception:
-        _oi_cache[exchange] = {}
-        _oi_cache_ts[exchange] = now
-        return {}
+        # Keep the last good OI snapshot if CoinGecko has a transient failure.
+        return _oi_cache.get(exchange, {})
     tickers = data.get("tickers") or []
     result = {}
     for ticker in tickers:
