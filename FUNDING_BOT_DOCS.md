@@ -107,6 +107,8 @@ Phemex, XT, Toobit, OKX, BingX, CoinW, KuCoin, Bitunix
 
 Toobit scan uses native `/api/v1/exchangeInfo` `contracts`, so TradFi futures such as `GER40` and commodities such as `NG` are included even when they are absent from the Phemex universe.
 
+XT, Toobit and KuCoin scans use native exchange symbol lists instead of the Phemex fallback universe.
+
 CoinW берётся из Supabase таблицы `funding_rates`:
 
 ```text

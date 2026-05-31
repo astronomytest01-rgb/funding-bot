@@ -105,6 +105,34 @@ def xt_fetch(coin, start_ms, end_ms):
     return [], last_err
 
 
+def xt_get_all_symbols():
+    """Получает все активные USDT-M perpetual контракты XT из native symbol list.
+
+    Возвращает базовые тикеры в формате, который понимает xt_fetch:
+    btc_usdt -> BTC, 1000pepe_usdt -> 1000PEPE.
+    """
+    url = "https://fapi.xt.com/future/market/v1/public/symbol/list"
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("returnCode") != 0:
+        err = data.get("error", {})
+        msg = err.get("msg") if isinstance(err, dict) else str(err)
+        raise ValueError(msg or data.get("msgInfo") or "XT API error")
+    coins = []
+    seen = set()
+    for item in data.get("result", []):
+        if item.get("productType") != "perpetual" or item.get("quoteCoin") != "usdt":
+            continue
+        if not item.get("tradeSwitch") or not item.get("openSwitch") or not item.get("isOpenApi", True):
+            continue
+        coin = str(item.get("baseCoin") or "").upper()
+        if coin and coin not in seen:
+            coins.append(coin)
+            seen.add(coin)
+    return coins
+
+
 
 # ─────────────────────────────────────────────
 # TOOBIT API
@@ -539,6 +567,7 @@ EXCHANGE_FETCHERS = {
 
 EXCHANGE_SYMBOL_FETCHERS = {
     "phemex": phemex_get_all_symbols,
+    "xt": xt_get_all_symbols,
     "toobit": toobit_get_all_symbols,
     "coinw": None,
     "kucoin": kucoin_get_all_symbols,

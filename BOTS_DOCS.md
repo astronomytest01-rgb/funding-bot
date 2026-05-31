@@ -92,6 +92,8 @@ phemex, xt, toobit, okx, bingx, coinw, kucoin, bitunix
 
 Toobit `/analyze` uses native `/api/v1/exchangeInfo` futures `contracts`, not the Phemex fallback list. This includes Toobit-only TradFi/commodity contracts such as `GER40` and `NG`.
 
+XT, Toobit and KuCoin `/analyze` use native exchange symbol lists instead of the Phemex fallback universe.
+
 ## Фильтры анализа
 
 Основной фильтр `analyze_rates`:
@@ -256,7 +258,7 @@ help - Справка
 | Ключ | Название | Источник |
 |------|----------|----------|
 | `phemex` | Phemex | public funding-rate-history |
-| `xt` | XT | public funding-rate-record |
+| `xt` | XT | public funding-rate-record + native symbol list |
 | `toobit` | Toobit | public historyFundingRate + native `/api/v1/exchangeInfo` futures list |
 | `okx` | OKX | public funding-rate-history |
 | `bingx` | BingX | public fundingRate |
