@@ -9,6 +9,7 @@ from config import (
     RECENT_TREND_MIN_GOOD_RATIO,
     RECENT_TREND_RATES,
     STABILITY_THRESHOLD,
+    TEMPORARILY_DISABLED_EXCHANGES,
 )
 from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS
 
@@ -16,8 +17,17 @@ def get_active_exchanges(requested=None):
     """Возвращает список активных бирж из финального набора."""
     if requested and requested != "all":
         exs = [e.strip().lower() for e in requested.split(",")]
-        return [e for e in exs if e in EXCHANGES_ENABLED and e in EXCHANGE_FETCHERS]
-    return [e for e, enabled in EXCHANGES_ENABLED.items() if enabled]
+        return [
+            e for e in exs
+            if e in EXCHANGES_ENABLED
+            and e in EXCHANGE_FETCHERS
+            and EXCHANGES_ENABLED.get(e, False)
+            and e not in TEMPORARILY_DISABLED_EXCHANGES
+        ]
+    return [
+        e for e, enabled in EXCHANGES_ENABLED.items()
+        if enabled and e not in TEMPORARILY_DISABLED_EXCHANGES
+    ]
 
 
 def analyze_rates(rates_pct):
@@ -183,7 +193,10 @@ def analyze_delta(coin, days, long_exchanges=None, all_exchanges=None):
     start_ms = now_ms - days * 24 * 60 * 60 * 1000
 
     if all_exchanges is None:
-        all_exchanges = [e for e, on in EXCHANGES_ENABLED.items() if on]
+        all_exchanges = [
+            e for e, on in EXCHANGES_ENABLED.items()
+            if on and e not in TEMPORARILY_DISABLED_EXCHANGES
+        ]
     if long_exchanges is None:
         long_exchanges = all_exchanges
 

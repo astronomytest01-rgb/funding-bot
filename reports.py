@@ -5,9 +5,14 @@ from telegram.ext import ContextTypes
 
 from ai import gemini_analyze_bulk
 from analysis import analyze_rates, calc_std, get_active_exchanges, recent_trend_ok
-from config import AUTO_SCAN_AMOUNT, AUTO_SCAN_DAYS, GEMINI_API_KEY, REPORT_CHAT_ID
+from config import AUTO_SCAN_AMOUNT, AUTO_SCAN_DAYS, GEMINI_API_KEY, REPORT_CHAT_ID, TEMPORARILY_DISABLED_EXCHANGES
 from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, EXCHANGE_SYMBOL_FETCHERS, phemex_get_all_symbols
 from oi import format_oi_status, is_oi_allowed
+
+
+def temporary_disabled_text():
+    labels = [EXCHANGE_LABELS.get(e, e.upper()) for e in TEMPORARILY_DISABLED_EXCHANGES]
+    return ", ".join(sorted(labels))
 
 ENTRY_INSTRUCTIONS = """🛡️ *Главная задача — не потерять депозит.* Заработок вторичен.
 
@@ -142,7 +147,8 @@ async def run_evening_report(context: ContextTypes.DEFAULT_TYPE, chat_id: int, m
     await context.bot.send_message(
         chat_id,
         ("🕗 *Вечерний авто-скан запущен*\n" if not manual else "🕗 *Вечерний отчёт запущен вручную*\n")
-        + "Ищу FULL-подходящие монеты, подбираю пару, а Gemini показываю как рекомендацию.",
+        + "Ищу FULL-подходящие монеты, подбираю пару, а Gemini показываю как рекомендацию.\n"
+        + f"❌ {temporary_disabled_text()} временно отключены; API-код сохранён, их можно быстро вернуть.",
         parse_mode="Markdown",
     )
 
@@ -275,4 +281,3 @@ async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
     if not REPORT_CHAT_ID:
         return
     await run_evening_report(context, int(REPORT_CHAT_ID))
-

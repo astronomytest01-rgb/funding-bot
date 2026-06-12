@@ -87,8 +87,16 @@ AUTO_SCAN_DAYS = 3
 Активные биржи:
 
 ```text
-phemex, xt, toobit, okx, bingx, coinw, kucoin, bitunix
+phemex, xt, toobit, okx, bingx, kucoin
 ```
+
+Временно отключены и скрыты из команд, кнопок, `/analyze`, `/report`, `/oi`, `/funding`, `/filter`, `/calculator` и delta-подбора:
+
+```text
+coinw, bitunix
+```
+
+Код API-подключений CoinW и Bitunix сохранён в `exchanges.py`, `oi.py` и связанных местах. Для быстрого возврата нужно убрать биржи из `TEMPORARILY_DISABLED_EXCHANGES` и вернуть `True` в `EXCHANGES_ENABLED`.
 
 Toobit `/analyze` uses native `/api/v1/exchangeInfo` futures `contracts`, not the Phemex fallback list. This includes Toobit-only TradFi/commodity contracts such as `GER40` and `NG`.
 
@@ -263,9 +271,9 @@ help - Справка
 | `toobit` | Toobit | public historyFundingRate + native `/api/v1/exchangeInfo` futures list |
 | `okx` | OKX | public funding-rate-history |
 | `bingx` | BingX | public fundingRate |
-| `coinw` | CoinW | Supabase collector, table `funding_rates` |
+| `coinw` | CoinW | Supabase collector, table `funding_rates`; временно отключена в `EXCHANGES_ENABLED` |
 | `kucoin` | KuCoin | public contract funding-rates |
-| `bitunix` | Bitunix | public get_funding_rate_history |
+| `bitunix` | Bitunix | public get_funding_rate_history; временно отключена в `EXCHANGES_ENABLED` |
 
 ## Архитектура кода
 
@@ -292,12 +300,13 @@ reports.py   - evening auto_scan_job
 8. Gemini output сохраняет emoji направления: 🟢 LONG, 🔴 SHORT.
 9. `/oi` проходит сценарий монета -> биржа -> рекомендация и использует те же OI-пороги, что фильтры.
 10. Вечерний отчёт использует только `full`-монеты, скрывает OI ниже $500k, показывает OI-статус long/short бирж, Gemini показывает как рекомендацию, считает прибыль за 1 день и отправляет инструкцию входа.
-11. Оба `.md` файла обновлены перед push.
+11. CoinW и Bitunix временно отключены: они не появляются в кнопках и не работают через прямые команды, но API-код сохранён для быстрого возврата.
+12. Оба `.md` файла обновлены перед push.
 
 ## Ограничения
 
 1. `/settings` хранит состояние только в памяти.
-2. CoinW зависит от Supabase collector.
+2. CoinW зависит от Supabase collector и сейчас временно отключена вместе с Bitunix.
 3. Gemini может ошибаться; это только риск-фильтр.
 4. Вечерний скан может занимать несколько минут.
 5. Telegram режет сообщения длиннее примерно 4096 символов, бот отправляет чанки.

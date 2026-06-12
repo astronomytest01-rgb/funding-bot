@@ -37,10 +37,16 @@ from config import (
     NEG_AVG_THRESHOLD,
     REPORT_CHAT_ID,
     STABILITY_THRESHOLD,
+    TEMPORARILY_DISABLED_EXCHANGES,
 )
 from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, EXCHANGE_SYMBOL_FETCHERS, phemex_fetch, phemex_get_all_symbols
 from oi import OI_HIDE_BELOW_USD, OI_OK_USD, format_oi_status, get_open_interest_usd, is_oi_allowed
 from reports import auto_scan_job, run_evening_report, send_entry_instructions
+
+
+def temporary_disabled_text():
+    labels = [EXCHANGE_LABELS.get(e, e.upper()) for e in TEMPORARILY_DISABLED_EXCHANGES]
+    return ", ".join(sorted(labels))
 
 WAIT_ANALYZE_COINS = 1
 WAIT_SHOW_COIN = 3
@@ -110,7 +116,7 @@ def parse_tokens(text):
         # пропускаем команды вида /filter если вдруг попали в текст
         if p in ("/filter", "/funding", "/calculator", "/start", "/help", "/settings", "/report", "/instruction", "/oi", "/cancel"):
             i += 1; continue
-        # Распознаём название активной биржи без префикса.
+        # Распознаём название биржи без префикса; активность проверяется позднее.
         if p in KNOWN_EXCHANGES:
             exchange = p; i += 1; continue
         # Старые/отключённые биржи не считаем тикерами монет.
@@ -226,11 +232,19 @@ async def do_analyze(update, coins, days, exchange_arg, selected_exchanges=None)
 
     # Если переданы выбранные биржи — используем их
     if selected_exchanges:
-        active = [e for e in selected_exchanges if e in EXCHANGE_FETCHERS]
+        active = [
+            e for e in selected_exchanges
+            if e in EXCHANGE_FETCHERS
+            and EXCHANGES_ENABLED.get(e, False)
+            and e not in TEMPORARILY_DISABLED_EXCHANGES
+        ]
     else:
         active = get_active_exchanges(exchange_arg)
     if not active:
-        await reply_fn("❌ Нет активных бирж. Проверь настройки EXCHANGES_ENABLED.")
+        await reply_fn(
+            "❌ Нет активных бирж. Проверь настройки EXCHANGES_ENABLED.\n"
+            f"ℹ️ Временно отключены: {temporary_disabled_text()}. Код API сохранён, их можно быстро вернуть."
+        )
         return
 
     ex_str = " + ".join(EXCHANGE_LABELS.get(e, e) for e in active)
@@ -478,13 +492,18 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    active = [EXCHANGE_LABELS.get(e, e) for e, on in EXCHANGES_ENABLED.items() if on]
+    active = [
+        EXCHANGE_LABELS.get(e, e)
+        for e, on in EXCHANGES_ENABLED.items()
+        if on and e not in TEMPORARILY_DISABLED_EXCHANGES
+    ]
     ex_str = ", ".join(active)
     gemini_status = "включён" if GEMINI_API_KEY else "не настроен"
     report_status = "включён" if REPORT_CHAT_ID else "не настроен"
     text = (
         "👋 *Funding Rate Analyzer + Gemini AI*\n\n"
         f"Активные биржи: `{ex_str}`\n"
+        f"Временно отключены: `{temporary_disabled_text()}` — API-код сохранён, можно быстро вернуть.\n"
         f"Gemini AI: `{gemini_status}` | Вечерний отчёт: `{report_status}`\n\n"
         "Команды:\n"
         "/filter — анализ монет по эталонным фильтрам фандинга\n"
@@ -509,7 +528,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🕗 Запускаю вечерний отчёт вручную. Это может занять несколько минут.")
+    await update.message.reply_text(
+        "🕗 Запускаю вечерний отчёт вручную. Это может занять несколько минут.\n"
+        f"❌ {temporary_disabled_text()} временно отключены; API-код сохранён, их можно быстро вернуть."
+    )
     await run_evening_report(context, update.effective_chat.id, manual=True)
 
 
@@ -541,7 +563,7 @@ def make_oi_exchange_keyboard():
     buttons = []
     row = []
     for ex, enabled in EXCHANGES_ENABLED.items():
-        if not enabled:
+        if not enabled or ex in TEMPORARILY_DISABLED_EXCHANGES:
             continue
         row.append(InlineKeyboardButton(EXCHANGE_LABELS.get(ex, ex.upper()), callback_data=f"oi_ex_{ex}"))
         if len(row) == 2:
@@ -625,6 +647,12 @@ async def oi_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Отменено.")
         return ConversationHandler.END
     exchange = q.data.replace("oi_ex_", "")
+    if exchange in TEMPORARILY_DISABLED_EXCHANGES or not EXCHANGES_ENABLED.get(exchange, False):
+        await q.edit_message_text(
+            f"❌ {EXCHANGE_LABELS.get(exchange, exchange.upper())} временно отключена. "
+            "API-код сохранён, биржу можно быстро вернуть позже."
+        )
+        return ConversationHandler.END
     coin = context.user_data.get("oi_coin")
     if not coin:
         await q.edit_message_text("❌ Монета не найдена. Запусти /oi заново.")
@@ -641,10 +669,15 @@ async def oi_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    active = [EXCHANGE_LABELS.get(e, e) for e, on in EXCHANGES_ENABLED.items() if on]
+    active = [
+        EXCHANGE_LABELS.get(e, e)
+        for e, on in EXCHANGES_ENABLED.items()
+        if on and e not in TEMPORARILY_DISABLED_EXCHANGES
+    ]
     text = (
         "⚙️ *Настройки*\n\n"
         f"Активные биржи: `{', '.join(active)}`\n"
+        f"Временно отключены: `{temporary_disabled_text()}` — API-код сохранён, можно быстро вернуть.\n"
         f"Период по умолчанию: `{DEFAULT_DAYS}` дней\n"
         f"Порог ставки: `{STABILITY_THRESHOLD}%`\n"
         f"Макс. выбросов: `{MAX_OUTLIER_PCT}%`\n"
@@ -688,19 +721,23 @@ AN_ANOMALY_THRESHOLD = 0.8   # аномалии для метода "Средн�
 async def cmd_analyze_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Шаг 1: выбор биржи."""
     context.user_data.clear()
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Phemex",  callback_data="an_ex_phemex"),
-         InlineKeyboardButton("XT",      callback_data="an_ex_xt")],
-        [InlineKeyboardButton("Toobit",  callback_data="an_ex_toobit"),
-         InlineKeyboardButton("CoinW",   callback_data="an_ex_coinw")],
-        [InlineKeyboardButton("OKX",     callback_data="an_ex_okx"),
-         InlineKeyboardButton("BingX",   callback_data="an_ex_bingx")],
-        [InlineKeyboardButton("KuCoin",  callback_data="an_ex_kucoin"),
-         InlineKeyboardButton("Bitunix", callback_data="an_ex_bitunix")],
-        [InlineKeyboardButton("Отмена",  callback_data="an_cancel")],
-    ])
+    rows = []
+    row = []
+    for ex, enabled in EXCHANGES_ENABLED.items():
+        if not enabled or ex in TEMPORARILY_DISABLED_EXCHANGES:
+            continue
+        row.append(InlineKeyboardButton(EXCHANGE_LABELS.get(ex, ex.upper()), callback_data=f"an_ex_{ex}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("Отмена",  callback_data="an_cancel")])
+    keyboard = InlineKeyboardMarkup(rows)
     await update.message.reply_text(
-        "🔍 Скан монет по фандингу\n\nШаг 1/3: Выбери биржу:",
+        "🔍 Скан монет по фандингу\n\n"
+        f"❌ {temporary_disabled_text()} временно отключены и скрыты из скана.\n\n"
+        "Шаг 1/3: Выбери биржу:",
         reply_markup=keyboard,
     )
     return AN_METHOD
@@ -714,6 +751,12 @@ async def an_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Отменено.")
         return ConversationHandler.END
     exchange = q.data.replace("an_ex_", "")
+    if exchange in TEMPORARILY_DISABLED_EXCHANGES or not EXCHANGES_ENABLED.get(exchange, False):
+        await q.edit_message_text(
+            f"❌ {EXCHANGE_LABELS.get(exchange, exchange.upper())} временно отключена. "
+            "API-код сохранён, биржу можно быстро вернуть позже."
+        )
+        return ConversationHandler.END
     context.user_data["an_exchange"] = exchange
     labels = {ex: EXCHANGE_LABELS.get(ex, ex.upper()) for ex in EXCHANGES_ENABLED}
     label = labels.get(exchange, exchange)
@@ -932,6 +975,12 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
 
     labels = {ex: EXCHANGE_LABELS.get(ex, ex.upper()) for ex in EXCHANGES_ENABLED}
     label = labels.get(exchange, exchange)
+    if exchange in TEMPORARILY_DISABLED_EXCHANGES or not EXCHANGES_ENABLED.get(exchange, False):
+        await msg.reply_text(
+            f"❌ {label} временно отключена и скрыта из команд. "
+            "API-код сохранён, биржу можно быстро вернуть позже."
+        )
+        return
     method_label = "Средняя ставка" if method == "rate" else f"Средний доход (${amount:,.0f}, ≥${threshold:.0f}/день)"
 
     # Получаем список монет
@@ -1172,7 +1221,7 @@ def make_exchange_keyboard(cb_prefix, selected=None):
     buttons = []
     row = []
     for ex, label in EXCHANGE_LABELS.items():
-        if not EXCHANGES_ENABLED.get(ex, False):
+        if not EXCHANGES_ENABLED.get(ex, False) or ex in TEMPORARILY_DISABLED_EXCHANGES:
             continue
         icon = "✅ " if ex in selected else ""
         row.append(InlineKeyboardButton(
@@ -1287,7 +1336,10 @@ async def acf_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     selected = context.user_data.get("acf_selected_ex", set())
 
     if q.data == "acf_ex_all":
-        selected = set(ex for ex in EXCHANGES_ENABLED if EXCHANGES_ENABLED[ex])
+        selected = set(
+            ex for ex in EXCHANGES_ENABLED
+            if EXCHANGES_ENABLED[ex] and ex not in TEMPORARILY_DISABLED_EXCHANGES
+        )
         context.user_data["acf_selected_ex"] = selected
         await q.edit_message_text(
             "Шаг 3/3: Выбери биржу.",
@@ -1298,7 +1350,10 @@ async def acf_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if q.data == "acf_ex_confirm":
         if not selected:
-            selected = set(ex for ex in EXCHANGES_ENABLED if EXCHANGES_ENABLED[ex])
+            selected = set(
+                ex for ex in EXCHANGES_ENABLED
+                if EXCHANGES_ENABLED[ex] and ex not in TEMPORARILY_DISABLED_EXCHANGES
+            )
         coins    = context.user_data.get("acf_coins", [])
         days     = context.user_data.get("acf_days", DEFAULT_DAYS)
         ex_label = ", ".join(EXCHANGE_LABELS.get(e, e) for e in selected)
@@ -1404,7 +1459,10 @@ async def fr_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     selected = context.user_data.get("fr_selected_ex", set())
 
     if q.data == "fr_ex_all":
-        selected = set(ex for ex in EXCHANGES_ENABLED if EXCHANGES_ENABLED[ex])
+        selected = set(
+            ex for ex in EXCHANGES_ENABLED
+            if EXCHANGES_ENABLED[ex] and ex not in TEMPORARILY_DISABLED_EXCHANGES
+        )
         context.user_data["fr_selected_ex"] = selected
         await q.edit_message_text(
             "Шаг 3/3: Выбери биржу.",
@@ -1415,7 +1473,10 @@ async def fr_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if q.data == "fr_ex_confirm":
         if not selected:
-            selected = set(ex for ex in EXCHANGES_ENABLED if EXCHANGES_ENABLED[ex])
+            selected = set(
+                ex for ex in EXCHANGES_ENABLED
+                if EXCHANGES_ENABLED[ex] and ex not in TEMPORARILY_DISABLED_EXCHANGES
+            )
         coin     = context.user_data.get("fr_coin", "")
         days     = context.user_data.get("fr_days", DEFAULT_DAYS)
         ex_label = ", ".join(EXCHANGE_LABELS.get(e, e) for e in selected)
@@ -1560,7 +1621,10 @@ async def pc_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     selected = context.user_data.get("pc_selected_ex", set())
 
     if q.data == "pc_ex_all":
-        selected = set(ex for ex in EXCHANGES_ENABLED if EXCHANGES_ENABLED[ex])
+        selected = set(
+            ex for ex in EXCHANGES_ENABLED
+            if EXCHANGES_ENABLED[ex] and ex not in TEMPORARILY_DISABLED_EXCHANGES
+        )
         context.user_data["pc_selected_ex"] = selected
         await q.edit_message_text(
             "Шаг 4/4: Выбери биржу.",
@@ -1571,7 +1635,10 @@ async def pc_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if q.data == "pc_ex_confirm":
         if not selected:
-            selected = set(ex for ex in EXCHANGES_ENABLED if EXCHANGES_ENABLED[ex])
+            selected = set(
+                ex for ex in EXCHANGES_ENABLED
+                if EXCHANGES_ENABLED[ex] and ex not in TEMPORARILY_DISABLED_EXCHANGES
+            )
         coin   = context.user_data.get("pc_coin", "")
         amount = context.user_data.get("pc_amount", 0)
         days   = context.user_data.get("pc_days", DEFAULT_DAYS)
@@ -1604,6 +1671,8 @@ def make_settings_keyboard():
     buttons = []
     row = []
     for ex, enabled in EXCHANGES_ENABLED.items():
+        if ex in TEMPORARILY_DISABLED_EXCHANGES:
+            continue
         label = EXCHANGE_LABELS.get(ex, ex.upper())
         icon  = "✅" if enabled else "❌"
         row.append(InlineKeyboardButton(f"{icon} {label}", callback_data=f"set_ex_{ex}"))
@@ -1621,7 +1690,11 @@ def make_settings_keyboard():
 
 
 def settings_text():
-    active = [EXCHANGE_LABELS.get(e, e) for e, on in EXCHANGES_ENABLED.items() if on]
+    active = [
+        EXCHANGE_LABELS.get(e, e)
+        for e, on in EXCHANGES_ENABLED.items()
+        if on and e not in TEMPORARILY_DISABLED_EXCHANGES
+    ]
     return (
         "⚙️ *Настройки*\\n\\n"
         f"Период по умолчанию: `{DEFAULT_DAYS}` дней\\n"
@@ -1630,12 +1703,13 @@ def settings_text():
         f"Neg avg порог: `{NEG_AVG_THRESHOLD}%`\\n"
         f"Gemini AI: `{'включён' if GEMINI_API_KEY else 'не настроен'}`\\n"
         f"Вечерний отчёт 20:00 Киев: `{'включён' if REPORT_CHAT_ID else 'не настроен'}`\\n\\n"
+        f"Временно отключены: `{temporary_disabled_text()}` — API-код сохранён, можно быстро вернуть.\\n\\n"
         "Категории:\\n"
         "✅ *ПОДХОДИТ* — стабильность ок\\n"
         "⚡ *ЧАСТИЧНО* — neg\\_avg сильный, нестабильно\\n"
         "❌ *НЕ ПОДХОДИТ* — не прошла\\n\\n"
         "*Биржи* (нажми чтобы вкл/выкл):\\n"
-        f"Активных: {len(active)} из {len(EXCHANGES_ENABLED)}"
+        f"Активных: {len(active)} из {len(EXCHANGES_ENABLED) - len(TEMPORARILY_DISABLED_EXCHANGES)}"
     )
 
 
@@ -1657,13 +1731,15 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if q.data == "set_ex_all_on":
         for ex in EXCHANGES_ENABLED:
+            if ex in TEMPORARILY_DISABLED_EXCHANGES:
+                continue
             EXCHANGES_ENABLED[ex] = True
     elif q.data == "set_ex_all_off":
         for ex in EXCHANGES_ENABLED:
             EXCHANGES_ENABLED[ex] = False
     elif q.data.startswith("set_ex_"):
         ex = q.data.replace("set_ex_", "")
-        if ex in EXCHANGES_ENABLED:
+        if ex in EXCHANGES_ENABLED and ex not in TEMPORARILY_DISABLED_EXCHANGES:
             EXCHANGES_ENABLED[ex] = not EXCHANGES_ENABLED[ex]
 
     # Обновляем сообщение с новыми кнопками
@@ -1716,7 +1792,10 @@ async def delta_got_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def do_delta(update, coins, days, amount_usd=None):
-    active = [e for e, on in EXCHANGES_ENABLED.items() if on]
+    active = [
+        e for e, on in EXCHANGES_ENABLED.items()
+        if on and e not in TEMPORARILY_DISABLED_EXCHANGES
+    ]
     if len(active) < 2:
         await update.message.reply_text(
             "\u274c \u041d\u0443\u0436\u043d\u043e \u043c\u0438\u043d\u0438\u043c\u0443\u043c 2 \u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0435 \u0431\u0438\u0440\u0436\u0438 \u0434\u043b\u044f \u0434\u0435\u043b\u044c\u0442\u0430-\u0430\u043d\u0430\u043b\u0438\u0437\u0430.\

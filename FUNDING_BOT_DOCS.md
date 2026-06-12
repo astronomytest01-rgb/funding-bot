@@ -102,14 +102,22 @@ SHORT:
 Активные:
 
 ```text
-Phemex, XT, Toobit, OKX, BingX, CoinW, KuCoin, Bitunix
+Phemex, XT, Toobit, OKX, BingX, KuCoin
 ```
+
+Временно отключены и скрыты из всех пользовательских команд и кнопок:
+
+```text
+CoinW, Bitunix
+```
+
+API-код CoinW и Bitunix сохранён. Для возврата нужно убрать ключи `coinw` и `bitunix` из `TEMPORARILY_DISABLED_EXCHANGES` и включить их в `EXCHANGES_ENABLED`.
 
 Toobit scan uses native `/api/v1/exchangeInfo` `contracts`, so TradFi futures such as `GER40` and commodities such as `NG` are included even when they are absent from the Phemex universe.
 
 XT, Toobit and KuCoin scans use native exchange symbol lists instead of the Phemex fallback universe.
 
-CoinW берётся из Supabase таблицы `funding_rates`:
+CoinW берётся из Supabase таблицы `funding_rates`, но сейчас временно отключена в runtime:
 
 ```text
 symbol, rate_pct, collected_at, funding_time
@@ -198,7 +206,7 @@ reports.py   - evening report job
 
 1. `PYTHONPYCACHEPREFIX=/private/tmp/pycache python3 -m py_compile bot.py config.py analysis.py ai.py exchanges.py reports.py oi.py`.
 2. Нет потерянных импортов после разбиения `bot.py`.
-3. CoinW работает через Supabase для исторических данных.
+3. CoinW API-код сохранён и работает через Supabase для исторических данных, но CoinW временно отключена вместе с Bitunix.
 4. `/analyze` `Средний доход` ищет обе стороны: LONG и SHORT.
 5. Длинный `/analyze` не блокирует Telegram polling: fetch/OI операции выполняются через `asyncio.to_thread`.
 6. Trend-фильтр использует последние 4 ставки и правило 2 из 4.
@@ -206,12 +214,13 @@ reports.py   - evening report job
 8. OI ниже $500k скрывается в `/analyze` и вечернем отчёте; $500k-$1m показывает ⚠️, $1m+ показывает ✅.
 9. `/oi` вручную проверяет OI: монета -> биржа -> рекомендация заходить или пропустить.
 10. Вечерний отчёт запускается в 20:00 Europe/Kyiv при наличии `REPORT_CHAT_ID`; `/report` запускает тот же отчёт вручную.
-11. Документация обновлена перед push.
+11. CoinW и Bitunix временно отключены: скрыты из кнопок и не работают через прямые команды, API-код оставлен для быстрого возврата.
+12. Документация обновлена перед push.
 
 ## Известные ограничения
 
 1. Настройки бирж не сохраняются после перезапуска.
-2. CoinW зависит от внешнего Supabase collector.
+2. CoinW зависит от внешнего Supabase collector и сейчас временно отключена вместе с Bitunix.
 3. Gemini не является торговым сигналом.
 4. Скан может идти несколько минут.
 5. Один bot token нельзя запускать одновременно локально и на сервере.
