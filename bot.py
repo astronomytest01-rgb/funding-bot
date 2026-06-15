@@ -114,7 +114,7 @@ def parse_tokens(text):
         if p in ("/exchange", "--exchange") and i + 1 < len(parts):
             exchange = parts[i + 1].lower(); i += 2; continue
         # пропускаем команды вида /filter если вдруг попали в текст
-        if p in ("/filter", "/funding", "/calculator", "/start", "/help", "/settings", "/report", "/instruction", "/oi", "/cancel"):
+        if p in ("/filter", "/funding", "/calculator", "/start", "/help", "/settings", "/report", "/instruction", "/ai", "/oi", "/cancel"):
             i += 1; continue
         # Распознаём название биржи без префикса; активность проверяется позднее.
         if p in KNOWN_EXCHANGES:
@@ -1873,6 +1873,34 @@ async def ai_got_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def ai_direct_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Standalone /ai handler registered before unknown.
+
+    This duplicates the conversation entry point intentionally: /ai is a critical
+    command, so it should not fall through to the generic unknown-command handler
+    even if ConversationHandler state tracking changes after deploy/restart.
+    """
+    if context.args:
+        context.user_data.pop("awaiting_ai_coin", None)
+        await do_ai_multiple(update, context.args)
+        return
+    context.user_data["awaiting_ai_coin"] = True
+    await update.message.reply_text(
+        "Введи монеты для AI-анализа, например:\n\n"
+        "`SOL`\n"
+        "`SOL ENJ RON`\n\n"
+        "AI оценивает фундаментал, ликвидность, волатильность и риски. "
+        "Ставки фандинга он не анализирует.",
+        parse_mode="Markdown",
+    )
+
+
+async def ai_direct_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.pop("awaiting_ai_coin", False):
+        return
+    await do_ai_multiple(update, update.message.text.split())
+
+
 
 def main():
     if not BOT_TOKEN:
@@ -1922,6 +1950,9 @@ def main():
     app.add_handler(CommandHandler("report",    cmd_report))
     app.add_handler(CommandHandler("instruction", cmd_instruction))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern="^set_"))
+    # Critical direct AI handler: keep before ConversationHandlers and unknown.
+    app.add_handler(CommandHandler("ai", ai_direct_start), group=-1)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai_direct_text), group=1)
     # /analyze ConversationHandler
     analyze_conv = ConversationHandler(
         entry_points=[CommandHandler("analyze", cmd_analyze_start)],
@@ -1950,11 +1981,8 @@ def main():
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
 
-    ai_conv = ConversationHandler(
-        entry_points=[CommandHandler("ai", ai_start)],
-        states={WAIT_AI_COIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, ai_got_coin)]},
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
-    )
+    # /ai is handled by ai_direct_start/ai_direct_text above instead of this
+    # ConversationHandler path, so the command cannot fall through to unknown.
 
     oi_conv = ConversationHandler(
         entry_points=[CommandHandler("oi", oi_start)],
@@ -1970,7 +1998,6 @@ def main():
     app.add_handler(fr_conv)
     app.add_handler(pc_conv)
     app.add_handler(delta_conv)
-    app.add_handler(ai_conv)
     app.add_handler(oi_conv)
 
     if REPORT_CHAT_ID and app.job_queue:
