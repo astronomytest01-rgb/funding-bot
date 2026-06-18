@@ -579,20 +579,8 @@ def normalize_oi_coin(text):
     return token
 
 
-def make_oi_exchange_keyboard():
-    buttons = []
-    row = []
-    for ex, enabled in EXCHANGES_ENABLED.items():
-        if not enabled or ex in TEMPORARILY_DISABLED_EXCHANGES:
-            continue
-        row.append(InlineKeyboardButton(EXCHANGE_LABELS.get(ex, ex.upper()), callback_data=f"oi_ex_{ex}"))
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-    buttons.append([InlineKeyboardButton("Отмена", callback_data="oi_cancel")])
-    return InlineKeyboardMarkup(buttons)
+def make_oi_exchange_keyboard(selected=None):
+    return make_exchange_keyboard("oi", selected)
 
 
 def format_oi_recommendation(coin, exchange):
@@ -633,9 +621,10 @@ async def oi_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         coin = normalize_oi_coin(" ".join(context.args))
         if coin:
             context.user_data["oi_coin"] = coin
+            context.user_data["oi_selected_ex"] = set()
             await update.message.reply_text(
-                f"Монета: `{coin}`\n\nШаг 2/2: выбери биржу для проверки OI:",
-                reply_markup=make_oi_exchange_keyboard(),
+                f"Монета: `{coin}`\n\nШаг 2/2: выбери одну или несколько бирж для проверки OI:",
+                reply_markup=make_oi_exchange_keyboard(set()),
                 parse_mode="Markdown",
             )
             return OI_EXCH
@@ -652,9 +641,10 @@ async def oi_got_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не распознал монету. Попробуй: `FLOW`", parse_mode="Markdown")
         return OI_COIN
     context.user_data["oi_coin"] = coin
+    context.user_data["oi_selected_ex"] = set()
     await update.message.reply_text(
-        f"Монета: `{coin}`\n\nШаг 2/2: выбери биржу для проверки OI:",
-        reply_markup=make_oi_exchange_keyboard(),
+        f"Монета: `{coin}`\n\nШаг 2/2: выбери одну или несколько бирж для проверки OI:",
+        reply_markup=make_oi_exchange_keyboard(set()),
         parse_mode="Markdown",
     )
     return OI_EXCH
@@ -664,8 +654,42 @@ async def oi_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     if q.data == "oi_cancel":
+        context.user_data.pop("oi_selected_ex", None)
         await q.edit_message_text("Отменено.")
         return ConversationHandler.END
+
+    selected = set(context.user_data.get("oi_selected_ex", set()))
+    active = set(active_exchange_keys())
+
+    if q.data == "oi_ex_all":
+        selected = set() if active and active.issubset(selected) else active
+        context.user_data["oi_selected_ex"] = selected
+        await q.edit_message_reply_markup(reply_markup=make_oi_exchange_keyboard(selected))
+        return OI_EXCH
+
+    if q.data == "oi_ex_confirm":
+        if not selected:
+            await q.edit_message_text(
+                "Выбери хотя бы одну биржу или нажми «Все биржи».",
+                reply_markup=make_oi_exchange_keyboard(selected),
+            )
+            return OI_EXCH
+        coin = context.user_data.get("oi_coin")
+        if not coin:
+            context.user_data.pop("oi_selected_ex", None)
+            await q.edit_message_text("❌ Монета не найдена. Запусти /oi заново.")
+            return ConversationHandler.END
+
+        exchanges = [ex for ex in active_exchange_keys() if ex in selected]
+        await q.edit_message_text(
+            f"Проверяю Open Interest по `{coin}` на {len(exchanges)} биржах...",
+            parse_mode="Markdown",
+        )
+        for exchange in exchanges:
+            await q.message.reply_text(format_oi_recommendation(coin, exchange), parse_mode="Markdown")
+        context.user_data.pop("oi_selected_ex", None)
+        return ConversationHandler.END
+
     exchange = q.data.replace("oi_ex_", "")
     if exchange in TEMPORARILY_DISABLED_EXCHANGES or not EXCHANGES_ENABLED.get(exchange, False):
         await q.edit_message_text(
@@ -673,13 +697,14 @@ async def oi_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "API-код сохранён, биржу можно быстро вернуть позже."
         )
         return ConversationHandler.END
-    coin = context.user_data.get("oi_coin")
-    if not coin:
-        await q.edit_message_text("❌ Монета не найдена. Запусти /oi заново.")
-        return ConversationHandler.END
-    await q.edit_message_text("Проверяю Open Interest...")
-    await q.message.reply_text(format_oi_recommendation(coin, exchange), parse_mode="Markdown")
-    return ConversationHandler.END
+
+    if exchange in selected:
+        selected.remove(exchange)
+    else:
+        selected.add(exchange)
+    context.user_data["oi_selected_ex"] = selected
+    await q.edit_message_reply_markup(reply_markup=make_oi_exchange_keyboard(selected))
+    return OI_EXCH
 
 
 # cmd_exchanges удалена — используй /settings
