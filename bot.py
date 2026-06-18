@@ -13,7 +13,8 @@ from datetime import datetime, time as dt_time, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    filters, ContextTypes, ConversationHandler, CallbackQueryHandler
+    filters, ContextTypes, ConversationHandler, CallbackQueryHandler,
+    ApplicationHandlerStop,
 )
 
 from ai import gemini_analyze_single, get_last_gemini_error, send_gemini_scan_review
@@ -267,8 +268,16 @@ async def do_analyze(update, coins, days, exchange_arg, selected_exchanges=None)
         await reply_fn(reply, parse_mode="Markdown")
 
 
-async def do_show(update, coin, days, exchange_arg):
-    active = get_active_exchanges(exchange_arg)
+async def do_show(update, coin, days, exchange_arg, selected_exchanges=None):
+    if selected_exchanges:
+        active = [
+            e for e in selected_exchanges
+            if e in EXCHANGE_FETCHERS
+            and EXCHANGES_ENABLED.get(e, False)
+            and e not in TEMPORARILY_DISABLED_EXCHANGES
+        ]
+    else:
+        active = get_active_exchanges(exchange_arg)
     if not active:
         await update.message.reply_text("❌ Нет активных бирж.")
         return
@@ -325,8 +334,16 @@ async def do_show(update, coin, days, exchange_arg):
             await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-async def do_calc(update, coin, amount_usd, days, exchange_arg):
-    active = get_active_exchanges(exchange_arg)
+async def do_calc(update, coin, amount_usd, days, exchange_arg, selected_exchanges=None):
+    if selected_exchanges:
+        active = [
+            e for e in selected_exchanges
+            if e in EXCHANGE_FETCHERS
+            and EXCHANGES_ENABLED.get(e, False)
+            and e not in TEMPORARILY_DISABLED_EXCHANGES
+        ]
+    else:
+        active = get_active_exchanges(exchange_arg)
     if not active:
         await update.message.reply_text("❌ Нет активных бирж.")
         return
@@ -1214,6 +1231,13 @@ def make_days_keyboard(cb_prefix, extra_short=False):
     ])
 
 
+def active_exchange_keys():
+    return [
+        ex for ex, enabled in EXCHANGES_ENABLED.items()
+        if enabled and ex not in TEMPORARILY_DISABLED_EXCHANGES
+    ]
+
+
 def make_exchange_keyboard(cb_prefix, selected=None):
     """Кнопки выбора бирж с мультивыбором.
     selected — set выбранных бирж (чекбоксы).
@@ -1236,8 +1260,10 @@ def make_exchange_keyboard(cb_prefix, selected=None):
             row = []
     if row:
         buttons.append(row)
+    active = set(active_exchange_keys())
+    all_label = "Снять все" if active and active.issubset(selected) else "Все биржи"
     buttons.append([
-        InlineKeyboardButton("Все биржи",   callback_data=f"{cb_prefix}_ex_all"),
+        InlineKeyboardButton(all_label,   callback_data=f"{cb_prefix}_ex_all"),
         InlineKeyboardButton("Подтвердить", callback_data=f"{cb_prefix}_ex_confirm"),
     ])
     buttons.append([InlineKeyboardButton("Отмена", callback_data=f"{cb_prefix}_cancel")])
@@ -1339,10 +1365,8 @@ async def acf_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     selected = context.user_data.get("acf_selected_ex", set())
 
     if q.data == "acf_ex_all":
-        selected = set(
-            ex for ex in EXCHANGES_ENABLED
-            if EXCHANGES_ENABLED[ex] and ex not in TEMPORARILY_DISABLED_EXCHANGES
-        )
+        all_active = set(active_exchange_keys())
+        selected = set() if all_active and all_active.issubset(selected) else all_active
         context.user_data["acf_selected_ex"] = selected
         await q.edit_message_text(
             "Шаг 3/3: Выбери биржу.",
@@ -1353,10 +1377,12 @@ async def acf_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if q.data == "acf_ex_confirm":
         if not selected:
-            selected = set(
-                ex for ex in EXCHANGES_ENABLED
-                if EXCHANGES_ENABLED[ex] and ex not in TEMPORARILY_DISABLED_EXCHANGES
+            await q.edit_message_text(
+                "Выбери хотя бы одну биржу или нажми «Все биржи».",
+                reply_markup=make_exchange_keyboard("acf", selected),
+                parse_mode="Markdown"
             )
+            return ACF_EXCH
         coins    = context.user_data.get("acf_coins", [])
         days     = context.user_data.get("acf_days", DEFAULT_DAYS)
         ex_label = ", ".join(EXCHANGE_LABELS.get(e, e) for e in selected)
@@ -1364,7 +1390,7 @@ async def acf_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Анализирую {' '.join(coins)} за {days}д на {ex_label}...",
         )
         exchange = list(selected)[0] if len(selected) == 1 else None
-        await do_analyze(q, coins, days, exchange, selected if len(selected) > 1 else None)
+        await do_analyze(q, coins, days, exchange, selected)
         return ConversationHandler.END
 
     # Переключаем выбор биржи
@@ -1414,7 +1440,7 @@ async def funding_direct_start(update: Update, context: ContextTypes.DEFAULT_TYP
         coins, days, exchange = parse_tokens(" ".join(context.args))
         if coins:
             await do_show(update, coins[0], days, exchange)
-            return
+            raise ApplicationHandlerStop
     context.user_data["awaiting_funding_coin"] = True
     await update.message.reply_text(
         "📈 Ставки фандинга по монете\n\n"
@@ -1423,6 +1449,7 @@ async def funding_direct_start(update: Update, context: ContextTypes.DEFAULT_TYP
         "Отмена: /cancel",
         parse_mode="Markdown",
     )
+    raise ApplicationHandlerStop
 
 
 async def funding_direct_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1431,16 +1458,17 @@ async def funding_direct_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not coins:
             context.user_data["awaiting_funding_coin"] = True
             await update.message.reply_text("Не распознал монету. Попробуй: `ENJ`", parse_mode="Markdown")
-            return
+            raise ApplicationHandlerStop
         context.user_data["fr_coin"] = coins[0]
         await update.message.reply_text(
             "Шаг 2/3: Выбери период анализа.",
             reply_markup=make_days_keyboard("fr", extra_short=True),
             parse_mode="Markdown",
         )
-        return
+        raise ApplicationHandlerStop
     if context.user_data.pop("awaiting_funding_days_num", False):
         await fr_days_num(update, context)
+        raise ApplicationHandlerStop
 
 
 async def funding_direct_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1448,12 +1476,13 @@ async def funding_direct_callback(update: Update, context: ContextTypes.DEFAULT_
     if data == "fr_days_other":
         context.user_data["awaiting_funding_days_num"] = True
         await fr_days_btn(update, context)
-        return
+        raise ApplicationHandlerStop
     if data.startswith("fr_days_") or data == "fr_cancel":
         context.user_data.pop("awaiting_funding_days_num", None)
         await fr_days_btn(update, context)
-        return
+        raise ApplicationHandlerStop
     await fr_exchange_btn(update, context)
+    raise ApplicationHandlerStop
 
 
 async def fr_got_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1516,10 +1545,8 @@ async def fr_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     selected = context.user_data.get("fr_selected_ex", set())
 
     if q.data == "fr_ex_all":
-        selected = set(
-            ex for ex in EXCHANGES_ENABLED
-            if EXCHANGES_ENABLED[ex] and ex not in TEMPORARILY_DISABLED_EXCHANGES
-        )
+        all_active = set(active_exchange_keys())
+        selected = set() if all_active and all_active.issubset(selected) else all_active
         context.user_data["fr_selected_ex"] = selected
         await q.edit_message_text(
             "Шаг 3/3: Выбери биржу.",
@@ -1530,16 +1557,18 @@ async def fr_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if q.data == "fr_ex_confirm":
         if not selected:
-            selected = set(
-                ex for ex in EXCHANGES_ENABLED
-                if EXCHANGES_ENABLED[ex] and ex not in TEMPORARILY_DISABLED_EXCHANGES
+            await q.edit_message_text(
+                "Выбери хотя бы одну биржу или нажми «Все биржи».",
+                reply_markup=make_exchange_keyboard("fr", selected),
+                parse_mode="Markdown"
             )
+            return FR_EXCH
         coin     = context.user_data.get("fr_coin", "")
         days     = context.user_data.get("fr_days", DEFAULT_DAYS)
         ex_label = ", ".join(EXCHANGE_LABELS.get(e, e) for e in selected)
         await q.edit_message_text(f"Загружаю ставки {coin} за {days}д на {ex_label}...")
         exchange = list(selected)[0] if len(selected) == 1 else None
-        await do_show(q, coin, days, exchange)
+        await do_show(q, coin, days, exchange, selected)
         return ConversationHandler.END
 
     ex = q.data.replace("fr_ex_", "")
@@ -1678,10 +1707,8 @@ async def pc_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     selected = context.user_data.get("pc_selected_ex", set())
 
     if q.data == "pc_ex_all":
-        selected = set(
-            ex for ex in EXCHANGES_ENABLED
-            if EXCHANGES_ENABLED[ex] and ex not in TEMPORARILY_DISABLED_EXCHANGES
-        )
+        all_active = set(active_exchange_keys())
+        selected = set() if all_active and all_active.issubset(selected) else all_active
         context.user_data["pc_selected_ex"] = selected
         await q.edit_message_text(
             "Шаг 4/4: Выбери биржу.",
@@ -1692,17 +1719,19 @@ async def pc_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if q.data == "pc_ex_confirm":
         if not selected:
-            selected = set(
-                ex for ex in EXCHANGES_ENABLED
-                if EXCHANGES_ENABLED[ex] and ex not in TEMPORARILY_DISABLED_EXCHANGES
+            await q.edit_message_text(
+                "Выбери хотя бы одну биржу или нажми «Все биржи».",
+                reply_markup=make_exchange_keyboard("pc", selected),
+                parse_mode="Markdown"
             )
+            return PC_EXCH
         coin   = context.user_data.get("pc_coin", "")
         amount = context.user_data.get("pc_amount", 0)
         days   = context.user_data.get("pc_days", DEFAULT_DAYS)
         ex_label = ", ".join(EXCHANGE_LABELS.get(e, e) for e in selected)
         await q.edit_message_text(f"Считаю доход {coin} ${amount:,.0f} за {days}д на {ex_label}...")
         exchange = list(selected)[0] if len(selected) == 1 else None
-        await do_calc(q, coin, amount, days, exchange)
+        await do_calc(q, coin, amount, days, exchange, selected)
         return ConversationHandler.END
 
     ex = q.data.replace("pc_ex_", "")
@@ -1940,7 +1969,7 @@ async def ai_direct_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         context.user_data.pop("awaiting_ai_coin", None)
         await do_ai_multiple(update, context.args)
-        return
+        raise ApplicationHandlerStop
     context.user_data["awaiting_ai_coin"] = True
     await update.message.reply_text(
         "Введи монеты для AI-анализа, например:\n\n"
@@ -1950,12 +1979,14 @@ async def ai_direct_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Ставки фандинга он не анализирует.",
         parse_mode="Markdown",
     )
+    raise ApplicationHandlerStop
 
 
 async def ai_direct_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.pop("awaiting_ai_coin", False):
         return
     await do_ai_multiple(update, update.message.text.split())
+    raise ApplicationHandlerStop
 
 
 
