@@ -487,6 +487,9 @@ async def calc_got_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("awaiting_funding_coin", None)
+    context.user_data.pop("awaiting_funding_days_num", None)
+    context.user_data.pop("awaiting_ai_coin", None)
     await update.message.reply_text("Отменено.")
     return ConversationHandler.END
 
@@ -1399,6 +1402,60 @@ async def fr_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return FR_COIN
 
 
+async def funding_direct_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Standalone /funding handler registered before unknown.
+
+    ConversationHandler entry points have repeatedly been the weak spot after
+    Railway deploys/restarts, so /funding keeps its own small user_data flow.
+    """
+    context.user_data.pop("awaiting_funding_coin", None)
+    context.user_data.pop("awaiting_funding_days_num", None)
+    if context.args:
+        coins, days, exchange = parse_tokens(" ".join(context.args))
+        if coins:
+            await do_show(update, coins[0], days, exchange)
+            return
+    context.user_data["awaiting_funding_coin"] = True
+    await update.message.reply_text(
+        "📈 Ставки фандинга по монете\n\n"
+        "Введи название монеты, например `ENJ`.\n\n"
+        "Быстрый ввод тоже работает: `/funding ENJ phemex 7`\n"
+        "Отмена: /cancel",
+        parse_mode="Markdown",
+    )
+
+
+async def funding_direct_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.pop("awaiting_funding_coin", False):
+        coins, _, _ = parse_tokens(update.message.text.strip())
+        if not coins:
+            context.user_data["awaiting_funding_coin"] = True
+            await update.message.reply_text("Не распознал монету. Попробуй: `ENJ`", parse_mode="Markdown")
+            return
+        context.user_data["fr_coin"] = coins[0]
+        await update.message.reply_text(
+            "Шаг 2/3: Выбери период анализа.",
+            reply_markup=make_days_keyboard("fr", extra_short=True),
+            parse_mode="Markdown",
+        )
+        return
+    if context.user_data.pop("awaiting_funding_days_num", False):
+        await fr_days_num(update, context)
+
+
+async def funding_direct_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = update.callback_query.data if update.callback_query else ""
+    if data == "fr_days_other":
+        context.user_data["awaiting_funding_days_num"] = True
+        await fr_days_btn(update, context)
+        return
+    if data.startswith("fr_days_") or data == "fr_cancel":
+        context.user_data.pop("awaiting_funding_days_num", None)
+        await fr_days_btn(update, context)
+        return
+    await fr_exchange_btn(update, context)
+
+
 async def fr_got_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     coins, _, _ = parse_tokens(update.message.text.strip())
     if not coins:
@@ -1953,6 +2010,10 @@ def main():
     # Critical direct AI handler: keep before ConversationHandlers and unknown.
     app.add_handler(CommandHandler("ai", ai_direct_start), group=-1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai_direct_text), group=1)
+    # Critical direct funding handler: keep before ConversationHandlers and unknown.
+    app.add_handler(CommandHandler("funding", funding_direct_start), group=-1)
+    app.add_handler(CallbackQueryHandler(funding_direct_callback, pattern="^fr_"), group=-1)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, funding_direct_text), group=2)
     # /analyze ConversationHandler
     analyze_conv = ConversationHandler(
         entry_points=[CommandHandler("analyze", cmd_analyze_start)],
@@ -1995,7 +2056,8 @@ def main():
 
     # ConversationHandlers — должны быть зарегистрированы до MessageHandler(unknown)
     app.add_handler(acf_conv)
-    app.add_handler(fr_conv)
+    # /funding is handled by funding_direct_* above instead of fr_conv, so the
+    # command cannot fall through to unknown after deploy/restart.
     app.add_handler(pc_conv)
     app.add_handler(delta_conv)
     app.add_handler(oi_conv)
