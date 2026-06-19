@@ -41,7 +41,17 @@ from config import (
     TEMPORARILY_DISABLED_EXCHANGES,
 )
 from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, EXCHANGE_SYMBOL_FETCHERS, phemex_fetch, phemex_get_all_symbols
-from oi import OI_HIDE_BELOW_USD, OI_OK_USD, format_oi_status, get_open_interest_usd, is_oi_allowed
+from oi import (
+    OI_HIDE_BELOW_USD,
+    OI_OK_USD,
+    VOLUME_HIDE_BELOW_USD,
+    format_oi_status,
+    format_volume_status,
+    get_24h_volume_usd,
+    get_open_interest_usd,
+    is_oi_allowed,
+    is_volume_allowed,
+)
 from reports import auto_scan_job, run_evening_report, send_entry_instructions
 
 
@@ -531,7 +541,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/calculator — калькулятор дохода от фандинга\n"
         "/analyze — скан рынка + Gemini-фильтр найденных монет\n"
         "/ai — фундаментальный AI-анализ монеты без анализа фандинга\n"
-        "/oi — пошаговая проверка Open Interest по монете\n"
+        "/oi — пошаговая проверка Open Interest и 24h volume по монете\n"
         "/findpair — дельта-нейтраль: найти пару лонг+шорт\n"
         "/report — запустить вечерний отчёт вручную\n"
         "/instruction — инструкция входа и риск-проверок\n"
@@ -587,6 +597,8 @@ def format_oi_recommendation(coin, exchange):
     label = EXCHANGE_LABELS.get(exchange, exchange.upper())
     oi_usd = get_open_interest_usd(exchange, coin)
     status = format_oi_status(exchange, coin)
+    volume_usd = get_24h_volume_usd(exchange, coin)
+    volume_status = format_volume_status(exchange, coin)
     if oi_usd is None:
         verdict = (
             "⚠️ *Данных OI нет.* Не заходи без ручной проверки OI на самой бирже, "
@@ -607,12 +619,20 @@ def format_oi_recommendation(coin, exchange):
             "✅ *OI проходит базовый фильтр.* Это не сигнал на вход: перед сделкой всё равно проверь "
             "spread, глубину первых 5 ордеров, slippage, Predicted Rate и стабильность фандинга."
         )
+    if volume_usd is None:
+        volume_verdict = "⚠️ *Данных 24h volume нет.* Обязательно проверь оборот на бирже вручную."
+    elif volume_usd < VOLUME_HIDE_BELOW_USD:
+        volume_verdict = "🚫 *24h volume ниже $400,000.* Бот скрывает такие монеты из `/analyze` и вечернего отчёта."
+    else:
+        volume_verdict = "✅ *24h volume проходит фильтр.* Если статус ⚠️ — нужна ручная проверка стакана и slippage."
     return (
-        f"🐋 *Open Interest check*\n\n"
+        f"🐋 *Open Interest + Volume check*\n\n"
         f"Монета: `{coin}`\n"
         f"Биржа: *{label}*\n"
         f"Статус: {status}\n\n"
-        f"{verdict}"
+        f"Оборот: {volume_status}\n\n"
+        f"{verdict}\n\n"
+        f"{volume_verdict}"
     )
 
 
@@ -1102,6 +1122,9 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
                 if not await asyncio.to_thread(is_oi_allowed, exchange, coin):
                     await asyncio.sleep(0.05)
                     continue
+                if not await asyncio.to_thread(is_volume_allowed, exchange, coin):
+                    await asyncio.sleep(0.05)
+                    continue
                 key_avg   = r["neg_avg"] if direction == "LONG" else r["pos_avg"]
                 outlier   = r["outlier_pct"]
                 category  = r["category"]
@@ -1150,6 +1173,9 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
                 if not await asyncio.to_thread(is_oi_allowed, exchange, coin):
                     await asyncio.sleep(0.05)
                     continue
+                if not await asyncio.to_thread(is_volume_allowed, exchange, coin):
+                    await asyncio.sleep(0.05)
+                    continue
 
                 batch_results.append((coin, key_avg, outlier, direction, "income", daily_income))
                 passed.append((coin, key_avg, outlier, direction, "income", daily_income))
@@ -1165,11 +1191,13 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
                 dir_icon = "🟢" if direction == "LONG" else "🔴"
                 if cat == "income":
                     oi_status = await asyncio.to_thread(format_oi_status, exchange, coin)
-                    lines.append(f"💰 {dir_icon} `{coin}` avg `{avg:+.4f}%` ~${income:.1f}/день | {oi_status}")
+                    volume_status = await asyncio.to_thread(format_volume_status, exchange, coin)
+                    lines.append(f"💰 {dir_icon} `{coin}` avg `{avg:+.4f}%` ~${income:.1f}/день | {oi_status} | {volume_status}")
                 else:
                     cat_icon = "✅" if cat == "full" else "⚡"
                     oi_status = await asyncio.to_thread(format_oi_status, exchange, coin)
-                    lines.append(f"{cat_icon} {dir_icon} `{coin}` avg `{avg:+.4f}%` выбр `{op:.0f}%` | {oi_status}")
+                    volume_status = await asyncio.to_thread(format_volume_status, exchange, coin)
+                    lines.append(f"{cat_icon} {dir_icon} `{coin}` avg `{avg:+.4f}%` выбр `{op:.0f}%` | {oi_status} | {volume_status}")
             await msg.reply_text("\n".join(lines), parse_mode="Markdown")
         else:
             await msg.reply_text(
@@ -1193,7 +1221,8 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
         for coin, avg, op, direction, cat, income in passed_sorted:
             dir_icon = "🟢" if direction == "LONG" else "🔴"
             oi_status = await asyncio.to_thread(format_oi_status, exchange, coin)
-            lines.append(f"  {dir_icon} `{coin}` avg `{avg:+.4f}%` ~${income:.1f}/день выбр `{op:.0f}%` | {oi_status}")
+            volume_status = await asyncio.to_thread(format_volume_status, exchange, coin)
+            lines.append(f"  {dir_icon} `{coin}` avg `{avg:+.4f}%` ~${income:.1f}/день выбр `{op:.0f}%` | {oi_status} | {volume_status}")
     else:
         full_longs  = [(c,a,o) for c,a,o,d,cat,_ in passed if d=="LONG"  and cat=="full"]
         full_shorts = [(c,a,o) for c,a,o,d,cat,_ in passed if d=="SHORT" and cat=="full"]
@@ -1203,22 +1232,26 @@ async def an_run_scan(trigger, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"\n✅ 🟢 *ЛОНГ — ПОДХОДЯТ* ({len(full_longs)}):")
             for c,a,o in sorted(full_longs, key=lambda x: x[1]):
                 oi_status = await asyncio.to_thread(format_oi_status, exchange, c)
-                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%` | {oi_status}")
+                volume_status = await asyncio.to_thread(format_volume_status, exchange, c)
+                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%` | {oi_status} | {volume_status}")
         if full_shorts:
             lines.append(f"\n✅ 🔴 *ШОРТ — ПОДХОДЯТ* ({len(full_shorts)}):")
             for c,a,o in sorted(full_shorts, key=lambda x: -x[1]):
                 oi_status = await asyncio.to_thread(format_oi_status, exchange, c)
-                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%` | {oi_status}")
+                volume_status = await asyncio.to_thread(format_volume_status, exchange, c)
+                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%` | {oi_status} | {volume_status}")
         if part_longs:
             lines.append(f"\n⚡ 🟢 *ЛОНГ — ЧАСТИЧНО* ({len(part_longs)}):")
             for c,a,o in sorted(part_longs, key=lambda x: x[1]):
                 oi_status = await asyncio.to_thread(format_oi_status, exchange, c)
-                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%` | {oi_status}")
+                volume_status = await asyncio.to_thread(format_volume_status, exchange, c)
+                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%` | {oi_status} | {volume_status}")
         if part_shorts:
             lines.append(f"\n⚡ 🔴 *ШОРТ — ЧАСТИЧНО* ({len(part_shorts)}):")
             for c,a,o in sorted(part_shorts, key=lambda x: -x[1]):
                 oi_status = await asyncio.to_thread(format_oi_status, exchange, c)
-                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%` | {oi_status}")
+                volume_status = await asyncio.to_thread(format_volume_status, exchange, c)
+                lines.append(f"  `{c}` avg `{a:+.4f}%` выбр `{o:.0f}%` | {oi_status} | {volume_status}")
 
     reply = "\n".join(lines)
     if len(reply) > 4000:

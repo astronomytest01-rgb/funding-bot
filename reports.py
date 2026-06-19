@@ -7,7 +7,7 @@ from ai import gemini_analyze_bulk
 from analysis import analyze_rates, calc_std, get_active_exchanges, recent_trend_ok
 from config import AUTO_SCAN_AMOUNT, AUTO_SCAN_DAYS, GEMINI_API_KEY, REPORT_CHAT_ID, TEMPORARILY_DISABLED_EXCHANGES
 from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, EXCHANGE_SYMBOL_FETCHERS, phemex_get_all_symbols
-from oi import format_oi_status, is_oi_allowed
+from oi import format_oi_status, format_volume_status, is_oi_allowed, is_volume_allowed
 
 
 def temporary_disabled_text():
@@ -19,6 +19,7 @@ ENTRY_INSTRUCTIONS = """🛡️ *Главная задача — не потер
 📊 *Фильтры и анализ:*
 
 • 🐋 *Open Interest (OI):* В боте монеты с OI ниже *$500,000* скрываются автоматически. От *$500,000* до *$1,000,000* — только ⚠️ ручная осторожность. Для входа приоритет — *$1,000,000+* на конкретной бирже. Зайдя на свои *$15,000* в слабый OI, ты сам проломишь пустой стакан (как было с FLOW на Toobit), оторвешь цену фьючерса от спота и алгоритм может влепить штрафной отрицательный фандинг. Твой ордер не должен превышать *1–1.5%* от всего OI.
+• 📊 *24h Volume:* Монеты с подтверждённым оборотом ниже *$400,000* скрываются автоматически. От *$400,000* до *$2,000,000* — ⚠️ только ручная проверка стакана, spread и slippage.
 • *Прибыльность:* Фандинг стабильно *0.03% – 0.08%* (если меньше — невыгодно).
 • *Спред входа:* Строго *до -0.5%*.
 • *Ликвидность:* Смотреть суточный объем и сумму первых 5 ордеров в стакане.
@@ -108,6 +109,8 @@ def find_delta_pair_for_signal(coin, signal, days, active_exchanges):
             short_avg = info["avg"]
             if not is_oi_allowed(long_ex, coin) or not is_oi_allowed(short_ex, coin):
                 continue
+            if not is_volume_allowed(long_ex, coin) or not is_volume_allowed(short_ex, coin):
+                continue
             net = -long_avg + short_avg
             candidates.append((net, long_ex, short_ex, long_avg, short_avg, info["std"]))
     else:
@@ -118,6 +121,8 @@ def find_delta_pair_for_signal(coin, signal, days, active_exchanges):
                 continue
             long_avg = info["avg"]
             if not is_oi_allowed(long_ex, coin) or not is_oi_allowed(short_ex, coin):
+                continue
+            if not is_volume_allowed(long_ex, coin) or not is_volume_allowed(short_ex, coin):
                 continue
             net = -long_avg + short_avg
             candidates.append((net, long_ex, short_ex, long_avg, short_avg, info["std"]))
@@ -182,6 +187,9 @@ async def run_evening_report(context: ContextTypes.DEFAULT_TYPE, chat_id: int, m
             metrics = analyze_rates(ordered_rates)
             if metrics and metrics["category"] == "full" and recent_trend_ok(ordered_rates, metrics["direction"]):
                 if not is_oi_allowed(ex, coin):
+                    time.sleep(0.1)
+                    continue
+                if not is_volume_allowed(ex, coin):
                     time.sleep(0.1)
                     continue
                 key_avg = metrics["neg_avg"] if metrics["direction"] == "LONG" else metrics["pos_avg"]
@@ -256,10 +264,12 @@ async def run_evening_report(context: ContextTypes.DEFAULT_TYPE, chat_id: int, m
         approx_income = AUTO_SCAN_AMOUNT * (p["net_rate"] / 100) * 3
         long_oi = format_oi_status(p["long_ex"], p["coin"])
         short_oi = format_oi_status(p["short_ex"], p["coin"])
+        long_volume = format_volume_status(p["long_ex"], p["coin"])
+        short_volume = format_volume_status(p["short_ex"], p["coin"])
         lines.append(
             f"*{p['coin']}*\n"
-            f"  🟢 Лонг: `{long_label}` avg `{p['long_avg']:+.4f}%` | {long_oi}\n"
-            f"  🔴 Шорт: `{short_label}` avg `{p['short_avg']:+.4f}%` | {short_oi}\n"
+            f"  🟢 Лонг: `{long_label}` avg `{p['long_avg']:+.4f}%` | {long_oi} | {long_volume}\n"
+            f"  🔴 Шорт: `{short_label}` avg `{p['short_avg']:+.4f}%` | {short_oi} | {short_volume}\n"
             f"  📈 Чистый фандинг: `{p['net_rate']:+.4f}%` / ставку\n"
             f"  💰 Оценка: `${approx_income:.2f}` за 1 день\n"
         )

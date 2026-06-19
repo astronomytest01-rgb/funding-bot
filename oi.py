@@ -3,6 +3,8 @@ import requests
 
 OI_HIDE_BELOW_USD = 500_000
 OI_OK_USD = 1_000_000
+VOLUME_HIDE_BELOW_USD = 400_000
+VOLUME_OK_USD = 2_000_000
 
 COINGECKO_DERIVATIVE_IDS = {
     "phemex": "phemex_futures",
@@ -17,7 +19,10 @@ COINGECKO_DERIVATIVE_IDS = {
 
 _oi_cache = {}
 _oi_cache_ts = {}
+_volume_cache = {}
+_volume_cache_ts = {}
 _OI_CACHE_TTL = 10 * 60
+_VOLUME_CACHE_TTL = 5 * 60
 
 
 def _normalize_coin(coin):
@@ -51,6 +56,114 @@ def _extract_oi_usd(ticker):
         except (TypeError, ValueError):
             continue
     return None
+
+
+def _extract_volume_usd(ticker):
+    for key in (
+        "volume_24h",
+        "converted_volume_usd",
+        "converted_volume",
+        "trade_volume_24h_usd",
+        "volume_usd",
+    ):
+        value = ticker.get(key)
+        if isinstance(value, dict):
+            value = value.get("usd")
+        if value in (None, ""):
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _put_volume(result, coin, value):
+    if value is None:
+        return
+    coin = _normalize_coin(coin)
+    if not coin:
+        return
+    result[coin] = max(result.get(coin, 0), float(value))
+
+
+def _fetch_native_kucoin_volume_map():
+    r = requests.get("https://api-futures.kucoin.com/api/v1/contracts/active", timeout=10)
+    r.raise_for_status()
+    items = r.json().get("data", [])
+    result = {}
+    for item in items:
+        symbol = str(item.get("symbol") or "").upper()
+        if not symbol.endswith("USDTM"):
+            continue
+        try:
+            volume = float(item.get("turnoverOf24h") or 0)
+        except (TypeError, ValueError):
+            continue
+        base = str(item.get("displayBaseCurrency") or item.get("baseCurrency") or "").upper()
+        if base == "XBT":
+            _put_volume(result, "BTC", volume)
+        _put_volume(result, base, volume)
+    return result
+
+
+def _fetch_native_toobit_volume_map():
+    r = requests.get("https://api.toobit.com/quote/v1/contract/ticker/24hr", timeout=10)
+    r.raise_for_status()
+    items = r.json()
+    result = {}
+    for item in items if isinstance(items, list) else []:
+        symbol = str(item.get("s") or "").upper()
+        if not symbol.endswith("-SWAP-USDT"):
+            continue
+        try:
+            volume = float(item.get("qv") or 0)
+        except (TypeError, ValueError):
+            continue
+        _put_volume(result, symbol[:-len("-SWAP-USDT")], volume)
+    return result
+
+
+def _fetch_native_xt_volume_map():
+    r = requests.get("https://fapi.xt.com/future/market/v1/public/q/tickers", timeout=10)
+    r.raise_for_status()
+    items = r.json().get("result", [])
+    result = {}
+    for item in items:
+        symbol = str(item.get("s") or "").upper()
+        if not symbol.endswith("_USDT"):
+            continue
+        try:
+            volume = float(item.get("v") or 0)
+        except (TypeError, ValueError):
+            continue
+        _put_volume(result, symbol[:-len("_USDT")], volume)
+    return result
+
+
+def _fetch_native_phemex_volume_map():
+    r = requests.get("https://api.phemex.com/md/v2/ticker/24hr/all", timeout=10)
+    r.raise_for_status()
+    items = r.json().get("result", [])
+    result = {}
+    for item in items:
+        symbol = str(item.get("symbol") or "").upper()
+        if not symbol.endswith("USDT"):
+            continue
+        try:
+            volume = float(item.get("turnoverRv") or 0)
+        except (TypeError, ValueError):
+            continue
+        _put_volume(result, symbol[:-len("USDT")], volume)
+    return result
+
+
+NATIVE_VOLUME_FETCHERS = {
+    "kucoin": _fetch_native_kucoin_volume_map,
+    "toobit": _fetch_native_toobit_volume_map,
+    "xt": _fetch_native_xt_volume_map,
+    "phemex": _fetch_native_phemex_volume_map,
+}
 
 
 def get_exchange_oi_map(exchange):
@@ -92,9 +205,59 @@ def get_exchange_oi_map(exchange):
     return result
 
 
+def get_exchange_volume_map(exchange):
+    exchange = exchange.lower()
+    now = time.time()
+    if exchange in _volume_cache and now - _volume_cache_ts.get(exchange, 0) < _VOLUME_CACHE_TTL:
+        return _volume_cache[exchange]
+
+    result = {}
+    native_fetcher = NATIVE_VOLUME_FETCHERS.get(exchange)
+    if native_fetcher:
+        try:
+            result = native_fetcher()
+        except Exception:
+            result = {}
+
+    if not result:
+        cg_id = COINGECKO_DERIVATIVE_IDS.get(exchange)
+        if cg_id:
+            url = f"https://api.coingecko.com/api/v3/derivatives/exchanges/{cg_id}"
+            try:
+                r = requests.get(url, params={"include_tickers": "all"}, timeout=8)
+                if r.status_code == 429:
+                    return _volume_cache.get(exchange, {})
+                r.raise_for_status()
+                tickers = r.json().get("tickers") or []
+            except Exception:
+                return _volume_cache.get(exchange, {})
+            for ticker in tickers:
+                volume = _extract_volume_usd(ticker)
+                if volume is None:
+                    continue
+                base = str(ticker.get("base") or "").upper()
+                if base:
+                    _put_volume(result, base, volume)
+                symbol = str(ticker.get("symbol") or "").upper()
+                clean_symbol = symbol.replace("-", "").replace("_", "")
+                for suffix in ("USDT", "USD"):
+                    if clean_symbol.endswith(suffix):
+                        _put_volume(result, clean_symbol[:-len(suffix)], volume)
+
+    if result:
+        _volume_cache[exchange] = result
+        _volume_cache_ts[exchange] = now
+    return result or _volume_cache.get(exchange, {})
+
+
 def get_open_interest_usd(exchange, coin):
     oi_map = get_exchange_oi_map(exchange)
     return oi_map.get(_normalize_coin(coin))
+
+
+def get_24h_volume_usd(exchange, coin):
+    volume_map = get_exchange_volume_map(exchange)
+    return volume_map.get(_normalize_coin(coin))
 
 
 def is_oi_allowed(exchange, coin):
@@ -107,6 +270,12 @@ def is_oi_allowed(exchange, coin):
     return oi_usd is None or oi_usd >= OI_HIDE_BELOW_USD
 
 
+def is_volume_allowed(exchange, coin):
+    """Hard filter: hide only confirmed 24h turnover below $400k."""
+    volume_usd = get_24h_volume_usd(exchange, coin)
+    return volume_usd is None or volume_usd >= VOLUME_HIDE_BELOW_USD
+
+
 def format_oi_status(exchange, coin, order_usd=15_000):
     oi_usd = get_open_interest_usd(exchange, coin)
     if oi_usd is None:
@@ -117,3 +286,15 @@ def format_oi_status(exchange, coin, order_usd=15_000):
     if oi_usd >= OI_OK_USD:
         return f"✅ OI {oi_text} | $15k = {share_text}"
     return f"⚠️ OI {oi_text} | $15k = {share_text}"
+
+
+def format_volume_status(exchange, coin):
+    volume_usd = get_24h_volume_usd(exchange, coin)
+    if volume_usd is None:
+        return "⚠️ Vol24h: нет данных"
+    volume_text = f"${volume_usd:,.0f}"
+    if volume_usd < VOLUME_HIDE_BELOW_USD:
+        return f"🚫 Vol24h {volume_text}"
+    if volume_usd < VOLUME_OK_USD:
+        return f"⚠️ Vol24h {volume_text}"
+    return f"✅ Vol24h {volume_text}"
