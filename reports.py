@@ -1,9 +1,10 @@
+import asyncio
 import time
 
 import requests
 from telegram.ext import ContextTypes
 
-from ai import gemini_analyze_bulk
+from ai import gemini_analyze_bulk, get_last_gemini_error
 from analysis import analyze_rates, calc_std, get_active_exchanges, recent_trend_ok
 from config import AUTO_SCAN_AMOUNT, AUTO_SCAN_DAYS, GEMINI_API_KEY, REPORT_CHAT_ID, TEMPORARILY_DISABLED_EXCHANGES
 from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, EXCHANGE_SYMBOL_FETCHERS, phemex_get_all_symbols
@@ -13,6 +14,20 @@ from oi import format_oi_status, format_volume_status, is_oi_allowed, is_volume_
 def temporary_disabled_text():
     labels = [EXCHANGE_LABELS.get(e, e.upper()) for e in TEMPORARILY_DISABLED_EXCHANGES]
     return ", ".join(sorted(labels))
+
+
+async def gemini_report_recommendation(text_rows, days, chunk_index, total_chunks):
+    """Run Gemini outside the Telegram event loop with a hard report timeout."""
+    prompt_text = "\n".join(text_rows)
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(gemini_analyze_bulk, prompt_text, days, 20),
+            timeout=75,
+        )
+    except asyncio.TimeoutError:
+        return None
+    except Exception:
+        return None
 
 ENTRY_INSTRUCTIONS = """🛡️ *Главная задача — не потерять депозит.* Заработок вторичен.
 
@@ -222,21 +237,27 @@ async def run_evening_report(context: ContextTypes.DEFAULT_TYPE, chat_id: int, m
 
     report_coins = list(best_signal_by_coin.keys())
     gemini_chunks = []
+    gemini_errors = []
     if GEMINI_API_KEY:
         await context.bot.send_message(chat_id, f"🤖 Gemini готовит рекомендацию по {len(report_coins)} монетам, но не удаляет их из отчёта...")
         signals = list(best_signal_by_coin.values())
+        total_chunks = (len(signals) + 14) // 15
         for i in range(0, len(signals), 15):
             part = signals[i:i+15]
+            chunk_index = i // 15 + 1
             text_rows = []
             for s in part:
                 direction = "ЛОНГ" if s["direction"] == "LONG" else "ШОРТ"
                 text_rows.append(
                     f"- {s['coin']} ({direction}, {EXCHANGE_LABELS.get(s['exchange'], s['exchange'])}, avg {s['avg']:+.4f}%)"
                 )
-            answer = gemini_analyze_bulk("\n".join(text_rows), AUTO_SCAN_DAYS)
+            answer = await gemini_report_recommendation(text_rows, AUTO_SCAN_DAYS, chunk_index, total_chunks)
             if answer:
                 gemini_chunks.append(answer)
-            time.sleep(3)
+            else:
+                reason = get_last_gemini_error() or "timeout/no response"
+                gemini_errors.append(f"порция {chunk_index}/{total_chunks}: {reason}")
+            await asyncio.sleep(1)
     else:
         await context.bot.send_message(chat_id, "⚠️ GEMINI_API_KEY не задан: блок рекомендации Gemini пропущен.")
 
@@ -252,6 +273,12 @@ async def run_evening_report(context: ContextTypes.DEFAULT_TYPE, chat_id: int, m
             gemini_report = "🤖 *Gemini-рекомендация* — не фильтр, а ручная проверка:\n\n" + "\n".join(gemini_chunks)
             for chunk in [gemini_report[i:i+4000] for i in range(0, len(gemini_report), 4000)]:
                 await context.bot.send_message(chat_id, chunk, parse_mode="Markdown")
+        elif gemini_errors:
+            await context.bot.send_message(
+                chat_id,
+                "⚠️ Gemini не успел подготовить рекомендацию, отчёт не остановлен.\n"
+                + "\n".join(gemini_errors[:3]),
+            )
         await send_entry_instructions(context, chat_id)
         return
 
@@ -283,6 +310,12 @@ async def run_evening_report(context: ContextTypes.DEFAULT_TYPE, chat_id: int, m
         gemini_report = "🤖 *Gemini-рекомендация* — не фильтр, а ручная проверка:\n\n" + "\n".join(gemini_chunks)
         for chunk in [gemini_report[i:i+4000] for i in range(0, len(gemini_report), 4000)]:
             await context.bot.send_message(chat_id, chunk, parse_mode="Markdown")
+    elif gemini_errors:
+        await context.bot.send_message(
+            chat_id,
+            "⚠️ Gemini не успел подготовить рекомендацию, основной отчёт отправлен без AI-блока.\n"
+            + "\n".join(gemini_errors[:3]),
+        )
 
     await send_entry_instructions(context, chat_id)
 

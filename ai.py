@@ -93,11 +93,11 @@ def gemini_generate(prompt, temperature=0.3, timeout=30):
     return None
 
 
-def gemini_analyze_bulk(coins_list_text, days):
+def gemini_analyze_bulk(coins_list_text, days, timeout=30):
     return gemini_generate(
         GEMINI_BULK_PROMPT.format(coins_list=coins_list_text, days=days),
         temperature=0.2,
-        timeout=30,
+        timeout=timeout,
     )
 
 
@@ -169,5 +169,4 @@ async def send_gemini_scan_review(msg, passed, days):
         text = "🤖 Gemini не оставил монет после фундаментального фильтра."
     for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
         await msg.reply_text(chunk)
-
 
