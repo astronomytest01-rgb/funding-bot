@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets
 import time
 from dataclasses import dataclass
 
 import requests
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 from analysis import calc_std
@@ -18,7 +20,8 @@ LONGTERM_DAYS = int(os.getenv("LONGTERM_DAYS", "7"))
 LONGTERM_AMOUNT_PER_LEG = float(os.getenv("LONGTERM_AMOUNT_PER_LEG", "20000"))
 LONGTERM_MIN_MONTHLY_USD = float(os.getenv("LONGTERM_MIN_MONTHLY_USD", "300"))
 LONGTERM_SYMBOL_LIMIT = int(os.getenv("LONGTERM_SYMBOL_LIMIT", "180"))
-LONGTERM_TOP_COINS = int(os.getenv("LONGTERM_TOP_COINS", "10"))
+LONGTERM_TOP_COINS = int(os.getenv("LONGTERM_TOP_COINS", "60"))
+LONGTERM_PAGE_SIZE = int(os.getenv("LONGTERM_PAGE_SIZE", "5"))
 LONGTERM_VARIANTS_PER_COIN = int(os.getenv("LONGTERM_VARIANTS_PER_COIN", "4"))
 LONGTERM_MIN_OI_WARN_USD = float(os.getenv("LONGTERM_MIN_OI_WARN_USD", "1000000"))
 LONGTERM_MIN_VOL_WARN_USD = float(os.getenv("LONGTERM_MIN_VOL_WARN_USD", "400000"))
@@ -27,6 +30,8 @@ LONGTERM_EXAMPLE_SYMBOLS = ("BCH", "XMR", "AMZNX", "ATH")
 _cg_market_cache = {}
 _cg_market_cache_ts = {}
 _CG_CACHE_TTL = 15 * 60
+_longterm_sessions = {}
+_SESSION_TTL = 30 * 60
 
 
 @dataclass(frozen=True)
@@ -286,6 +291,7 @@ def scan_longterm_funding(days=LONGTERM_DAYS, active_exchanges=None):
         "symbols_scanned": len(symbols),
         "pairs_found": len(ranked),
         "groups": [(symbol, grouped[symbol]) for symbol in top_symbols[:LONGTERM_TOP_COINS]],
+        "groups_total": len(grouped),
         "errors": errors,
         "active_exchanges": active,
     }
@@ -300,6 +306,8 @@ def format_longterm_summary(result):
         f"Размер: `${LONGTERM_AMOUNT_PER_LEG:,.0f}` на ногу\n"
         f"Монет проверено: `{result['symbols_scanned']}`\n"
         f"Связок найдено: `{result['pairs_found']}`\n\n"
+        f"Монет с вариантами: `{result.get('groups_total', len(result['groups']))}`\n"
+        f"Показываю порциями по `{LONGTERM_PAGE_SIZE}` монет\n\n"
         "OI/24h volume не фильтруют результат, только дают warning."
     )
 
@@ -325,6 +333,71 @@ def format_longterm_coin(symbol, pairs):
     return "\n".join(lines)
 
 
+def _cleanup_sessions():
+    now = time.time()
+    expired = [
+        token for token, session in _longterm_sessions.items()
+        if now - session.get("created_at", 0) > _SESSION_TTL
+    ]
+    for token in expired:
+        _longterm_sessions.pop(token, None)
+
+
+def _save_session(result):
+    _cleanup_sessions()
+    token = secrets.token_urlsafe(6)
+    _longterm_sessions[token] = {
+        "created_at": time.time(),
+        "groups": result["groups"],
+    }
+    return token
+
+
+def _more_markup(token, next_offset, total):
+    if next_offset >= total:
+        return None
+    count = min(LONGTERM_PAGE_SIZE, total - next_offset)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Показать ещё {count}", callback_data=f"lt_more:{token}:{next_offset}")]
+    ])
+
+
+async def send_longterm_page(bot, chat_id, token, offset):
+    session = _longterm_sessions.get(token)
+    if not session:
+        await bot.send_message(chat_id, "Сессия longfunding устарела. Запусти /longfunding ещё раз.")
+        return
+
+    groups = session["groups"]
+    total = len(groups)
+    end = min(offset + LONGTERM_PAGE_SIZE, total)
+    for symbol, pairs in groups[offset:end]:
+        await bot.send_message(chat_id, format_longterm_coin(symbol, pairs), parse_mode="Markdown")
+
+    markup = _more_markup(token, end, total)
+    if markup:
+        await bot.send_message(
+            chat_id,
+            f"Показано `{end}` из `{total}` монет.",
+            parse_mode="Markdown",
+            reply_markup=markup,
+        )
+    else:
+        await bot.send_message(chat_id, f"Готово. Показано {total} монет.")
+
+
+async def longterm_more_callback(update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _prefix, token, offset_raw = query.data.split(":", 2)
+        offset = int(offset_raw)
+    except Exception:
+        await query.message.reply_text("Не смог открыть следующую порцию. Запусти /longfunding ещё раз.")
+        return
+    await send_longterm_page(context.bot, query.message.chat_id, token, offset)
+
+
 async def send_longterm_report(bot, chat_id, manual=False):
     prefix = "🔎 Запускаю долгосрочный funding scan..." if manual else "🕘 Авто-скан долгосрочного funding запущен..."
     await bot.send_message(chat_id, prefix)
@@ -333,8 +406,8 @@ async def send_longterm_report(bot, chat_id, manual=False):
     if not result["groups"]:
         await bot.send_message(chat_id, "✅ Подходящих долгосрочных связок сейчас нет.")
         return
-    for symbol, pairs in result["groups"]:
-        await bot.send_message(chat_id, format_longterm_coin(symbol, pairs), parse_mode="Markdown")
+    token = _save_session(result)
+    await send_longterm_page(bot, chat_id, token, 0)
 
 
 async def auto_longterm_job(context: ContextTypes.DEFAULT_TYPE):

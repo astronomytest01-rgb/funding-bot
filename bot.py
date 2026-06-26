@@ -41,7 +41,7 @@ from config import (
     TEMPORARILY_DISABLED_EXCHANGES,
 )
 from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, EXCHANGE_SYMBOL_FETCHERS, phemex_fetch, phemex_get_all_symbols
-from longterm import auto_longterm_job, send_longterm_report
+from longterm import auto_longterm_job, longterm_more_callback, send_longterm_report
 from oi import (
     OI_HIDE_BELOW_USD,
     OI_OK_USD,
@@ -2102,6 +2102,7 @@ def main():
     app.add_handler(CommandHandler("report",    cmd_report))
     app.add_handler(CommandHandler("longfunding", cmd_longfunding))
     app.add_handler(CommandHandler("instruction", cmd_instruction))
+    app.add_handler(CallbackQueryHandler(longterm_more_callback, pattern="^lt_more:"))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern="^set_"))
     # Critical direct AI handler: keep before ConversationHandlers and unknown.
     app.add_handler(CommandHandler("ai", ai_direct_start), group=-1)
