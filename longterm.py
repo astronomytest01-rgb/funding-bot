@@ -10,8 +10,9 @@ import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
+from ai import gemini_generate, get_last_gemini_error
 from analysis import calc_std
-from config import EXCHANGES_ENABLED, REPORT_CHAT_ID, TEMPORARILY_DISABLED_EXCHANGES
+from config import EXCHANGES_ENABLED, GEMINI_API_KEY, REPORT_CHAT_ID, TEMPORARILY_DISABLED_EXCHANGES
 from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, EXCHANGE_SYMBOL_FETCHERS, phemex_get_all_symbols
 from oi import COINGECKO_DERIVATIVE_IDS
 
@@ -23,6 +24,8 @@ LONGTERM_SYMBOL_LIMIT = int(os.getenv("LONGTERM_SYMBOL_LIMIT", "180"))
 LONGTERM_TOP_COINS = int(os.getenv("LONGTERM_TOP_COINS", "60"))
 LONGTERM_PAGE_SIZE = int(os.getenv("LONGTERM_PAGE_SIZE", "5"))
 LONGTERM_VARIANTS_PER_COIN = int(os.getenv("LONGTERM_VARIANTS_PER_COIN", "4"))
+LONGTERM_GEMINI_FILTER = os.getenv("LONGTERM_GEMINI_FILTER", "1").lower() not in ("0", "false", "off", "no")
+LONGTERM_GEMINI_CHUNK_SIZE = int(os.getenv("LONGTERM_GEMINI_CHUNK_SIZE", "15"))
 LONGTERM_MIN_OI_WARN_USD = float(os.getenv("LONGTERM_MIN_OI_WARN_USD", "1000000"))
 LONGTERM_MIN_VOL_WARN_USD = float(os.getenv("LONGTERM_MIN_VOL_WARN_USD", "400000"))
 LONGTERM_EXAMPLE_SYMBOLS = ("BCH", "XMR", "AMZNX", "ATH")
@@ -32,6 +35,23 @@ _cg_market_cache_ts = {}
 _CG_CACHE_TTL = 15 * 60
 _longterm_sessions = {}
 _SESSION_TTL = 30 * 60
+
+LONGTERM_GEMINI_PROMPT = """Действуй как риск-менеджер криптофонда для долгосрочной delta-neutral funding стратегии.
+Бот уже посчитал funding. Твоя задача НЕ пересчитывать funding, а отфильтровать только качество актива.
+
+Нужно оставить только монеты, в которые теоретически можно заходить на долгосрок с плечом x3-x4 и не бояться типичного пампа/дампа 30-50% за день.
+Исключай мемкоины, микрокапы, хайповые щиткоины, активы без устойчивой капитализации/инфраструктуры, токены с высоким риском скама, манипуляций или резких свечей.
+Приоритет: крупные/понятные активы, устойчивая ликвидность, серьёзная инфраструктура, меньше риск внезапной новости/делистинга/манипуляции.
+
+Список кандидатов после funding-математики:
+{coins_list}
+
+Верни ТОЛЬКО монеты, которые стоит оставить для ручной проверки.
+Формат каждой строки строго:
+KEEP TICKER — причина 3-8 слов
+
+Если ничего не подходит, напиши:
+NO_KEEPERS"""
 
 
 @dataclass(frozen=True)
@@ -299,6 +319,12 @@ def scan_longterm_funding(days=LONGTERM_DAYS, active_exchanges=None):
 
 def format_longterm_summary(result):
     labels = ", ".join(EXCHANGE_LABELS.get(exchange, exchange.upper()) for exchange in result["active_exchanges"])
+    before_gemini = result.get("groups_before_gemini")
+    gemini_line = (
+        f"После Gemini longterm-фильтра: `{len(result['groups'])}` из `{before_gemini}` монет\n"
+        if before_gemini is not None
+        else ""
+    )
     return (
         "🧲 *Долгосрочный funding scan*\n\n"
         f"Биржи: `{labels}`\n"
@@ -307,6 +333,7 @@ def format_longterm_summary(result):
         f"Монет проверено: `{result['symbols_scanned']}`\n"
         f"Связок найдено: `{result['pairs_found']}`\n\n"
         f"Монет с вариантами: `{result.get('groups_total', len(result['groups']))}`\n"
+        f"{gemini_line}"
         f"Показываю порциями по `{LONGTERM_PAGE_SIZE}` монет\n\n"
         "OI/24h volume не фильтруют результат, только дают warning."
     )
@@ -331,6 +358,78 @@ def format_longterm_coin(symbol, pairs):
         if warnings:
             lines.append("    ⚠️ " + " | ".join(warnings))
     return "\n".join(lines)
+
+
+def _gemini_candidate_row(symbol, pairs):
+    best = pairs[0]
+    routes = []
+    for pair in pairs[:2]:
+        long_label = EXCHANGE_LABELS.get(pair.long.exchange, pair.long.exchange.upper())
+        short_label = EXCHANGE_LABELS.get(pair.short.exchange, pair.short.exchange.upper())
+        routes.append(
+            f"{long_label} long avg {pair.long.avg:+.4f}% / "
+            f"{short_label} short avg {pair.short.avg:+.4f}%"
+        )
+    warnings = _liquidity_warnings(best)
+    warning_text = "; warnings: " + " | ".join(warnings) if warnings else ""
+    return f"- {symbol}: best ~${best.monthly_usd:,.0f}/month; routes: {'; '.join(routes)}{warning_text}"
+
+
+def _extract_gemini_keep_symbols(answer, candidates):
+    if not answer or "NO_KEEPERS" in answer.upper():
+        return set()
+    allowed = {symbol.upper(): symbol for symbol in candidates}
+    keep = set()
+    for raw_line in answer.splitlines():
+        line = raw_line.strip()
+        if not line.upper().startswith("KEEP "):
+            continue
+        token = line.split(" ", 1)[1].split("—", 1)[0].split("-", 1)[0].strip().upper()
+        token = token.replace("$", "").replace("`", "").replace("*", "")
+        if token in allowed:
+            keep.add(allowed[token])
+    return keep
+
+
+def apply_longterm_gemini_filter(result):
+    """Filter longterm groups by asset quality. If Gemini fails, return result unchanged."""
+    if not GEMINI_API_KEY or not LONGTERM_GEMINI_FILTER or not result.get("groups"):
+        return result, None
+
+    groups = result["groups"]
+    kept_symbols = set()
+    ai_notes = []
+    errors = []
+    for i in range(0, len(groups), LONGTERM_GEMINI_CHUNK_SIZE):
+        chunk = groups[i:i + LONGTERM_GEMINI_CHUNK_SIZE]
+        symbols = [symbol for symbol, _pairs in chunk]
+        prompt = LONGTERM_GEMINI_PROMPT.format(
+            coins_list="\n".join(_gemini_candidate_row(symbol, pairs) for symbol, pairs in chunk)
+        )
+        answer = gemini_generate(prompt, temperature=0.1, timeout=20)
+        if not answer:
+            errors.append(get_last_gemini_error() or "no response")
+            continue
+        kept_symbols.update(_extract_gemini_keep_symbols(answer, symbols))
+        ai_notes.append(answer)
+        time.sleep(1)
+
+    if errors and not ai_notes:
+        return result, "⚠️ Gemini-фильтр долгосрока не ответил, показываю математический результат без AI-фильтра: " + errors[0]
+
+    filtered_groups = [(symbol, pairs) for symbol, pairs in groups if symbol in kept_symbols]
+    filtered = dict(result)
+    filtered["groups_before_gemini"] = len(groups)
+    filtered["groups"] = filtered_groups
+    filtered["gemini_notes"] = ai_notes
+    filtered["gemini_errors"] = errors
+    note = (
+        f"🤖 Gemini longterm-фильтр: оставил {len(filtered_groups)} из {len(groups)} монет "
+        "по критерию качества актива для долгосрока."
+    )
+    if errors:
+        note += f"\n⚠️ Часть Gemini-порций не ответила: {errors[0]}"
+    return filtered, note
 
 
 def _cleanup_sessions():
@@ -402,6 +501,14 @@ async def send_longterm_report(bot, chat_id, manual=False):
     prefix = "🔎 Запускаю долгосрочный funding scan..." if manual else "🕘 Авто-скан долгосрочного funding запущен..."
     await bot.send_message(chat_id, prefix)
     result = await asyncio.to_thread(scan_longterm_funding)
+    if GEMINI_API_KEY and LONGTERM_GEMINI_FILTER and result.get("groups"):
+        await bot.send_message(
+            chat_id,
+            "🤖 Gemini проверяет монеты на долгосрок: капитализация, серьёзность, риск 30-50% свечи, мем/скам риск...",
+        )
+        result, gemini_note = await asyncio.to_thread(apply_longterm_gemini_filter, result)
+        if gemini_note:
+            await bot.send_message(chat_id, gemini_note)
     await bot.send_message(chat_id, format_longterm_summary(result), parse_mode="Markdown")
     if not result["groups"]:
         await bot.send_message(chat_id, "✅ Подходящих долгосрочных связок сейчас нет.")
