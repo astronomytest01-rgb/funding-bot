@@ -41,6 +41,7 @@ from config import (
     TEMPORARILY_DISABLED_EXCHANGES,
 )
 from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, EXCHANGE_SYMBOL_FETCHERS, phemex_fetch, phemex_get_all_symbols
+from longterm import auto_longterm_job, send_longterm_report
 from oi import (
     OI_HIDE_BELOW_USD,
     OI_OK_USD,
@@ -125,7 +126,7 @@ def parse_tokens(text):
         if p in ("/exchange", "--exchange") and i + 1 < len(parts):
             exchange = parts[i + 1].lower(); i += 2; continue
         # пропускаем команды вида /filter если вдруг попали в текст
-        if p in ("/filter", "/funding", "/calculator", "/start", "/help", "/settings", "/report", "/instruction", "/ai", "/oi", "/cancel"):
+        if p in ("/filter", "/funding", "/calculator", "/start", "/help", "/settings", "/report", "/longfunding", "/instruction", "/ai", "/oi", "/cancel"):
             i += 1; continue
         # Распознаём название биржи без префикса; активность проверяется позднее.
         if p in KNOWN_EXCHANGES:
@@ -544,6 +545,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/oi — пошаговая проверка Open Interest и 24h volume по монете\n"
         "/findpair — дельта-нейтраль: найти пару лонг+шорт\n"
         "/report — запустить вечерний отчёт вручную\n"
+        "/longfunding — долгосрочные стабильные funding-связки\n"
         "/instruction — инструкция входа и риск-проверок\n"
         "/settings — настройки и управление биржами\n"
         "/help — справка\n\n"
@@ -567,6 +569,10 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_instruction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_entry_instructions(context, update.effective_chat.id)
+
+
+async def cmd_longfunding(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_longterm_report(context.bot, update.effective_chat.id, manual=True)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2094,6 +2100,7 @@ def main():
     app.add_handler(CommandHandler("help",      cmd_help))
     app.add_handler(CommandHandler("settings",  cmd_settings_new))
     app.add_handler(CommandHandler("report",    cmd_report))
+    app.add_handler(CommandHandler("longfunding", cmd_longfunding))
     app.add_handler(CommandHandler("instruction", cmd_instruction))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern="^set_"))
     # Critical direct AI handler: keep before ConversationHandlers and unknown.
@@ -2153,12 +2160,14 @@ def main():
 
     if REPORT_CHAT_ID and app.job_queue:
         app.job_queue.run_daily(auto_scan_job, time=dt_time(hour=17, minute=0, second=0, tzinfo=timezone.utc))
+        app.job_queue.run_daily(auto_longterm_job, time=dt_time(hour=18, minute=0, second=0, tzinfo=timezone.utc))
 
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
     print("Бот запущен...")
     if REPORT_CHAT_ID:
         print("Вечерний отчёт включён: 20:00 Europe/Kyiv / 17:00 UTC")
+        print("Longterm funding отчёт включён: 21:00 Europe/Kyiv / 18:00 UTC")
     app.run_polling()
 
 
