@@ -501,7 +501,7 @@ async def send_longterm_report(bot, chat_id, manual=False):
     prefix = "🔎 Запускаю долгосрочный funding scan..." if manual else "🕘 Авто-скан долгосрочного funding запущен..."
     await bot.send_message(chat_id, prefix)
     result = await asyncio.to_thread(scan_longterm_funding)
-    if GEMINI_API_KEY and LONGTERM_GEMINI_FILTER and result.get("groups"):
+    if not manual and GEMINI_API_KEY and LONGTERM_GEMINI_FILTER and result.get("groups"):
         await bot.send_message(
             chat_id,
             "🤖 Gemini проверяет монеты на долгосрок: капитализация, серьёзность, риск 30-50% свечи, мем/скам риск...",
