@@ -32,9 +32,9 @@ EXCHANGES_ENABLED = {
     "bingx": True,
     # CoinW/Bitunix API-код оставлен в проекте, но биржи временно скрыты
     # из команд, кнопок, /analyze и вечернего отчёта.
-    "coinw": False,
+    "coinw": True,
     "kucoin": True,
     "bitunix": False,
 }
 
-TEMPORARILY_DISABLED_EXCHANGES = {"coinw", "bitunix"}
+TEMPORARILY_DISABLED_EXCHANGES = {"bitunix"}
