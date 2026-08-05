@@ -89,20 +89,20 @@ AUTO_REPORT_MIN_ENTRY_SPREAD_PCT = -0.8
 Активные биржи:
 
 ```text
-phemex, xt, toobit, okx, bingx, kucoin
+binance, bybit, phemex, xt, toobit, okx, gate, bingx, coinw, kucoin
 ```
 
 Временно отключены и скрыты из команд, кнопок, `/analyze`, `/report`, `/oi`, `/funding`, `/filter`, `/calculator` и delta-подбора:
 
 ```text
-coinw, bitunix
+bitunix
 ```
 
-Код API-подключений CoinW и Bitunix сохранён в `exchanges.py`, `oi.py` и связанных местах. Для быстрого возврата нужно убрать биржи из `TEMPORARILY_DISABLED_EXCHANGES` и вернуть `True` в `EXCHANGES_ENABLED`.
+Код API-подключения Bitunix сохранён в `exchanges.py`, `oi.py` и связанных местах. Для быстрого возврата нужно убрать биржу из `TEMPORARILY_DISABLED_EXCHANGES` и вернуть `True` в `EXCHANGES_ENABLED`.
 
 Toobit `/analyze` uses native `/api/v1/exchangeInfo` futures `contracts`, not the Phemex fallback list. This includes Toobit-only TradFi/commodity contracts such as `GER40` and `NG`.
 
-XT, Toobit and KuCoin `/analyze` use native exchange symbol lists instead of the Phemex fallback universe.
+Binance, Bybit, Gate, XT, Toobit and KuCoin `/analyze` use native exchange symbol lists instead of the Phemex fallback universe.
 
 ## Фильтры анализа
 
@@ -317,12 +317,15 @@ help - Справка
 
 | Ключ | Название | Источник |
 |------|----------|----------|
+| `binance` | Binance | public fundingRate + native exchangeInfo |
+| `bybit` | Bybit | public funding/history + native instruments-info |
 | `phemex` | Phemex | public funding-rate-history |
 | `xt` | XT | public funding-rate-record + native symbol list |
 | `toobit` | Toobit | public historyFundingRate + native `/api/v1/exchangeInfo` futures list |
 | `okx` | OKX | public funding-rate-history |
+| `gate` | Gate | public futures funding_rate + native contracts list |
 | `bingx` | BingX | public fundingRate |
-| `coinw` | CoinW | Supabase collector, table `funding_rates`; временно отключена в `EXCHANGES_ENABLED` |
+| `coinw` | CoinW | Supabase collector, table `funding_rates` |
 | `kucoin` | KuCoin | public contract funding-rates |
 | `bitunix` | Bitunix | public get_funding_rate_history; временно отключена в `EXCHANGES_ENABLED` |
 
@@ -373,13 +376,13 @@ longterm.py  - long-term stable funding scan and 21:00 auto job
 17. Ручной `/longfunding` не использует Gemini; auto job в 21:00 с `GEMINI_API_KEY` фильтрует активы по долгосрочному качеству, исключая мемкоины, микрокапы и высокий риск резких свечей.
 18. `/longfunding` отдаёт результаты порциями и кнопка `Показать ещё` показывает следующую порцию без повторного скана.
 19. Longterm auto job запускается в 21:00 Europe/Kyiv / 18:00 UTC при наличии `REPORT_CHAT_ID`.
-20. CoinW и Bitunix временно отключены: они не появляются в кнопках и не работают через прямые команды, но API-код сохранён для быстрого возврата.
+20. Bitunix временно отключена: она не появляется в кнопках и не работает через прямые команды, но API-код сохранён для быстрого возврата.
 21. Оба `.md` файла обновлены перед push.
 
 ## Ограничения
 
 1. `/settings` хранит состояние только в памяти.
-2. CoinW зависит от Supabase collector и сейчас временно отключена вместе с Bitunix.
+2. CoinW зависит от Supabase collector.
 3. Gemini может ошибаться; это только риск-фильтр.
 4. Вечерний скан может занимать несколько минут.
 5. Telegram режет сообщения длиннее примерно 4096 символов, бот отправляет чанки.

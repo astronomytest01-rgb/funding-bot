@@ -37,6 +37,62 @@ def phemex_fetch(coin, start_ms, end_ms):
 
 
 # ─────────────────────────────────────────────
+# BINANCE API
+# ─────────────────────────────────────────────
+
+
+def binance_symbol_for_coin(coin):
+    coin = coin.upper()
+    if coin.endswith("USDT"):
+        return coin
+    if coin.endswith("USD"):
+        return f"{coin[:-3]}USDT"
+    return f"{coin}USDT"
+
+
+def binance_fetch(coin, start_ms, end_ms):
+    """Binance USD-M funding history. Rates are fractional: 0.0001 = 0.01%."""
+    sym = binance_symbol_for_coin(coin)
+    try:
+        url = "https://fapi.binance.com/fapi/v1/fundingRate"
+        params = {"symbol": sym, "startTime": start_ms, "endTime": end_ms, "limit": 1000}
+        r = requests.get(url, params=params, timeout=6)
+        if r.status_code in (418, 429, 451):
+            return [], f"Binance HTTP {r.status_code}: {r.text[:200]}"
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list):
+            return [], f"Unexpected response: {str(data)[:120]}"
+        rows = []
+        for x in data:
+            ts = int(x.get("fundingTime", 0))
+            if start_ms <= ts <= end_ms:
+                rows.append((ts, float(x.get("fundingRate", 0)) * 100))
+        return sorted(rows, key=lambda x: x[0]), sym
+    except Exception as e:
+        return [], str(e)
+
+
+def binance_get_all_symbols():
+    url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+    r = requests.get(url, timeout=10)
+    if r.status_code in (418, 429, 451):
+        raise ValueError(f"Binance HTTP {r.status_code}: {r.text[:200]}")
+    r.raise_for_status()
+    data = r.json()
+    coins = []
+    seen = set()
+    for item in data.get("symbols", []):
+        if item.get("contractType") != "PERPETUAL" or item.get("quoteAsset") != "USDT" or item.get("status") != "TRADING":
+            continue
+        coin = str(item.get("baseAsset") or "").upper()
+        if coin and coin not in seen:
+            coins.append(coin)
+            seen.add(coin)
+    return coins
+
+
+# ─────────────────────────────────────────────
 # XT API
 # ─────────────────────────────────────────────
 
@@ -285,6 +341,72 @@ def okx_fetch(coin, start_ms, end_ms):
 
 
 # ─────────────────────────────────────────────
+# BYBIT API
+# ─────────────────────────────────────────────
+
+
+def bybit_symbol_for_coin(coin):
+    coin = coin.upper()
+    if coin.endswith("USDT"):
+        return coin
+    if coin.endswith("USD"):
+        return f"{coin[:-3]}USDT"
+    return f"{coin}USDT"
+
+
+def bybit_fetch(coin, start_ms, end_ms):
+    """Bybit linear funding history. Rates are fractional: 0.0001 = 0.01%."""
+    sym = bybit_symbol_for_coin(coin)
+    try:
+        url = "https://api.bybit.com/v5/market/funding/history"
+        params = {"category": "linear", "symbol": sym, "startTime": start_ms, "endTime": end_ms, "limit": 200}
+        r = requests.get(url, params=params, timeout=6)
+        if r.status_code in (403, 429, 451):
+            return [], f"Bybit HTTP {r.status_code}: {r.text[:200]}"
+        r.raise_for_status()
+        data = r.json()
+        if data.get("retCode") != 0:
+            return [], data.get("retMsg", "Bybit API error")
+        result = data.get("result", {}) if isinstance(data, dict) else {}
+        rows = []
+        for x in result.get("list", []):
+            ts = int(x.get("fundingRateTimestamp") or x.get("fundingTime") or 0)
+            if start_ms <= ts <= end_ms:
+                rows.append((ts, float(x.get("fundingRate", 0)) * 100))
+        return sorted(rows, key=lambda x: x[0]), sym
+    except Exception as e:
+        return [], str(e)
+
+
+def bybit_get_all_symbols():
+    coins = []
+    seen = set()
+    cursor = ""
+    while True:
+        params = {"category": "linear", "limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+        r = requests.get("https://api.bybit.com/v5/market/instruments-info", params=params, timeout=10)
+        if r.status_code in (403, 429, 451):
+            raise ValueError(f"Bybit HTTP {r.status_code}: {r.text[:200]}")
+        r.raise_for_status()
+        data = r.json()
+        if data.get("retCode") != 0:
+            raise ValueError(data.get("retMsg", "Bybit API error"))
+        result = data.get("result", {})
+        for item in result.get("list", []):
+            if item.get("quoteCoin") != "USDT" or item.get("status") != "Trading":
+                continue
+            coin = str(item.get("baseCoin") or "").upper()
+            if coin and coin not in seen:
+                coins.append(coin)
+                seen.add(coin)
+        cursor = result.get("nextPageCursor") or ""
+        if not cursor:
+            return coins
+
+
+# ─────────────────────────────────────────────
 # BINGX API
 # ─────────────────────────────────────────────
 
@@ -402,6 +524,65 @@ def kucoin_get_all_symbols():
             continue
         coin = "BTC" if coin.upper() == "XBT" else coin.upper()
         if coin not in seen:
+            coins.append(coin)
+            seen.add(coin)
+    return coins
+
+
+# ─────────────────────────────────────────────
+# GATE API
+# ─────────────────────────────────────────────
+
+
+def gate_symbol_for_coin(coin):
+    coin = coin.upper()
+    if coin.endswith("USDT"):
+        return f"{coin[:-4]}_USDT"
+    if coin.endswith("USD"):
+        return f"{coin[:-3]}_USDT"
+    return f"{coin}_USDT"
+
+
+def gate_fetch(coin, start_ms, end_ms):
+    """Gate USDT futures funding history. Rates are fractional: 0.0001 = 0.01%."""
+    sym = gate_symbol_for_coin(coin)
+    try:
+        url = "https://api.gateio.ws/api/v4/futures/usdt/funding_rate"
+        params = {"contract": sym, "from": start_ms // 1000, "to": end_ms // 1000, "limit": 1000}
+        r = requests.get(url, params=params, timeout=6)
+        if r.status_code in (403, 429, 451):
+            return [], f"Gate HTTP {r.status_code}: {r.text[:200]}"
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list):
+            return [], f"Unexpected response: {str(data)[:120]}"
+        rows = []
+        for x in data:
+            ts = int(x.get("t") or x.get("time") or 0) * 1000
+            if start_ms <= ts <= end_ms:
+                rows.append((ts, float(x.get("r") or x.get("rate") or 0) * 100))
+        return sorted(rows, key=lambda x: x[0]), sym
+    except Exception as e:
+        return [], str(e)
+
+
+def gate_get_all_symbols():
+    url = "https://api.gateio.ws/api/v4/futures/usdt/contracts"
+    r = requests.get(url, timeout=10)
+    if r.status_code in (403, 429, 451):
+        raise ValueError(f"Gate HTTP {r.status_code}: {r.text[:200]}")
+    r.raise_for_status()
+    data = r.json()
+    coins = []
+    seen = set()
+    for item in data if isinstance(data, list) else []:
+        name = str(item.get("name") or "").upper()
+        in_delisting = bool(item.get("in_delisting"))
+        trade_size = float(item.get("trade_size") or 0)
+        if not name.endswith("_USDT") or in_delisting or trade_size <= 0:
+            continue
+        coin = name[:-5]
+        if coin and coin not in seen:
             coins.append(coin)
             seen.add(coin)
     return coins
@@ -555,10 +736,13 @@ def phemex_get_all_symbols():
 
 
 EXCHANGE_FETCHERS = {
+    "binance": binance_fetch,
+    "bybit": bybit_fetch,
     "phemex": phemex_fetch,
     "xt": xt_fetch,
     "toobit": toobit_fetch,
     "okx": okx_fetch,
+    "gate": gate_fetch,
     "bingx": bingx_fetch,
     "coinw": coinw_fetch,
     "kucoin": kucoin_fetch,
@@ -566,19 +750,25 @@ EXCHANGE_FETCHERS = {
 }
 
 EXCHANGE_SYMBOL_FETCHERS = {
+    "binance": binance_get_all_symbols,
+    "bybit": bybit_get_all_symbols,
     "phemex": phemex_get_all_symbols,
     "xt": xt_get_all_symbols,
     "toobit": toobit_get_all_symbols,
+    "gate": gate_get_all_symbols,
     "coinw": None,
     "kucoin": kucoin_get_all_symbols,
     "bitunix": bitunix_get_all_symbols,
 }
 
 EXCHANGE_LABELS = {
+    "binance": "Binance",
+    "bybit": "Bybit",
     "phemex": "Phemex",
     "xt": "XT",
     "toobit": "Toobit",
     "okx": "OKX",
+    "gate": "Gate",
     "bingx": "BingX",
     "coinw": "CoinW",
     "kucoin": "KuCoin",

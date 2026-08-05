@@ -7,10 +7,13 @@ VOLUME_HIDE_BELOW_USD = 400_000
 VOLUME_OK_USD = 2_000_000
 
 COINGECKO_DERIVATIVE_IDS = {
+    "binance": "binance_futures",
+    "bybit": "bybit",
     "phemex": "phemex_futures",
     "xt": "xt_derivatives",
     "toobit": "toobit_derivatives",
     "okx": "okex_swap",
+    "gate": "gate_futures",
     "bingx": "bingx_futures",
     "coinw": "coinw_futures",
     "bitunix": "bitunix_futures",
@@ -158,11 +161,51 @@ def _fetch_native_phemex_volume_map():
     return result
 
 
+def _fetch_native_binance_volume_map():
+    r = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=10)
+    r.raise_for_status()
+    result = {}
+    for item in r.json():
+        symbol = str(item.get("symbol") or "").upper()
+        if not symbol.endswith("USDT"):
+            continue
+        _put_volume(result, symbol[:-len("USDT")], item.get("quoteVolume"))
+    return result
+
+
+def _fetch_native_bybit_volume_map():
+    r = requests.get("https://api.bybit.com/v5/market/tickers", params={"category": "linear"}, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    result = {}
+    for item in data.get("result", {}).get("list", []):
+        symbol = str(item.get("symbol") or "").upper()
+        if not symbol.endswith("USDT"):
+            continue
+        _put_volume(result, symbol[:-len("USDT")], item.get("turnover24h"))
+    return result
+
+
+def _fetch_native_gate_volume_map():
+    r = requests.get("https://api.gateio.ws/api/v4/futures/usdt/tickers", timeout=10)
+    r.raise_for_status()
+    result = {}
+    for item in r.json():
+        symbol = str(item.get("contract") or "").upper()
+        if not symbol.endswith("_USDT"):
+            continue
+        _put_volume(result, symbol[:-len("_USDT")], item.get("volume_24h_quote") or item.get("volume_24h_settle"))
+    return result
+
+
 NATIVE_VOLUME_FETCHERS = {
+    "binance": _fetch_native_binance_volume_map,
+    "bybit": _fetch_native_bybit_volume_map,
     "kucoin": _fetch_native_kucoin_volume_map,
     "toobit": _fetch_native_toobit_volume_map,
     "xt": _fetch_native_xt_volume_map,
     "phemex": _fetch_native_phemex_volume_map,
+    "gate": _fetch_native_gate_volume_map,
 }
 
 

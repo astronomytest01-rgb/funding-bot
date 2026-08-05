@@ -104,22 +104,22 @@ SHORT:
 Активные:
 
 ```text
-Phemex, XT, Toobit, OKX, BingX, KuCoin
+Binance, Bybit, Phemex, XT, Toobit, OKX, Gate, BingX, CoinW, KuCoin
 ```
 
 Временно отключены и скрыты из всех пользовательских команд и кнопок:
 
 ```text
-CoinW, Bitunix
+Bitunix
 ```
 
-API-код CoinW и Bitunix сохранён. Для возврата нужно убрать ключи `coinw` и `bitunix` из `TEMPORARILY_DISABLED_EXCHANGES` и включить их в `EXCHANGES_ENABLED`.
+API-код Bitunix сохранён. Для возврата нужно убрать ключ `bitunix` из `TEMPORARILY_DISABLED_EXCHANGES` и включить его в `EXCHANGES_ENABLED`.
 
 Toobit scan uses native `/api/v1/exchangeInfo` `contracts`, so TradFi futures such as `GER40` and commodities such as `NG` are included even when they are absent from the Phemex universe.
 
-XT, Toobit and KuCoin scans use native exchange symbol lists instead of the Phemex fallback universe.
+Binance, Bybit, Gate, XT, Toobit and KuCoin scans use native exchange symbol lists instead of the Phemex fallback universe.
 
-CoinW берётся из Supabase таблицы `funding_rates`, но сейчас временно отключена в runtime:
+CoinW берётся из Supabase таблицы `funding_rates`:
 
 ```text
 symbol, rate_pct, collected_at, funding_time
@@ -244,7 +244,7 @@ longterm.py  - long-term stable funding scan and 21:00 auto job
 
 1. `PYTHONPYCACHEPREFIX=/private/tmp/pycache python3 -m py_compile bot.py config.py analysis.py ai.py exchanges.py reports.py oi.py longterm.py`.
 2. Нет потерянных импортов после разбиения `bot.py`.
-3. CoinW API-код сохранён и работает через Supabase для исторических данных, но CoinW временно отключена вместе с Bitunix.
+3. CoinW API-код работает через Supabase для исторических данных; Bitunix API-код сохранён, но биржа временно отключена.
 4. `/analyze` `Средний доход` ищет обе стороны: LONG и SHORT.
 5. Длинный `/analyze` не блокирует Telegram polling: fetch/OI/volume операции выполняются через `asyncio.to_thread`.
 6. Trend-фильтр использует последние 4 ставки и правило 2 из 4.
@@ -261,13 +261,13 @@ longterm.py  - long-term stable funding scan and 21:00 auto job
 17. Ручной `/longfunding` не использует Gemini; auto job в 21:00 с `GEMINI_API_KEY` фильтрует активы по долгосрочному качеству, исключая мемкоины, микрокапы и высокий риск резких свечей.
 18. Кнопка `Показать ещё` отдаёт следующую порцию сохранённого результата без повторного скана.
 19. Longterm auto job запускается в 21:00 Europe/Kyiv при наличии `REPORT_CHAT_ID`.
-20. CoinW и Bitunix временно отключены: скрыты из кнопок и не работают через прямые команды, API-код оставлен для быстрого возврата.
+20. Bitunix временно отключена: скрыта из кнопок и не работает через прямые команды, API-код оставлен для быстрого возврата.
 21. Документация обновлена перед push.
 
 ## Известные ограничения
 
 1. Настройки бирж не сохраняются после перезапуска.
-2. CoinW зависит от внешнего Supabase collector и сейчас временно отключена вместе с Bitunix.
+2. CoinW зависит от внешнего Supabase collector.
 3. Gemini не является торговым сигналом.
 4. Скан может идти несколько минут.
 5. Один bot token нельзя запускать одновременно локально и на сервере.

@@ -107,7 +107,7 @@ def number(value, default=0.0):
 
 def first_payload(data):
     if isinstance(data, dict):
-        for key in ("data", "result"):
+        for key in ("data", "result", "list"):
             payload = data.get(key)
             if isinstance(payload, list):
                 return payload[0] if payload else {}
@@ -161,6 +161,13 @@ def fetch_market_quote(coin, exchange):
     """Returns top-of-book bid/ask for report entry spread filtering."""
     base = coin_base(coin)
     exchange = exchange.lower()
+    if exchange == "binance":
+        data = public_get_json("https://fapi.binance.com", "/fapi/v1/depth", {"symbol": f"{base}USDT", "limit": "20"})
+        return best_book_prices(data)
+    if exchange == "bybit":
+        data = public_get_json("https://api.bybit.com", "/v5/market/tickers", {"category": "linear", "symbol": f"{base}USDT"})
+        item = first_payload(data)
+        return {"bid": number(item.get("bid1Price")), "ask": number(item.get("ask1Price"))}
     if exchange == "phemex":
         data = public_get_json("https://api.phemex.com", "/md/v2/ticker/24hr", {"symbol": f"{base}USDT"})
         item = first_payload(data)
@@ -173,6 +180,9 @@ def fetch_market_quote(coin, exchange):
         data = public_get_json("https://www.okx.com", "/api/v5/market/ticker", {"instId": f"{base}-USDT-SWAP"})
         item = first_payload(data)
         return {"bid": number(item.get("bidPx")), "ask": number(item.get("askPx"))}
+    if exchange == "gate":
+        data = public_get_json("https://api.gateio.ws/api/v4", "/futures/usdt/order_book", {"contract": f"{base}_USDT", "limit": "20"})
+        return best_book_prices(data)
     if exchange == "xt":
         data = public_get_json("https://fapi.xt.com", "/future/market/v1/public/q/depth", {"symbol": f"{base.lower()}_usdt", "level": "20"})
         return best_book_prices(data)

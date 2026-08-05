@@ -17,6 +17,18 @@ class EveningReportPairTests(unittest.TestCase):
 
         self.assertEqual(quote, {"bid": 0.010034, "ask": 0.010062})
 
+    def test_first_payload_reads_bybit_result_list(self):
+        item = reports.first_payload({
+            "retCode": 0,
+            "result": {
+                "list": [
+                    {"bid1Price": "64103.7", "ask1Price": "64103.8"}
+                ]
+            }
+        })
+
+        self.assertEqual(item, {"bid1Price": "64103.7", "ask1Price": "64103.8"})
+
     def test_daily_income_filter_hides_low_or_negative_routes(self):
         signal = {"exchange": "phemex", "direction": "LONG"}
         fake = {

@@ -27,13 +27,14 @@ AUTO_REPORT_MIN_DAILY_USD = 10
 AUTO_REPORT_MIN_ENTRY_SPREAD_PCT = -0.8
 
 EXCHANGES_ENABLED = {
+    "binance": True,
+    "bybit": True,
     "phemex": True,
     "xt": True,
     "toobit": True,
     "okx": True,
+    "gate": True,
     "bingx": True,
-    # CoinW/Bitunix API-код оставлен в проекте, но биржи временно скрыты
-    # из команд, кнопок, /analyze и вечернего отчёта.
     "coinw": True,
     "kucoin": True,
     "bitunix": False,
