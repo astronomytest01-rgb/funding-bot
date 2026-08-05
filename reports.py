@@ -302,7 +302,7 @@ async def run_evening_report(context: ContextTypes.DEFAULT_TYPE, chat_id: int, m
         return
 
     lines = [
-        f"🤖 *ВЕЧЕРНИЙ ОТЧЁТ* — база {AUTO_SCAN_DAYS} дня, сумма ${AUTO_SCAN_AMOUNT:,.0f}\n"
+        f"🤖 *ВЕЧЕРНИЙ ОТЧЁТ* — база {AUTO_SCAN_DAYS} дня, позиция ${AUTO_SCAN_AMOUNT:,.0f} на ногу\n"
     ]
     for p in sorted(pairs, key=lambda x: x["net_rate"], reverse=True)[:20]:
         long_label = EXCHANGE_LABELS.get(p["long_ex"], p["long_ex"])
@@ -317,7 +317,7 @@ async def run_evening_report(context: ContextTypes.DEFAULT_TYPE, chat_id: int, m
             f"  🟢 Лонг: `{long_label}` avg `{p['long_avg']:+.4f}%` | `{p['long_payments_per_day']:.1f}` выплат/день | {long_oi} | {long_volume}\n"
             f"  🔴 Шорт: `{short_label}` avg `{p['short_avg']:+.4f}%` | `{p['short_payments_per_day']:.1f}` выплат/день | {short_oi} | {short_volume}\n"
             f"  📈 Чистый фандинг: `{p['net_daily_pct']:+.4f}%` / день\n"
-            f"  💰 Оценка: `${approx_income:.2f}` за 1 день\n"
+            f"  💰 Оценка: `${approx_income:.2f}` за 1 день на позицию `${AUTO_SCAN_AMOUNT:,.0f}` на ногу\n"
         )
 
     report = "\n".join(lines)
