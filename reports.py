@@ -6,7 +6,7 @@ from telegram.ext import ContextTypes
 
 from ai import gemini_analyze_bulk, get_last_gemini_error
 from analysis import analyze_rates, calc_std, get_active_exchanges, recent_trend_ok
-from config import AUTO_REPORT_MIN_DAILY_USD, AUTO_SCAN_AMOUNT, AUTO_SCAN_DAYS, GEMINI_API_KEY, REPORT_CHAT_ID, TEMPORARILY_DISABLED_EXCHANGES
+from config import AUTO_REPORT_MIN_DAILY_USD, AUTO_REPORT_MIN_ENTRY_SPREAD_PCT, AUTO_SCAN_AMOUNT, AUTO_SCAN_DAYS, GEMINI_API_KEY, REPORT_CHAT_ID, TEMPORARILY_DISABLED_EXCHANGES
 from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, EXCHANGE_SYMBOL_FETCHERS, phemex_get_all_symbols
 from oi import format_oi_status, format_volume_status, is_oi_allowed, is_volume_allowed
 
@@ -96,6 +96,114 @@ def fetch_exchange_average(coin, exchange, start_ms, end_ms):
     }
 
 
+def number(value, default=0.0):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def first_payload(data):
+    if isinstance(data, dict):
+        for key in ("data", "result"):
+            payload = data.get(key)
+            if isinstance(payload, list):
+                return payload[0] if payload else {}
+            if isinstance(payload, dict):
+                return first_payload(payload)
+        return data
+    if isinstance(data, list):
+        return data[0] if data else {}
+    return {}
+
+
+def best_book_prices(data):
+    payload = first_payload(data)
+    if isinstance(payload, dict):
+        payload = payload.get("orderbook_p") or payload.get("book") or payload
+    bids = payload.get("bids") or payload.get("b") or []
+    asks = payload.get("asks") or payload.get("a") or []
+    if not bids or not asks:
+        return None
+    bid = bids[0]
+    ask = asks[0]
+    if isinstance(bid, dict):
+        best_bid = number(bid.get("p") or bid.get("price") or bid.get("px"))
+    else:
+        best_bid = number(bid[0] if isinstance(bid, (list, tuple)) and bid else None)
+    if isinstance(ask, dict):
+        best_ask = number(ask.get("p") or ask.get("price") or ask.get("px"))
+    else:
+        best_ask = number(ask[0] if isinstance(ask, (list, tuple)) and ask else None)
+    if best_bid <= 0 or best_ask <= 0:
+        return None
+    return {"bid": best_bid, "ask": best_ask}
+
+
+def coin_base(coin):
+    coin = coin.upper()
+    if coin.endswith("USDT"):
+        return coin[:-4]
+    if coin.endswith("USD"):
+        return coin[:-3]
+    return coin
+
+
+def public_get_json(base_url, endpoint, params, timeout=6):
+    r = requests.get(f"{base_url}{endpoint}", params=params, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_market_quote(coin, exchange):
+    """Returns top-of-book bid/ask for report entry spread filtering."""
+    base = coin_base(coin)
+    exchange = exchange.lower()
+    if exchange == "phemex":
+        data = public_get_json("https://api.phemex.com", "/md/v2/ticker/24hr", {"symbol": f"{base}USDT"})
+        item = first_payload(data)
+        quote = {"bid": number(item.get("bidRp")), "ask": number(item.get("askRp"))}
+        if quote["bid"] > 0 and quote["ask"] > 0:
+            return quote
+        book = public_get_json("https://api.phemex.com", "/md/v2/orderbook", {"symbol": f"{base}USDT"})
+        return best_book_prices(book)
+    if exchange == "okx":
+        data = public_get_json("https://www.okx.com", "/api/v5/market/ticker", {"instId": f"{base}-USDT-SWAP"})
+        item = first_payload(data)
+        return {"bid": number(item.get("bidPx")), "ask": number(item.get("askPx"))}
+    if exchange == "xt":
+        data = public_get_json("https://fapi.xt.com", "/future/market/v1/public/q/depth", {"symbol": f"{base.lower()}_usdt", "level": "20"})
+        return best_book_prices(data)
+    if exchange == "toobit":
+        data = public_get_json("https://api.toobit.com", "/quote/v1/ticker/24hr", {"symbol": f"{base}-SWAP-USDT"})
+        item = first_payload(data)
+        return {"bid": number(item.get("b") or item.get("bid")), "ask": number(item.get("a") or item.get("ask"))}
+    if exchange == "bingx":
+        data = public_get_json("https://open-api.bingx.com", "/openApi/swap/v2/quote/depth", {"symbol": f"{base}-USDT", "limit": "20"})
+        return best_book_prices(data)
+    if exchange == "kucoin":
+        symbol = "XBTUSDTM" if base == "BTC" else f"{base}USDTM"
+        data = public_get_json("https://api-futures.kucoin.com", "/api/v1/ticker", {"symbol": symbol})
+        item = first_payload(data)
+        return {"bid": number(item.get("bestBidPrice")), "ask": number(item.get("bestAskPrice"))}
+    if exchange == "coinw":
+        data = public_get_json("https://api.coinw.com", "/v1/perpumPublic/depth", {"base": base})
+        return best_book_prices(data)
+    return None
+
+
+def entry_spread_pct(long_quote, short_quote):
+    if not long_quote or not short_quote:
+        return None
+    long_ask = number(long_quote.get("ask"))
+    short_bid = number(short_quote.get("bid"))
+    if long_ask <= 0 or short_bid <= 0:
+        return None
+    return (short_bid / long_ask * 100) - 100
+
+
 def calc_pair_daily_income_pct(long_avg, long_payments_per_day, short_avg, short_payments_per_day):
     """Daily funding PnL % for equal notional legs.
 
@@ -128,9 +236,22 @@ def find_delta_pair_for_signal(coin, signal, days, active_exchanges):
         return None
 
     candidates = []
+    quote_cache = {}
+    for ex in exchange_data:
+        try:
+            quote = fetch_market_quote(coin, ex)
+            if quote and quote.get("bid", 0) > 0 and quote.get("ask", 0) > 0:
+                quote_cache[ex] = quote
+        except Exception:
+            pass
+        time.sleep(0.05)
+
     for long_ex, long_info in exchange_data.items():
         for short_ex, short_info in exchange_data.items():
             if short_ex == long_ex:
+                continue
+            entry_spread = entry_spread_pct(quote_cache.get(long_ex), quote_cache.get(short_ex))
+            if entry_spread is None or entry_spread < AUTO_REPORT_MIN_ENTRY_SPREAD_PCT:
                 continue
             if not is_oi_allowed(long_ex, coin) or not is_oi_allowed(short_ex, coin):
                 continue
@@ -152,12 +273,13 @@ def find_delta_pair_for_signal(coin, signal, days, active_exchanges):
                 short_ex,
                 long_info,
                 short_info,
+                entry_spread,
             ))
 
     if not candidates:
         return None
-    candidates.sort(key=lambda x: (-x[0], x[4]["std"] + x[5]["std"]))
-    daily_income_usd, net_daily_pct, long_ex, short_ex, long_info, short_info = candidates[0]
+    candidates.sort(key=lambda x: (-x[0], x[4]["std"] + x[5]["std"], -x[6]))
+    daily_income_usd, net_daily_pct, long_ex, short_ex, long_info, short_info, entry_spread = candidates[0]
     return {
         "coin": coin,
         "direction": signal["direction"],
@@ -170,6 +292,7 @@ def find_delta_pair_for_signal(coin, signal, days, active_exchanges):
         "net_rate": net_daily_pct,
         "net_daily_pct": net_daily_pct,
         "daily_income_usd": daily_income_usd,
+        "entry_spread_pct": entry_spread,
     }
 
 
@@ -318,6 +441,7 @@ async def run_evening_report(context: ContextTypes.DEFAULT_TYPE, chat_id: int, m
             f"  🔴 Шорт: `{short_label}` avg `{p['short_avg']:+.4f}%` | `{p['short_payments_per_day']:.1f}` выплат/день | {short_oi} | {short_volume}\n"
             f"  📈 Чистый фандинг: `{p['net_daily_pct']:+.4f}%` / день\n"
             f"  💰 Оценка: `${approx_income:.2f}` за 1 день на позицию `${AUTO_SCAN_AMOUNT:,.0f}` на ногу\n"
+            f"  🚪 Спред входа: `{p['entry_spread_pct']:+.3f}%`\n"
         )
 
     report = "\n".join(lines)
