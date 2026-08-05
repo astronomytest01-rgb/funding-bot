@@ -6,7 +6,7 @@ from telegram.ext import ContextTypes
 
 from ai import gemini_analyze_bulk, get_last_gemini_error
 from analysis import analyze_rates, calc_std, get_active_exchanges, recent_trend_ok
-from config import AUTO_SCAN_AMOUNT, AUTO_SCAN_DAYS, GEMINI_API_KEY, REPORT_CHAT_ID, TEMPORARILY_DISABLED_EXCHANGES
+from config import AUTO_REPORT_MIN_DAILY_USD, AUTO_SCAN_AMOUNT, AUTO_SCAN_DAYS, GEMINI_API_KEY, REPORT_CHAT_ID, TEMPORARILY_DISABLED_EXCHANGES
 from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, EXCHANGE_SYMBOL_FETCHERS, phemex_get_all_symbols
 from oi import format_oi_status, format_volume_status, is_oi_allowed, is_volume_allowed
 
@@ -92,11 +92,26 @@ def fetch_exchange_average(coin, exchange, start_ms, end_ms):
         "rates": rates,
         "avg": sum(rates) / len(rates),
         "std": calc_std(rates),
+        "payments_per_day": len(rates) / max((end_ms - start_ms) / (24 * 60 * 60 * 1000), 1e-9),
     }
 
 
+def calc_pair_daily_income_pct(long_avg, long_payments_per_day, short_avg, short_payments_per_day):
+    """Daily funding PnL % for equal notional legs.
+
+    Long earns when funding is negative, short earns when funding is positive.
+    Funding intervals differ by exchange, so per-payment averages must be
+    multiplied by observed payments per day before comparing two venues.
+    """
+    return (-long_avg * long_payments_per_day) + (short_avg * short_payments_per_day)
+
+
+def calc_pair_daily_income_usd(amount_usd, long_avg, long_payments_per_day, short_avg, short_payments_per_day):
+    return amount_usd * calc_pair_daily_income_pct(long_avg, long_payments_per_day, short_avg, short_payments_per_day) / 100
+
+
 def find_delta_pair_for_signal(coin, signal, days, active_exchanges):
-    """Подбирает пару для монеты, которая уже прошла full-фильтр LONG или SHORT."""
+    """Подбирает лучшую пару для монеты с учетом разных funding intervals."""
     now_ms = int(time.time() * 1000)
     start_ms = now_ms - days * 24 * 60 * 60 * 1000
     exchange_data = {}
@@ -109,51 +124,52 @@ def find_delta_pair_for_signal(coin, signal, days, active_exchanges):
             pass
         time.sleep(0.1)
 
-    signal_ex = signal["exchange"]
-    if signal_ex not in exchange_data:
+    if signal["exchange"] not in exchange_data:
         return None
 
-    main_avg = exchange_data[signal_ex]["avg"]
     candidates = []
-    if signal["direction"] == "LONG":
-        long_ex = signal_ex
-        long_avg = main_avg
-        for short_ex, info in exchange_data.items():
+    for long_ex, long_info in exchange_data.items():
+        for short_ex, short_info in exchange_data.items():
             if short_ex == long_ex:
                 continue
-            short_avg = info["avg"]
             if not is_oi_allowed(long_ex, coin) or not is_oi_allowed(short_ex, coin):
                 continue
             if not is_volume_allowed(long_ex, coin) or not is_volume_allowed(short_ex, coin):
                 continue
-            net = -long_avg + short_avg
-            candidates.append((net, long_ex, short_ex, long_avg, short_avg, info["std"]))
-    else:
-        short_ex = signal_ex
-        short_avg = main_avg
-        for long_ex, info in exchange_data.items():
-            if long_ex == short_ex:
+            net_daily_pct = calc_pair_daily_income_pct(
+                long_info["avg"],
+                long_info["payments_per_day"],
+                short_info["avg"],
+                short_info["payments_per_day"],
+            )
+            daily_income_usd = AUTO_SCAN_AMOUNT * net_daily_pct / 100
+            if daily_income_usd < AUTO_REPORT_MIN_DAILY_USD:
                 continue
-            long_avg = info["avg"]
-            if not is_oi_allowed(long_ex, coin) or not is_oi_allowed(short_ex, coin):
-                continue
-            if not is_volume_allowed(long_ex, coin) or not is_volume_allowed(short_ex, coin):
-                continue
-            net = -long_avg + short_avg
-            candidates.append((net, long_ex, short_ex, long_avg, short_avg, info["std"]))
+            candidates.append((
+                daily_income_usd,
+                net_daily_pct,
+                long_ex,
+                short_ex,
+                long_info,
+                short_info,
+            ))
 
     if not candidates:
         return None
-    candidates.sort(key=lambda x: (-x[0], x[5]))
-    net, long_ex, short_ex, long_avg, short_avg, _ = candidates[0]
+    candidates.sort(key=lambda x: (-x[0], x[4]["std"] + x[5]["std"]))
+    daily_income_usd, net_daily_pct, long_ex, short_ex, long_info, short_info = candidates[0]
     return {
         "coin": coin,
         "direction": signal["direction"],
         "long_ex": long_ex,
         "short_ex": short_ex,
-        "long_avg": long_avg,
-        "short_avg": short_avg,
-        "net_rate": net,
+        "long_avg": long_info["avg"],
+        "short_avg": short_info["avg"],
+        "long_payments_per_day": long_info["payments_per_day"],
+        "short_payments_per_day": short_info["payments_per_day"],
+        "net_rate": net_daily_pct,
+        "net_daily_pct": net_daily_pct,
+        "daily_income_usd": daily_income_usd,
     }
 
 
@@ -268,7 +284,10 @@ async def run_evening_report(context: ContextTypes.DEFAULT_TYPE, chat_id: int, m
             pairs.append(pair)
 
     if not pairs:
-        await context.bot.send_message(chat_id, "⚠️ Не нашёл дельта-нейтральных пар по FULL-монетам.")
+        await context.bot.send_message(
+            chat_id,
+            f"⚠️ Не нашёл дельта-нейтральных пар по FULL-монетам с доходом от ${AUTO_REPORT_MIN_DAILY_USD:.0f}/день."
+        )
         if gemini_chunks:
             gemini_report = "🤖 *Gemini-рекомендация* — не фильтр, а ручная проверка:\n\n" + "\n".join(gemini_chunks)
             for chunk in [gemini_report[i:i+4000] for i in range(0, len(gemini_report), 4000)]:
@@ -288,16 +307,16 @@ async def run_evening_report(context: ContextTypes.DEFAULT_TYPE, chat_id: int, m
     for p in sorted(pairs, key=lambda x: x["net_rate"], reverse=True)[:20]:
         long_label = EXCHANGE_LABELS.get(p["long_ex"], p["long_ex"])
         short_label = EXCHANGE_LABELS.get(p["short_ex"], p["short_ex"])
-        approx_income = AUTO_SCAN_AMOUNT * (p["net_rate"] / 100) * 3
+        approx_income = p["daily_income_usd"]
         long_oi = format_oi_status(p["long_ex"], p["coin"])
         short_oi = format_oi_status(p["short_ex"], p["coin"])
         long_volume = format_volume_status(p["long_ex"], p["coin"])
         short_volume = format_volume_status(p["short_ex"], p["coin"])
         lines.append(
             f"*{p['coin']}*\n"
-            f"  🟢 Лонг: `{long_label}` avg `{p['long_avg']:+.4f}%` | {long_oi} | {long_volume}\n"
-            f"  🔴 Шорт: `{short_label}` avg `{p['short_avg']:+.4f}%` | {short_oi} | {short_volume}\n"
-            f"  📈 Чистый фандинг: `{p['net_rate']:+.4f}%` / ставку\n"
+            f"  🟢 Лонг: `{long_label}` avg `{p['long_avg']:+.4f}%` | `{p['long_payments_per_day']:.1f}` выплат/день | {long_oi} | {long_volume}\n"
+            f"  🔴 Шорт: `{short_label}` avg `{p['short_avg']:+.4f}%` | `{p['short_payments_per_day']:.1f}` выплат/день | {short_oi} | {short_volume}\n"
+            f"  📈 Чистый фандинг: `{p['net_daily_pct']:+.4f}%` / день\n"
             f"  💰 Оценка: `${approx_income:.2f}` за 1 день\n"
         )
 
