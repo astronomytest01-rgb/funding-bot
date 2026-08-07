@@ -60,7 +60,11 @@ SUPABASE_URL=
 SUPABASE_KEY=
 GEMINI_API_KEY=
 REPORT_CHAT_ID=
+BINANCE_PROXY_URL=
+BYBIT_PROXY_URL=
 ```
+
+`BINANCE_PROXY_URL` и `BYBIT_PROXY_URL` — HTTP-прокси для обхода геоблокировки. Формат: `http://user:pass@host:port`. Если не заданы, запросы идут напрямую. Прокси применяется ко всем вызовам Binance и Bybit: funding history, symbol list, order book, volume.
 
 Параметры фильтра:
 
@@ -156,7 +160,11 @@ OI-проверка теперь является частью фильтра. �
 - `toobit`: native Toobit USDT-M `/quote/v1/contract/ticker/24hr`, поле `qv`;
 - `xt`: native XT futures `/future/market/v1/public/q/tickers`, поле `v`;
 - `phemex`: native Phemex `/md/v2/ticker/24hr/all`, поле `turnoverRv`;
+- `binance`: native Binance Futures `quoteVolume` (через `BINANCE_PROXY_URL`);
+- `bybit`: native Bybit linear `turnover24h` (через `BYBIT_PROXY_URL`);
 - `okx`, `bingx` и fallback для остальных: CoinGecko Derivatives `volume_24h`.
+
+Если native-источник недоступен (proxy не задан или API-ошибка), бот автоматически переключается на CoinGecko fallback.
 
 Фильтр применяется в `/analyze`, вечернем отчёте и при подборе итоговой long/short пары. Команда `/oi` показывает OI и 24h volume вместе.
 
