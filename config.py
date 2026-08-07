@@ -8,6 +8,9 @@ REPORT_CHAT_ID = os.environ.get("REPORT_CHAT_ID", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
+BINANCE_PROXY_URL = os.environ.get("BINANCE_PROXY_URL", "")
+BYBIT_PROXY_URL = os.environ.get("BYBIT_PROXY_URL", "")
+
 DEFAULT_DAYS = 7
 STABILITY_THRESHOLD = -0.04
 MAX_OUTLIER_PCT = 25

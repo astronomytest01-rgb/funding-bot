@@ -1,6 +1,9 @@
 import time
 import requests
 
+from config import BINANCE_PROXY_URL, BYBIT_PROXY_URL
+from exchanges import _proxies
+
 OI_HIDE_BELOW_USD = 500_000
 OI_OK_USD = 1_000_000
 VOLUME_HIDE_BELOW_USD = 400_000
@@ -162,7 +165,7 @@ def _fetch_native_phemex_volume_map():
 
 
 def _fetch_native_binance_volume_map():
-    r = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=10)
+    r = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=10, proxies=_proxies(BINANCE_PROXY_URL))
     r.raise_for_status()
     result = {}
     for item in r.json():
@@ -174,7 +177,7 @@ def _fetch_native_binance_volume_map():
 
 
 def _fetch_native_bybit_volume_map():
-    r = requests.get("https://api.bybit.com/v5/market/tickers", params={"category": "linear"}, timeout=10)
+    r = requests.get("https://api.bybit.com/v5/market/tickers", params={"category": "linear"}, timeout=10, proxies=_proxies(BYBIT_PROXY_URL))
     r.raise_for_status()
     data = r.json()
     result = {}

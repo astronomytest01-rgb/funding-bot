@@ -2,7 +2,13 @@ import time
 import requests
 from datetime import datetime, timezone
 
-from config import SUPABASE_KEY, SUPABASE_URL
+from config import BINANCE_PROXY_URL, BYBIT_PROXY_URL, SUPABASE_KEY, SUPABASE_URL
+
+
+def _proxies(proxy_url):
+    if proxy_url:
+        return {"http": proxy_url, "https": proxy_url}
+    return None
 
 def phemex_fetch(coin, start_ms, end_ms):
     """Возвращает list of (timestamp_ms, rate_pct) или raises"""
@@ -56,7 +62,7 @@ def binance_fetch(coin, start_ms, end_ms):
     try:
         url = "https://fapi.binance.com/fapi/v1/fundingRate"
         params = {"symbol": sym, "startTime": start_ms, "endTime": end_ms, "limit": 1000}
-        r = requests.get(url, params=params, timeout=6)
+        r = requests.get(url, params=params, timeout=6, proxies=_proxies(BINANCE_PROXY_URL))
         if r.status_code in (418, 429, 451):
             return [], f"Binance HTTP {r.status_code}: {r.text[:200]}"
         r.raise_for_status()
@@ -75,7 +81,7 @@ def binance_fetch(coin, start_ms, end_ms):
 
 def binance_get_all_symbols():
     url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-    r = requests.get(url, timeout=10)
+    r = requests.get(url, timeout=10, proxies=_proxies(BINANCE_PROXY_URL))
     if r.status_code in (418, 429, 451):
         raise ValueError(f"Binance HTTP {r.status_code}: {r.text[:200]}")
     r.raise_for_status()
@@ -360,7 +366,7 @@ def bybit_fetch(coin, start_ms, end_ms):
     try:
         url = "https://api.bybit.com/v5/market/funding/history"
         params = {"category": "linear", "symbol": sym, "startTime": start_ms, "endTime": end_ms, "limit": 200}
-        r = requests.get(url, params=params, timeout=6)
+        r = requests.get(url, params=params, timeout=6, proxies=_proxies(BYBIT_PROXY_URL))
         if r.status_code in (403, 429, 451):
             return [], f"Bybit HTTP {r.status_code}: {r.text[:200]}"
         r.raise_for_status()
@@ -386,7 +392,7 @@ def bybit_get_all_symbols():
         params = {"category": "linear", "limit": 1000}
         if cursor:
             params["cursor"] = cursor
-        r = requests.get("https://api.bybit.com/v5/market/instruments-info", params=params, timeout=10)
+        r = requests.get("https://api.bybit.com/v5/market/instruments-info", params=params, timeout=10, proxies=_proxies(BYBIT_PROXY_URL))
         if r.status_code in (403, 429, 451):
             raise ValueError(f"Bybit HTTP {r.status_code}: {r.text[:200]}")
         r.raise_for_status()

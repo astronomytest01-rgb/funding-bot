@@ -7,7 +7,7 @@ from telegram.ext import ContextTypes
 from ai import gemini_analyze_bulk, get_last_gemini_error
 from analysis import analyze_rates, calc_std, get_active_exchanges, recent_trend_ok
 from config import AUTO_REPORT_MIN_DAILY_USD, AUTO_REPORT_MIN_ENTRY_SPREAD_PCT, AUTO_SCAN_AMOUNT, AUTO_SCAN_DAYS, GEMINI_API_KEY, REPORT_CHAT_ID, TEMPORARILY_DISABLED_EXCHANGES
-from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, EXCHANGE_SYMBOL_FETCHERS, phemex_get_all_symbols
+from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, EXCHANGE_SYMBOL_FETCHERS, _proxies, phemex_get_all_symbols
 from oi import format_oi_status, format_volume_status, is_oi_allowed, is_volume_allowed
 
 
@@ -151,8 +151,8 @@ def coin_base(coin):
     return coin
 
 
-def public_get_json(base_url, endpoint, params, timeout=6):
-    r = requests.get(f"{base_url}{endpoint}", params=params, timeout=timeout)
+def public_get_json(base_url, endpoint, params, timeout=6, proxies=None):
+    r = requests.get(f"{base_url}{endpoint}", params=params, timeout=timeout, proxies=proxies)
     r.raise_for_status()
     return r.json()
 
@@ -162,10 +162,12 @@ def fetch_market_quote(coin, exchange):
     base = coin_base(coin)
     exchange = exchange.lower()
     if exchange == "binance":
-        data = public_get_json("https://fapi.binance.com", "/fapi/v1/depth", {"symbol": f"{base}USDT", "limit": "20"})
+        from config import BINANCE_PROXY_URL
+        data = public_get_json("https://fapi.binance.com", "/fapi/v1/depth", {"symbol": f"{base}USDT", "limit": "20"}, proxies=_proxies(BINANCE_PROXY_URL))
         return best_book_prices(data)
     if exchange == "bybit":
-        data = public_get_json("https://api.bybit.com", "/v5/market/tickers", {"category": "linear", "symbol": f"{base}USDT"})
+        from config import BYBIT_PROXY_URL
+        data = public_get_json("https://api.bybit.com", "/v5/market/tickers", {"category": "linear", "symbol": f"{base}USDT"}, proxies=_proxies(BYBIT_PROXY_URL))
         item = first_payload(data)
         return {"bid": number(item.get("bid1Price")), "ask": number(item.get("ask1Price"))}
     if exchange == "phemex":
