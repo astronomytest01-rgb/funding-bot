@@ -338,14 +338,12 @@ async def run_evening_report(context: ContextTypes.DEFAULT_TYPE, chat_id: int, m
             continue
 
         found_before = len(full_signals)
-        await context.bot.send_message(chat_id, f"🔎 {EXCHANGE_LABELS.get(ex, ex)}: начинаю скан {len(coins)} монет...")
+        await context.bot.send_message(chat_id, f"🔎 {EXCHANGE_LABELS.get(ex, ex)}: скан {len(coins)} монет...")
         for idx, coin in enumerate(coins, start=1):
             try:
                 rows, _sym = fetcher(coin, start_ms, now_ms)
             except Exception:
                 rows = []
-            if idx % 50 == 0:
-                await context.bot.send_message(chat_id, f"⏳ {EXCHANGE_LABELS.get(ex, ex)}: {idx}/{len(coins)} | FULL {len(full_signals) - found_before}")
             if not rows:
                 time.sleep(0.1)
                 continue
@@ -369,9 +367,10 @@ async def run_evening_report(context: ContextTypes.DEFAULT_TYPE, chat_id: int, m
                 })
             time.sleep(0.1)
 
+        found_now = len(full_signals) - found_before
         await context.bot.send_message(
             chat_id,
-            f"⏳ {EXCHANGE_LABELS.get(ex, ex)}: найдено FULL {len(full_signals) - found_before}, всего {len(full_signals)}"
+            f"✅ {EXCHANGE_LABELS.get(ex, ex)}: FULL {found_now}, всего {len(full_signals)}"
         )
 
     if not full_signals:
