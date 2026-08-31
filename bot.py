@@ -95,6 +95,12 @@ AN_DAYS = 55
 AN_DAYS_NUM = 56
 OI_COIN = 60
 OI_EXCH = 61
+CHECK_COIN = 70
+CHECK_EX_A = 71
+CHECK_SIDE_A = 72
+CHECK_EX_B = 73
+CHECK_AMT = 74
+CHECK_AMT_NUM = 75
 
 SCAN_DAYS = 7
 SCAN_BATCH = 20
@@ -131,7 +137,7 @@ def parse_tokens(text):
         if p in ("/exchange", "--exchange") and i + 1 < len(parts):
             exchange = parts[i + 1].lower(); i += 2; continue
         # пропускаем команды вида /filter если вдруг попали в текст
-        if p in ("/filter", "/funding", "/calculator", "/start", "/help", "/settings", "/report", "/longfunding", "/instruction", "/ai", "/oi", "/cancel"):
+        if p in ("/filter", "/funding", "/calculator", "/start", "/help", "/settings", "/report", "/longfunding", "/instruction", "/ai", "/oi", "/check", "/cancel"):
             i += 1; continue
         # Распознаём название биржи без префикса; активность проверяется позднее.
         if p in KNOWN_EXCHANGES:
@@ -523,6 +529,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("awaiting_funding_coin", None)
     context.user_data.pop("awaiting_funding_days_num", None)
     context.user_data.pop("awaiting_ai_coin", None)
+    clear_check_state(context)
     await update.message.reply_text("Отменено.")
     return ConversationHandler.END
 
@@ -548,6 +555,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/analyze — скан рынка + Gemini-фильтр найденных монет\n"
         "/ai — фундаментальный AI-анализ монеты без анализа фандинга\n"
         "/oi — пошаговая проверка Open Interest и 24h volume по монете\n"
+        "/check — проверка одной монеты под две ноги с размером позиции\n"
         "/findpair — дельта-нейтраль: найти пару лонг+шорт\n"
         "/report — запустить вечерний отчёт вручную\n"
         "/longfunding — долгосрочные стабильные funding-связки\n"
@@ -559,6 +567,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/funding ENJ phemex 7`\n"
         "`/calculator ENJ 25000 7 phemex`\n"
         "`/oi FLOW`\n"
+        "`/check DASH`\n"
         "`/ai SOL ENJ`"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -636,7 +645,7 @@ def format_oi_recommendation(coin, exchange):
     elif oi_usd < oi_hide:
         verdict = (
             f"🚫 *Не стоит заходить.* OI ниже `{oi_hide_text}`, бот скрывает такие монеты "
-            "из `/analyze` и вечернего отчёта."
+            "из ручного `/analyze`."
         )
     elif oi_usd < oi_ok:
         verdict = (
@@ -651,7 +660,7 @@ def format_oi_recommendation(coin, exchange):
     if volume_usd is None:
         volume_verdict = "⚠️ *Данных 24h volume нет.* Обязательно проверь оборот на бирже вручную."
     elif volume_usd < volume_hide:
-        volume_verdict = f"🚫 *24h volume ниже {volume_hide_text}.* Бот скрывает такие монеты из `/analyze` и вечернего отчёта."
+        volume_verdict = f"🚫 *24h volume ниже {volume_hide_text}.* Бот скрывает такие монеты из ручного `/analyze`."
     elif volume_usd < volume_ok:
         volume_verdict = f"⚠️ *24h volume между {volume_hide_text} и {volume_ok_text}.* Нужна ручная проверка стакана и slippage."
     else:
@@ -793,6 +802,251 @@ async def oi_direct_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def oi_direct_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await oi_exchange_btn(update, context)
     raise ApplicationHandlerStop
+
+
+# ─────────────────────────────────────────────
+# /check — проверка одной монеты под две ноги
+# ─────────────────────────────────────────────
+
+
+def clear_check_state(context):
+    for key in (
+        "awaiting_check_coin",
+        "awaiting_check_amount",
+        "check_coin",
+        "check_ex_a",
+        "check_side_a",
+        "check_ex_b",
+    ):
+        context.user_data.pop(key, None)
+
+
+def make_check_exchange_keyboard(step, exclude=None):
+    buttons = []
+    row = []
+    for ex in active_exchange_keys():
+        if ex == exclude:
+            continue
+        row.append(InlineKeyboardButton(EXCHANGE_LABELS.get(ex, ex.upper()), callback_data=f"check_{step}_{ex}"))
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("Отмена", callback_data="check_cancel")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def make_check_side_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 LONG первая нога", callback_data="check_side_LONG")],
+        [InlineKeyboardButton("🔴 SHORT первая нога", callback_data="check_side_SHORT")],
+        [InlineKeyboardButton("Отмена", callback_data="check_cancel")],
+    ])
+
+
+def make_check_amount_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("$6,000", callback_data="check_amt_6000"),
+         InlineKeyboardButton("$8,000", callback_data="check_amt_8000")],
+        [InlineKeyboardButton("$10,000", callback_data="check_amt_10000"),
+         InlineKeyboardButton("Другая", callback_data="check_amt_other")],
+        [InlineKeyboardButton("Отмена", callback_data="check_cancel")],
+    ])
+
+
+def parse_usd_amount(text):
+    raw = (text or "").strip().replace("$", "").replace(",", "").replace(" ", "")
+    try:
+        amount = float(raw)
+    except ValueError:
+        return None
+    if amount <= 0:
+        return None
+    return amount
+
+
+def format_check_leg(coin, exchange, side, amount_usd):
+    label = EXCHANGE_LABELS.get(exchange, exchange.upper())
+    side_icon = "🟢 LONG" if side == "LONG" else "🔴 SHORT"
+    oi_usd = get_open_interest_usd(exchange, coin)
+    volume_status = format_volume_status(exchange, coin)
+
+    if oi_usd is None:
+        oi_line = "⚠️ OI: нет данных"
+        verdict = "⚠️ Проверь OI вручную на бирже перед входом."
+    else:
+        share = amount_usd / oi_usd if oi_usd > 0 else 1
+        share_pct = share * 100
+        oi_line = f"OI `${oi_usd:,.0f}` | позиция `${amount_usd:,.0f}` = `{share_pct:.2f}%` от OI"
+        if share < 0.02:
+            verdict = "✅ Доля позиции от OI < 2%: базово ок, но стакан/slippage всё равно проверить."
+        elif share < 0.10:
+            verdict = "⚠️ Доля позиции от OI < 10%: можно смотреть только после ручной проверки стакана."
+        else:
+            verdict = "🚫 Доля позиции от OI >= 10%: лучше пропустить или сильно уменьшить размер."
+
+    if is_liquidity_filter_disabled(exchange):
+        filter_note = "ℹ️ Для Aster OI/Vol не используются как hard-filter в боте."
+    else:
+        filter_note = (
+            "ℹ️ Это preview под размер позиции. Ручной `/analyze` использует свои hard-пороги; "
+            "автоотчёты OI/Vol не фильтруют."
+        )
+
+    return (
+        f"{side_icon} *{label}*\n"
+        f"• {oi_line}\n"
+        f"• {volume_status}\n"
+        f"• {verdict}\n"
+        f"• {filter_note}"
+    )
+
+
+def format_check_result(coin, ex_a, side_a, ex_b, amount_usd):
+    side_b = "SHORT" if side_a == "LONG" else "LONG"
+    return (
+        "🧪 *Liquidity check*\n\n"
+        f"Монета: `{coin}`\n"
+        f"Размер: `${amount_usd:,.0f}` на каждую ногу\n\n"
+        f"{format_check_leg(coin, ex_a, side_a, amount_usd)}\n\n"
+        f"{format_check_leg(coin, ex_b, side_b, amount_usd)}\n\n"
+        "🛡️ Финально перед входом проверь spread, глубину первых 5 ордеров, slippage и Predicted Rate."
+    )
+
+
+async def check_direct_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_check_state(context)
+    if context.args:
+        coin = normalize_oi_coin(" ".join(context.args))
+        if coin:
+            context.user_data["check_coin"] = coin
+            await update.message.reply_text(
+                f"🧪 `/check`\n\nМонета: `{coin}`\n\nШаг 2/5: выбери биржу первой ноги:",
+                reply_markup=make_check_exchange_keyboard("exa"),
+                parse_mode="Markdown",
+            )
+            raise ApplicationHandlerStop
+
+    context.user_data["awaiting_check_coin"] = True
+    await update.message.reply_text(
+        "🧪 Проверка одной монеты под две ноги\n\n"
+        "Шаг 1/5: введи монету, например `DASH`.\n\n"
+        "Быстрый ввод тоже работает: `/check DASH`",
+        parse_mode="Markdown",
+    )
+    raise ApplicationHandlerStop
+
+
+async def check_direct_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.pop("awaiting_check_coin", False):
+        coin = normalize_oi_coin(update.message.text)
+        if not coin:
+            context.user_data["awaiting_check_coin"] = True
+            await update.message.reply_text("Не распознал монету. Попробуй: `DASH`", parse_mode="Markdown")
+            raise ApplicationHandlerStop
+        context.user_data["check_coin"] = coin
+        await update.message.reply_text(
+            f"Монета: `{coin}`\n\nШаг 2/5: выбери биржу первой ноги:",
+            reply_markup=make_check_exchange_keyboard("exa"),
+            parse_mode="Markdown",
+        )
+        raise ApplicationHandlerStop
+
+    if context.user_data.pop("awaiting_check_amount", False):
+        amount = parse_usd_amount(update.message.text)
+        if amount is None:
+            context.user_data["awaiting_check_amount"] = True
+            await update.message.reply_text("Не распознал сумму. Введи число, например `8000`.", parse_mode="Markdown")
+            raise ApplicationHandlerStop
+        await send_check_result(update, context, amount)
+        raise ApplicationHandlerStop
+
+
+async def send_check_result(update_or_query, context, amount_usd):
+    coin = context.user_data.get("check_coin")
+    ex_a = context.user_data.get("check_ex_a")
+    side_a = context.user_data.get("check_side_a")
+    ex_b = context.user_data.get("check_ex_b")
+    if not all((coin, ex_a, side_a, ex_b)):
+        clear_check_state(context)
+        if hasattr(update_or_query, "message") and update_or_query.message:
+            await update_or_query.message.reply_text("❌ Не хватает данных. Запусти /check заново.")
+        else:
+            await update_or_query.edit_message_text("❌ Не хватает данных. Запусти /check заново.")
+        return
+    text = await asyncio.to_thread(format_check_result, coin, ex_a, side_a, ex_b, amount_usd)
+    clear_check_state(context)
+    if hasattr(update_or_query, "message") and update_or_query.message:
+        await update_or_query.message.reply_text(text, parse_mode="Markdown")
+    else:
+        await update_or_query.message.reply_text(text, parse_mode="Markdown")
+
+
+async def check_direct_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+
+    if data == "check_cancel":
+        clear_check_state(context)
+        await q.edit_message_text("Отменено.")
+        raise ApplicationHandlerStop
+
+    if data.startswith("check_exa_"):
+        exchange = data.replace("check_exa_", "")
+        context.user_data["check_ex_a"] = exchange
+        await q.edit_message_text(
+            f"Биржа первой ноги: *{EXCHANGE_LABELS.get(exchange, exchange.upper())}*\n\n"
+            "Шаг 3/5: выбери направление первой ноги:",
+            reply_markup=make_check_side_keyboard(),
+            parse_mode="Markdown",
+        )
+        raise ApplicationHandlerStop
+
+    if data.startswith("check_side_"):
+        side = data.replace("check_side_", "")
+        context.user_data["check_side_a"] = side
+        ex_a = context.user_data.get("check_ex_a")
+        opposite = "SHORT" if side == "LONG" else "LONG"
+        await q.edit_message_text(
+            f"Первая нога: *{side}*\n"
+            f"Вторая нога будет автоматически: *{opposite}*\n\n"
+            "Шаг 4/5: выбери биржу второй ноги:",
+            reply_markup=make_check_exchange_keyboard("exb", exclude=ex_a),
+            parse_mode="Markdown",
+        )
+        raise ApplicationHandlerStop
+
+    if data.startswith("check_exb_"):
+        exchange = data.replace("check_exb_", "")
+        if exchange == context.user_data.get("check_ex_a"):
+            await q.edit_message_text("Вторая биржа должна отличаться от первой. Запусти /check заново.")
+            clear_check_state(context)
+            raise ApplicationHandlerStop
+        context.user_data["check_ex_b"] = exchange
+        await q.edit_message_text(
+            f"Биржа второй ноги: *{EXCHANGE_LABELS.get(exchange, exchange.upper())}*\n\n"
+            "Шаг 5/5: выбери размер позиции на каждую ногу:",
+            reply_markup=make_check_amount_keyboard(),
+            parse_mode="Markdown",
+        )
+        raise ApplicationHandlerStop
+
+    if data.startswith("check_amt_"):
+        amount_token = data.replace("check_amt_", "")
+        if amount_token == "other":
+            context.user_data["awaiting_check_amount"] = True
+            await q.edit_message_text("Введи размер позиции в USDT на каждую ногу, например `8000`.", parse_mode="Markdown")
+            raise ApplicationHandlerStop
+        amount = parse_usd_amount(amount_token)
+        if amount is None:
+            await q.edit_message_text("❌ Не распознал сумму. Запусти /check заново.")
+            clear_check_state(context)
+            raise ApplicationHandlerStop
+        await q.edit_message_text("Проверяю OI и 24h volume...")
+        await send_check_result(q, context, amount)
+        raise ApplicationHandlerStop
 
 
 # cmd_exchanges удалена — используй /settings
@@ -2179,6 +2433,10 @@ def main():
     app.add_handler(CommandHandler("oi", oi_direct_start), group=-1)
     app.add_handler(CallbackQueryHandler(oi_direct_callback, pattern="^oi_"), group=-1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, oi_direct_text), group=3)
+    # Critical direct liquidity preview handler: keep before unknown.
+    app.add_handler(CommandHandler("check", check_direct_start), group=-1)
+    app.add_handler(CallbackQueryHandler(check_direct_callback, pattern="^check_"), group=-1)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_direct_text), group=4)
     # /analyze ConversationHandler
     analyze_conv = ConversationHandler(
         entry_points=[CommandHandler("analyze", cmd_analyze_start)],
