@@ -8,7 +8,7 @@ from ai import gemini_analyze_bulk, get_last_gemini_error
 from analysis import analyze_rates, calc_std, get_active_exchanges, recent_trend_ok
 from config import AUTO_REPORT_MIN_DAILY_USD, AUTO_REPORT_MIN_ENTRY_SPREAD_PCT, AUTO_SCAN_AMOUNT, AUTO_SCAN_DAYS, GEMINI_API_KEY, REPORT_CHAT_ID, TEMPORARILY_DISABLED_EXCHANGES
 from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, EXCHANGE_SYMBOL_FETCHERS, _proxies, phemex_get_all_symbols
-from oi import format_oi_status, format_volume_status, is_oi_allowed, is_volume_allowed
+from oi import format_oi_status, format_volume_status
 
 
 def temporary_disabled_text():
@@ -33,8 +33,8 @@ ENTRY_INSTRUCTIONS = """🛡️ *Главная задача — не потер
 
 📊 *Фильтры и анализ:*
 
-• 🐋 *Open Interest (OI):* В боте монеты с OI ниже *$500,000* скрываются автоматически. От *$500,000* до *$1,000,000* — только ⚠️ ручная осторожность. Для входа приоритет — *$1,000,000+* на конкретной бирже. Зайдя на свои *$15,000* в слабый OI, ты сам проломишь пустой стакан (как было с FLOW на Toobit), оторвешь цену фьючерса от спота и алгоритм может влепить штрафной отрицательный фандинг. Твой ордер не должен превышать *1–1.5%* от всего OI.
-• 📊 *24h Volume:* Монеты с подтверждённым оборотом ниже *$400,000* скрываются автоматически. От *$400,000* до *$2,000,000* — ⚠️ только ручная проверка стакана, spread и slippage.
+• 🐋 *Open Interest (OI):* В ручном `/analyze` монеты с OI ниже *$500,000* скрываются автоматически; для XT порог *$150,000*, Aster не фильтруется. В автоотчётах 20:00/21:00 OI не скрывает монеты, а показывается как риск-статус ✅/⚠️/🚫. Для входа приоритет — *$1,000,000+* на конкретной бирже. Твой ордер не должен превышать *1–1.5%* от всего OI.
+• 📊 *24h Volume:* В ручном `/analyze` подтверждённый оборот ниже *$400,000* скрывается автоматически; для XT порог *$150,000*, Aster не фильтруется. В автоотчётах 20:00/21:00 Vol24h не скрывает монеты, а показывается как риск-статус ✅/⚠️/🚫. Дальше нужна ручная проверка стакана, spread и slippage.
 • *Прибыльность:* Фандинг стабильно *0.03% – 0.08%* (если меньше — невыгодно).
 • *Спред входа:* Строго *до -0.5%*.
 • *Ликвидность:* Смотреть суточный объем и сумму первых 5 ордеров в стакане.
@@ -265,10 +265,6 @@ def find_delta_pair_for_signal(coin, signal, days, active_exchanges):
             entry_spread = entry_spread_pct(quote_cache.get(long_ex), quote_cache.get(short_ex))
             if entry_spread is None or entry_spread < AUTO_REPORT_MIN_ENTRY_SPREAD_PCT:
                 continue
-            if not is_oi_allowed(long_ex, coin) or not is_oi_allowed(short_ex, coin):
-                continue
-            if not is_volume_allowed(long_ex, coin) or not is_volume_allowed(short_ex, coin):
-                continue
             net_daily_pct = calc_pair_daily_income_pct(
                 long_info["avg"],
                 long_info["payments_per_day"],
@@ -350,12 +346,6 @@ async def run_evening_report(context: ContextTypes.DEFAULT_TYPE, chat_id: int, m
             ordered_rates = [rate for _, rate in sorted(rows, key=lambda x: x[0])]
             metrics = analyze_rates(ordered_rates)
             if metrics and metrics["category"] == "full" and recent_trend_ok(ordered_rates, metrics["direction"]):
-                if not is_oi_allowed(ex, coin):
-                    time.sleep(0.1)
-                    continue
-                if not is_volume_allowed(ex, coin):
-                    time.sleep(0.1)
-                    continue
                 key_avg = metrics["neg_avg"] if metrics["direction"] == "LONG" else metrics["pos_avg"]
                 full_signals.append({
                     "coin": coin,
