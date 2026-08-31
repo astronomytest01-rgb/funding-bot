@@ -30,7 +30,6 @@ LONGTERM_MIN_MONTHLY_USD = float(os.getenv("LONGTERM_MIN_MONTHLY_USD", "300"))
 LONGTERM_SYMBOL_LIMIT = int(os.getenv("LONGTERM_SYMBOL_LIMIT", "180"))
 LONGTERM_TOP_COINS = int(os.getenv("LONGTERM_TOP_COINS", "60"))
 LONGTERM_PAGE_SIZE = int(os.getenv("LONGTERM_PAGE_SIZE", "5"))
-LONGTERM_VARIANTS_PER_COIN = int(os.getenv("LONGTERM_VARIANTS_PER_COIN", "4"))
 LONGTERM_GEMINI_FILTER = os.getenv("LONGTERM_GEMINI_FILTER", "1").lower() not in ("0", "false", "off", "no")
 LONGTERM_GEMINI_CHUNK_SIZE = int(os.getenv("LONGTERM_GEMINI_CHUNK_SIZE", "15"))
 LONGTERM_MIN_OI_WARN_USD = float(os.getenv("LONGTERM_MIN_OI_WARN_USD", "1000000"))
@@ -432,6 +431,16 @@ def format_longterm_summary(result):
         if before_gemini is not None
         else ""
     )
+    selected_before_gemini = before_gemini if before_gemini is not None else len(result["groups"])
+    total_coins = result.get("groups_total", selected_before_gemini)
+    limit_line = (
+        f"Лимит выдачи до Gemini: `{selected_before_gemini}` из `{total_coins}` монет\n"
+        if total_coins > selected_before_gemini else ""
+    )
+    error_line = (
+        f"⚠️ Ошибок получения funding: `{len(result['errors'])}`; результат может быть неполным.\n"
+        if result.get("errors") else ""
+    )
     return (
         "🧲 *Долгосрочный funding scan*\n\n"
         f"Биржи: `{labels}`\n"
@@ -440,9 +449,12 @@ def format_longterm_summary(result):
         f"Период: `{result['days']}` дней\n"
         "Оценка прибыли: `$8,000` и `$20,000` на ногу\n"
         f"Монет проверено: `{result['symbols_scanned']}`\n"
-        f"Связок найдено: `{result['pairs_found']}`\n\n"
-        f"Монет с вариантами: `{result.get('groups_total', len(result['groups']))}`\n"
+        f"Маршрутов до Gemini (включая альтернативы): `{result['pairs_found']}`\n"
+        f"Монет по funding-фильтрам: `{total_coins}`\n"
+        f"{limit_line}"
         f"{gemini_line}"
+        f"Доступно к показу: `{len(result['groups'])}` монет — по одной лучшей связке\n"
+        f"{error_line}"
         f"Показываю порциями по `{LONGTERM_PAGE_SIZE}` монет\n\n"
         "OI/24h volume и live-спред не фильтруют longterm-результат."
     )
@@ -481,8 +493,9 @@ def _pair_daily_pct(pair):
 
 
 def format_longterm_coin(symbol, pairs):
-    lines = [f"🧲 *{symbol}*", f"Вариантов: `{len(pairs)}`", ""]
-    for idx, pair in enumerate(pairs[:LONGTERM_VARIANTS_PER_COIN], 1):
+    # Preserve scanner ranking and Gemini input; collapse routes only for display.
+    lines = [f"🧲 *{symbol}*"]
+    for pair in pairs[:1]:
         long_label = EXCHANGE_LABELS.get(pair.long.exchange, pair.long.exchange.upper())
         short_label = EXCHANGE_LABELS.get(pair.short.exchange, pair.short.exchange.upper())
         net_daily_pct = _pair_daily_pct(pair)
@@ -494,7 +507,6 @@ def format_longterm_coin(symbol, pairs):
             else "нет данных"
         )
         lines.append(
-            f"*#{idx}*\n"
             f"🟢 Лонг: `{long_label}` avg `{pair.long.avg:+.4f}%` | "
             f"`{pair.long.payments_per_day:.1f}` выплат/день | "
             f"{_format_leg_oi(pair.long)} | {_format_leg_volume(pair.long)}\n"
@@ -530,7 +542,7 @@ def _enrich_entry_spreads(groups):
     visible = [
         pair
         for _symbol, pairs in groups
-        for pair in pairs[:LONGTERM_VARIANTS_PER_COIN]
+        for pair in pairs[:1]
     ]
     quote_keys = {
         (pair.symbol, exchange)
@@ -555,7 +567,7 @@ def _enrich_entry_spreads(groups):
     for symbol, pairs in groups:
         enriched = []
         for pair in pairs:
-            if len(enriched) < LONGTERM_VARIANTS_PER_COIN:
+            if not enriched:
                 spread = entry_spread_pct(
                     quotes.get((symbol, pair.long.exchange)),
                     quotes.get((symbol, pair.short.exchange)),
@@ -689,7 +701,11 @@ async def send_longterm_page(bot, chat_id, token, offset):
             reply_markup=markup,
         )
     else:
-        await bot.send_message(chat_id, f"Готово. Показано {total} монет.")
+        await bot.send_message(
+            chat_id,
+            f"Готово. Показано {total} из {total} монет. "
+            "Все монеты этого результата показаны — следующей страницы нет.",
+        )
 
 
 async def longterm_more_callback(update, context: ContextTypes.DEFAULT_TYPE):
