@@ -10,6 +10,9 @@ VOLUME_HIDE_BELOW_USD = 400_000
 VOLUME_OK_USD = 2_000_000
 EXCHANGE_OI_HIDE_BELOW_USD = {"xt": 150_000}
 EXCHANGE_VOLUME_HIDE_BELOW_USD = {"xt": 150_000}
+EXCHANGE_OI_OK_USD = {"xt": 150_000}
+EXCHANGE_VOLUME_OK_USD = {"xt": 150_000}
+LIQUIDITY_FILTER_DISABLED_EXCHANGES = {"aster"}
 
 COINGECKO_DERIVATIVE_IDS = {
     "binance": "binance_futures",
@@ -294,6 +297,18 @@ def get_volume_hide_threshold(exchange):
     return EXCHANGE_VOLUME_HIDE_BELOW_USD.get(exchange.lower(), VOLUME_HIDE_BELOW_USD)
 
 
+def get_oi_ok_threshold(exchange):
+    return EXCHANGE_OI_OK_USD.get(exchange.lower(), OI_OK_USD)
+
+
+def get_volume_ok_threshold(exchange):
+    return EXCHANGE_VOLUME_OK_USD.get(exchange.lower(), VOLUME_OK_USD)
+
+
+def is_liquidity_filter_disabled(exchange):
+    return exchange.lower() in LIQUIDITY_FILTER_DISABLED_EXCHANGES
+
+
 def get_exchange_oi_map(exchange):
     exchange = exchange.lower()
     now = time.time()
@@ -404,12 +419,16 @@ def is_oi_allowed(exchange, coin):
     Missing CoinGecko data is kept visible as a warning because the exchange API
     data can still be valid while the OI provider is incomplete or rate-limited.
     """
+    if is_liquidity_filter_disabled(exchange):
+        return True
     oi_usd = get_open_interest_usd(exchange, coin)
     return oi_usd is None or oi_usd >= get_oi_hide_threshold(exchange)
 
 
 def is_volume_allowed(exchange, coin):
     """Hard filter: hide only confirmed 24h turnover below the exchange threshold."""
+    if is_liquidity_filter_disabled(exchange):
+        return True
     volume_usd = get_24h_volume_usd(exchange, coin)
     return volume_usd is None or volume_usd >= get_volume_hide_threshold(exchange)
 
@@ -417,12 +436,13 @@ def is_volume_allowed(exchange, coin):
 def format_oi_status(exchange, coin, order_usd=15_000):
     oi_usd = get_open_interest_usd(exchange, coin)
     hide_threshold = get_oi_hide_threshold(exchange)
+    ok_threshold = get_oi_ok_threshold(exchange)
     if oi_usd is None:
         return "⚠️ OI: нет данных"
     order_share = order_usd / oi_usd if oi_usd > 0 else 1
     oi_text = f"${oi_usd:,.0f}"
     share_text = f"{order_share * 100:.2f}%"
-    if oi_usd >= OI_OK_USD:
+    if oi_usd >= ok_threshold:
         return f"✅ OI {oi_text} | $15k = {share_text}"
     if oi_usd < hide_threshold:
         return f"🚫 OI {oi_text} | $15k = {share_text}"
@@ -432,11 +452,12 @@ def format_oi_status(exchange, coin, order_usd=15_000):
 def format_volume_status(exchange, coin):
     volume_usd = get_24h_volume_usd(exchange, coin)
     hide_threshold = get_volume_hide_threshold(exchange)
+    ok_threshold = get_volume_ok_threshold(exchange)
     if volume_usd is None:
         return "⚠️ Vol24h: нет данных"
     volume_text = f"${volume_usd:,.0f}"
     if volume_usd < hide_threshold:
         return f"🚫 Vol24h {volume_text}"
-    if volume_usd < VOLUME_OK_USD:
+    if volume_usd < ok_threshold:
         return f"⚠️ Vol24h {volume_text}"
     return f"✅ Vol24h {volume_text}"

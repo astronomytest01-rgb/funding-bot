@@ -50,8 +50,11 @@ from oi import (
     format_volume_status,
     get_24h_volume_usd,
     get_oi_hide_threshold,
+    get_oi_ok_threshold,
     get_open_interest_usd,
+    get_volume_ok_threshold,
     get_volume_hide_threshold,
+    is_liquidity_filter_disabled,
     is_oi_allowed,
     is_volume_allowed,
 )
@@ -608,9 +611,23 @@ def format_oi_recommendation(coin, exchange):
     volume_usd = get_24h_volume_usd(exchange, coin)
     volume_status = format_volume_status(exchange, coin)
     oi_hide = get_oi_hide_threshold(exchange)
+    oi_ok = get_oi_ok_threshold(exchange)
     volume_hide = get_volume_hide_threshold(exchange)
+    volume_ok = get_volume_ok_threshold(exchange)
     oi_hide_text = f"${oi_hide:,.0f}"
+    oi_ok_text = f"${oi_ok:,.0f}"
     volume_hide_text = f"${volume_hide:,.0f}"
+    volume_ok_text = f"${volume_ok:,.0f}"
+    if is_liquidity_filter_disabled(exchange):
+        return (
+            f"🐋 *Open Interest + Volume check*\n\n"
+            f"Монета: `{coin}`\n"
+            f"Биржа: *{label}*\n"
+            f"Статус: {status}\n\n"
+            f"Оборот: {volume_status}\n\n"
+            "ℹ️ *Aster — особая биржа:* OI и 24h volume показываются только для информации. "
+            "Бот не скрывает и не фильтрует Aster по этим значениям в `/analyze` и вечернем отчёте."
+        )
     if oi_usd is None:
         verdict = (
             "⚠️ *Данных OI нет.* Не заходи без ручной проверки OI на самой бирже, "
@@ -621,9 +638,9 @@ def format_oi_recommendation(coin, exchange):
             f"🚫 *Не стоит заходить.* OI ниже `{oi_hide_text}`, бот скрывает такие монеты "
             "из `/analyze` и вечернего отчёта."
         )
-    elif oi_usd < OI_OK_USD:
+    elif oi_usd < oi_ok:
         verdict = (
-            "⚠️ *Высокий риск.* OI между `$500,000` и `$1,000,000`: можно смотреть только "
+            f"⚠️ *Высокий риск.* OI между `{oi_hide_text}` и `{oi_ok_text}`: можно смотреть только "
             "после ручной проверки стакана, но для позиции около `$15,000` лучше пропустить."
         )
     else:
@@ -635,8 +652,10 @@ def format_oi_recommendation(coin, exchange):
         volume_verdict = "⚠️ *Данных 24h volume нет.* Обязательно проверь оборот на бирже вручную."
     elif volume_usd < volume_hide:
         volume_verdict = f"🚫 *24h volume ниже {volume_hide_text}.* Бот скрывает такие монеты из `/analyze` и вечернего отчёта."
+    elif volume_usd < volume_ok:
+        volume_verdict = f"⚠️ *24h volume между {volume_hide_text} и {volume_ok_text}.* Нужна ручная проверка стакана и slippage."
     else:
-        volume_verdict = "✅ *24h volume проходит фильтр.* Если статус ⚠️ — нужна ручная проверка стакана и slippage."
+        volume_verdict = "✅ *24h volume проходит фильтр.* Всё равно проверь стакан и slippage перед входом."
     return (
         f"🐋 *Open Interest + Volume check*\n\n"
         f"Монета: `{coin}`\n"
