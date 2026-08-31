@@ -653,6 +653,125 @@ def bitunix_get_all_symbols():
 
 
 # ─────────────────────────────────────────────
+# BITGET API
+# ─────────────────────────────────────────────
+
+
+def bitget_symbol_for_coin(coin):
+    coin = coin.upper()
+    if coin.endswith("USDT"):
+        return coin
+    if coin.endswith("USD"):
+        return f"{coin[:-3]}USDT"
+    return f"{coin}USDT"
+
+
+def bitget_fetch(coin, start_ms, end_ms):
+    """Bitget USDT-FUTURES funding history."""
+    sym = bitget_symbol_for_coin(coin)
+    try:
+        url = "https://api.bitget.com/api/v2/mix/market/history-fund-rate"
+        params = {
+            "symbol": sym,
+            "productType": "USDT-FUTURES",
+            "pageSize": "100",
+            "pageNo": "1",
+        }
+        r = requests.get(url, params=params, timeout=6)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("code") != "00000":
+            return [], data.get("msg", "API error")
+        rows = []
+        for x in data.get("data", []):
+            ts = int(x.get("fundingTime") or x.get("fundingRateTimestamp") or 0)
+            if start_ms <= ts <= end_ms:
+                rows.append((ts, float(x.get("fundingRate", 0)) * 100))
+        return sorted(rows, key=lambda x: x[0]), sym
+    except Exception as e:
+        return [], str(e)
+
+
+def bitget_get_all_symbols():
+    """Returns normal USDT perpetual Bitget Futures symbols as base coins."""
+    url = "https://api.bitget.com/api/v2/mix/market/contracts"
+    r = requests.get(url, params={"productType": "USDT-FUTURES"}, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("code") != "00000":
+        raise ValueError(data.get("msg", "API error"))
+    coins = []
+    seen = set()
+    for item in data.get("data", []):
+        if item.get("quoteCoin") != "USDT" or item.get("symbolStatus") != "normal":
+            continue
+        coin = str(item.get("baseCoin") or "").upper()
+        if coin and coin not in seen:
+            coins.append(coin)
+            seen.add(coin)
+    return coins
+
+
+# ─────────────────────────────────────────────
+# ASTER API
+# ─────────────────────────────────────────────
+
+
+def aster_symbol_for_coin(coin):
+    coin = coin.upper()
+    if coin.endswith("USDT"):
+        return coin
+    if coin.endswith("USD"):
+        return f"{coin[:-3]}USDT"
+    return f"{coin}USDT"
+
+
+def aster_fetch(coin, start_ms, end_ms):
+    """Aster USDT perpetual funding history."""
+    sym = aster_symbol_for_coin(coin)
+    try:
+        url = "https://fapi.asterdex.com/fapi/v1/fundingRate"
+        params = {"symbol": sym, "startTime": start_ms, "endTime": end_ms, "limit": 1000}
+        r = requests.get(url, params=params, timeout=6)
+        if r.status_code in (418, 429):
+            return [], f"Aster rate limit/WAF {r.status_code}"
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list):
+            return [], str(data)[:120]
+        rows = []
+        for x in data:
+            ts = int(x.get("fundingTime", 0))
+            if start_ms <= ts <= end_ms:
+                rows.append((ts, float(x.get("fundingRate", 0)) * 100))
+        return sorted(rows, key=lambda x: x[0]), sym
+    except Exception as e:
+        return [], str(e)
+
+
+def aster_get_all_symbols():
+    """Returns trading USDT perpetual Aster symbols as base coins."""
+    url = "https://fapi.asterdex.com/fapi/v1/exchangeInfo"
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    coins = []
+    seen = set()
+    for item in data.get("symbols", []):
+        if (
+            item.get("contractType") != "PERPETUAL"
+            or item.get("quoteAsset") != "USDT"
+            or item.get("status") != "TRADING"
+        ):
+            continue
+        coin = str(item.get("baseAsset") or "").upper()
+        if coin and coin not in seen:
+            coins.append(coin)
+            seen.add(coin)
+    return coins
+
+
+# ─────────────────────────────────────────────
 # УНИВЕРСАЛЬНЫЙ АНАЛИЗ
 # ─────────────────────────────────────────────
 
@@ -753,6 +872,8 @@ EXCHANGE_FETCHERS = {
     "coinw": coinw_fetch,
     "kucoin": kucoin_fetch,
     "bitunix": bitunix_fetch,
+    "bitget": bitget_fetch,
+    "aster": aster_fetch,
 }
 
 EXCHANGE_SYMBOL_FETCHERS = {
@@ -765,6 +886,8 @@ EXCHANGE_SYMBOL_FETCHERS = {
     "coinw": None,
     "kucoin": kucoin_get_all_symbols,
     "bitunix": bitunix_get_all_symbols,
+    "bitget": bitget_get_all_symbols,
+    "aster": aster_get_all_symbols,
 }
 
 EXCHANGE_LABELS = {
@@ -779,4 +902,6 @@ EXCHANGE_LABELS = {
     "coinw": "CoinW",
     "kucoin": "KuCoin",
     "bitunix": "Bitunix",
+    "bitget": "Bitget",
+    "aster": "Aster",
 }

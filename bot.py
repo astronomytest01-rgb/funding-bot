@@ -49,7 +49,9 @@ from oi import (
     format_oi_status,
     format_volume_status,
     get_24h_volume_usd,
+    get_oi_hide_threshold,
     get_open_interest_usd,
+    get_volume_hide_threshold,
     is_oi_allowed,
     is_volume_allowed,
 )
@@ -605,14 +607,18 @@ def format_oi_recommendation(coin, exchange):
     status = format_oi_status(exchange, coin)
     volume_usd = get_24h_volume_usd(exchange, coin)
     volume_status = format_volume_status(exchange, coin)
+    oi_hide = get_oi_hide_threshold(exchange)
+    volume_hide = get_volume_hide_threshold(exchange)
+    oi_hide_text = f"${oi_hide:,.0f}"
+    volume_hide_text = f"${volume_hide:,.0f}"
     if oi_usd is None:
         verdict = (
             "⚠️ *Данных OI нет.* Не заходи без ручной проверки OI на самой бирже, "
             "глубины стакана, spread, slippage и Predicted Rate."
         )
-    elif oi_usd < OI_HIDE_BELOW_USD:
+    elif oi_usd < oi_hide:
         verdict = (
-            "🚫 *Не стоит заходить.* OI ниже `$500,000`, бот скрывает такие монеты "
+            f"🚫 *Не стоит заходить.* OI ниже `{oi_hide_text}`, бот скрывает такие монеты "
             "из `/analyze` и вечернего отчёта."
         )
     elif oi_usd < OI_OK_USD:
@@ -627,8 +633,8 @@ def format_oi_recommendation(coin, exchange):
         )
     if volume_usd is None:
         volume_verdict = "⚠️ *Данных 24h volume нет.* Обязательно проверь оборот на бирже вручную."
-    elif volume_usd < VOLUME_HIDE_BELOW_USD:
-        volume_verdict = "🚫 *24h volume ниже $400,000.* Бот скрывает такие монеты из `/analyze` и вечернего отчёта."
+    elif volume_usd < volume_hide:
+        volume_verdict = f"🚫 *24h volume ниже {volume_hide_text}.* Бот скрывает такие монеты из `/analyze` и вечернего отчёта."
     else:
         volume_verdict = "✅ *24h volume проходит фильтр.* Если статус ⚠️ — нужна ручная проверка стакана и slippage."
     return (
@@ -714,6 +720,7 @@ async def oi_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for exchange in exchanges:
             await q.message.reply_text(format_oi_recommendation(coin, exchange), parse_mode="Markdown")
         context.user_data.pop("oi_selected_ex", None)
+        context.user_data.pop("awaiting_oi_coin", None)
         return ConversationHandler.END
 
     exchange = q.data.replace("oi_ex_", "")
@@ -731,6 +738,42 @@ async def oi_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["oi_selected_ex"] = selected
     await q.edit_message_reply_markup(reply_markup=make_oi_exchange_keyboard(selected))
     return OI_EXCH
+
+
+async def oi_direct_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Standalone /oi handler registered before unknown, same safety pattern as /ai and /funding."""
+    context.user_data.pop("awaiting_oi_coin", None)
+    if context.args:
+        coin = normalize_oi_coin(" ".join(context.args))
+        if coin:
+            context.user_data["oi_coin"] = coin
+            context.user_data["oi_selected_ex"] = set()
+            await update.message.reply_text(
+                f"Монета: `{coin}`\n\nШаг 2/2: выбери одну или несколько бирж для проверки OI и 24h volume:",
+                reply_markup=make_oi_exchange_keyboard(set()),
+                parse_mode="Markdown",
+            )
+            raise ApplicationHandlerStop
+    context.user_data["awaiting_oi_coin"] = True
+    await update.message.reply_text(
+        "🐋 Проверка Open Interest + 24h volume\n\n"
+        "Шаг 1/2: введи монету, например `FLOW` или `JTO`.\n\n"
+        "Быстрый ввод тоже работает: `/oi FLOW`",
+        parse_mode="Markdown",
+    )
+    raise ApplicationHandlerStop
+
+
+async def oi_direct_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.pop("awaiting_oi_coin", False):
+        return
+    await oi_got_coin(update, context)
+    raise ApplicationHandlerStop
+
+
+async def oi_direct_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await oi_exchange_btn(update, context)
+    raise ApplicationHandlerStop
 
 
 # cmd_exchanges удалена — используй /settings
@@ -780,6 +823,8 @@ SCAN_EXCHANGE_FETCHERS = {
     "coinw":  "coinw",
     "kucoin": "kucoin",
     "bitunix": "bitunix",
+    "bitget": "bitget",
+    "aster": "aster",
 }
 
 
@@ -2111,6 +2156,10 @@ def main():
     app.add_handler(CommandHandler("funding", funding_direct_start), group=-1)
     app.add_handler(CallbackQueryHandler(funding_direct_callback, pattern="^fr_"), group=-1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, funding_direct_text), group=2)
+    # Critical direct OI handler: keep before ConversationHandlers and unknown.
+    app.add_handler(CommandHandler("oi", oi_direct_start), group=-1)
+    app.add_handler(CallbackQueryHandler(oi_direct_callback, pattern="^oi_"), group=-1)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, oi_direct_text), group=3)
     # /analyze ConversationHandler
     analyze_conv = ConversationHandler(
         entry_points=[CommandHandler("analyze", cmd_analyze_start)],

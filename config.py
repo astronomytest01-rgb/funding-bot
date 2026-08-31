@@ -38,6 +38,8 @@ EXCHANGES_ENABLED = {
     "okx": True,
     "gate": True,
     "bingx": True,
+    "bitget": True,
+    "aster": True,
     "coinw": True,
     "kucoin": True,
     "bitunix": False,

@@ -93,7 +93,7 @@ AUTO_REPORT_MIN_ENTRY_SPREAD_PCT = -0.8
 Активные биржи:
 
 ```text
-binance, bybit, phemex, xt, toobit, okx, gate, bingx, coinw, kucoin
+binance, bybit, phemex, xt, toobit, okx, gate, bingx, bitget, aster, coinw, kucoin
 ```
 
 Временно отключены и скрыты из команд, кнопок, `/analyze`, `/report`, `/oi`, `/funding`, `/filter`, `/calculator` и delta-подбора:
@@ -106,7 +106,7 @@ bitunix
 
 Toobit `/analyze` uses native `/api/v1/exchangeInfo` futures `contracts`, not the Phemex fallback list. This includes Toobit-only TradFi/commodity contracts such as `GER40` and `NG`.
 
-Binance, Bybit, Gate, XT, Toobit and KuCoin `/analyze` use native exchange symbol lists instead of the Phemex fallback universe.
+Binance, Bybit, Gate, XT, Toobit, KuCoin, Bitget and Aster `/analyze` use native exchange symbol lists instead of the Phemex fallback universe.
 
 ## Фильтры анализа
 
@@ -133,7 +133,9 @@ OI-проверка теперь является частью фильтра. �
 
 Правило отображения:
 
-- монета скрывается из `/analyze` и вечернего отчёта, если CoinGecko подтверждает OI ниже `$500,000`;
+- монета скрывается из `/analyze` и вечернего отчёта, если подтверждённый OI ниже `$500,000`;
+- исключение: для XT hard-порог OI снижен до `$150,000`, другие биржи остаются на `$500,000`;
+- Bitget OI берётся native из `holdingAmount * markPrice`, Aster OI берётся через CoinGecko `aster`;
 - transient CoinGecko errors/429 do not overwrite the last valid OI cache with empty data;
 - ⚠️ если OI от `$500,000` до `$1,000,000`, CoinGecko не отдал данные или пары нет в источнике;
 - ✅ если OI на конкретной бирже от `$1,000,000`;
@@ -148,6 +150,7 @@ OI-проверка теперь является частью фильтра. �
 Правило:
 
 - монета скрывается из `/analyze` и вечернего отчёта, если подтверждённый оборот за 24 часа ниже `$400,000`;
+- исключение: для XT hard-порог 24h volume снижен до `$150,000`, другие биржи остаются на `$400,000`;
 - ⚠️ если оборот от `$400,000` до `$2,000,000` или данные временно недоступны;
 - ✅ если оборот от `$2,000,000`;
 - отсутствующие volume-данные не скрывают монету, чтобы не терять рабочие пары из-за rate-limit/API-сбоя, но в Telegram показывается `⚠️ Vol24h: нет данных`.
@@ -160,6 +163,8 @@ OI-проверка теперь является частью фильтра. �
 - `phemex`: native Phemex `/md/v2/ticker/24hr/all`, поле `turnoverRv`;
 - `binance`: native Binance Futures `quoteVolume` (через `BINANCE_PROXY_URL`);
 - `bybit`: native Bybit linear `turnover24h` (через `BYBIT_PROXY_URL`);
+- `bitget`: native Bitget Futures `/api/v2/mix/market/tickers`, поля `quoteVolume`/`usdtVolume`;
+- `aster`: native Aster `/fapi/v1/ticker/24hr`, поле `quoteVolume`;
 - `okx`, `bingx` и fallback для остальных: CoinGecko Derivatives `volume_24h`.
 
 Если native-источник недоступен (proxy не задан или API-ошибка), бот автоматически переключается на CoinGecko fallback.
@@ -250,6 +255,8 @@ help - Справка
 - пошагово: команда -> монета -> мультивыбор бирж кнопками -> подтверждение -> отдельная рекомендация по каждой выбранной бирже;
 - использует те же OI-пороги, что `/analyze` и вечерний отчёт: `< $500k` 🚫, `$500k-$1m` ⚠️, `$1m+` ✅;
 - показывает 24h volume: `< $400k` 🚫, `$400k-$2m` ⚠️, `$2m+` ✅;
+- для XT в `/oi`, `/analyze` и вечернем отчёте hard-пороги OI/24h volume равны `$150k`;
+- зарегистрирована прямым `CommandHandler` до `unknown`, как `/ai` и `/funding`, чтобы не проваливаться в "Не знаю такой команды" после deploy/restart;
 - кнопка `Все биржи` работает как toggle: повторное нажатие снимает выделение;
 - быстрый ввод: `/oi FLOW`.
 
@@ -336,6 +343,8 @@ help - Справка
 | `coinw` | CoinW | Supabase collector, table `funding_rates` |
 | `kucoin` | KuCoin | public contract funding-rates |
 | `bitunix` | Bitunix | public get_funding_rate_history; временно отключена в `EXCHANGES_ENABLED` |
+| `bitget` | Bitget | public `/api/v2/mix/market/history-fund-rate` + native contracts/tickers |
+| `aster` | Aster | public `/fapi/v1/fundingRate` + native `exchangeInfo`/ticker |
 
 ## Архитектура кода
 
@@ -351,7 +360,7 @@ longterm.py  - long-term stable funding scan and 21:00 auto job
 
 ## Handler safety contract
 
-Критичные публичные команды не должны зависеть только от `ConversationHandler` entry point, если после них есть общий `unknown` handler. Для команд `/ai` и `/funding` используется прямой `CommandHandler` в группе `-1`, текстовый fallback через `user_data` и обязательный `ApplicationHandlerStop` после обработки. Это предотвращает двойной ответ вида "команда сработала" + "Не знаю такой команды".
+Критичные публичные команды не должны зависеть только от `ConversationHandler` entry point, если после них есть общий `unknown` handler. Для команд `/ai`, `/funding` и `/oi` используется прямой `CommandHandler` в группе `-1`, текстовый fallback через `user_data` и обязательный `ApplicationHandlerStop` после обработки. Это предотвращает двойной ответ вида "команда сработала" + "Не знаю такой команды".
 
 Правило для будущих правок:
 
@@ -369,7 +378,7 @@ longterm.py  - long-term stable funding scan and 21:00 auto job
 2. Импорт всех модулей без `NameError`.
 3. `/funding` получает данные хотя бы по одной рабочей бирже.
 4. `/analyze` в режиме `Средняя ставка` показывает LONG и SHORT группы, если они есть.
-5. `/analyze` в режиме `Средний доход` ищет и 🟢 LONG, и 🔴 SHORT, скрывает OI ниже $500k и 24h volume ниже $400k, показывает OI/Vol24h статус ✅/⚠️.
+5. `/analyze` в режиме `Средний доход` ищет и 🟢 LONG, и 🔴 SHORT, скрывает OI ниже $500k и 24h volume ниже $400k, кроме XT с hard-порогами $150k/$150k, показывает OI/Vol24h статус ✅/⚠️/🚫.
 6. Во время длинного `/analyze` бот продолжает отвечать на Telegram-команды; сетевые fetch/OI/volume вызовы не блокируют event loop.
 7. Trend-фильтр работает по последним 4 ставкам: минимум 2 из 4 в нужную сторону.
 8. Gemini output сохраняет emoji направления: 🟢 LONG, 🔴 SHORT.
@@ -378,14 +387,15 @@ longterm.py  - long-term stable funding scan and 21:00 auto job
 11. `/filter`, `/funding`, `/calculator`, `/oi` при выборе двух бирж показывают результат только по выбранным двум, а не по всем.
 12. Кнопка `Все биржи` повторным нажатием меняется на снятие выделения; подтверждение без выбора просит выбрать биржу.
 13. `/oi` проходит сценарий монета -> мультивыбор бирж -> подтверждение -> рекомендации и использует те же OI/24h volume пороги, что фильтры.
-14. Вечерний отчёт использует только `full`-монеты, скрывает OI ниже $500k и 24h volume ниже $400k, показывает OI/Vol24h статус long/short бирж, Gemini показывает как рекомендацию, считает прибыль за 1 день и отправляет инструкцию входа.
+14. Вечерний отчёт использует только `full`-монеты, скрывает OI ниже $500k и 24h volume ниже $400k, кроме XT с hard-порогами $150k/$150k, показывает OI/Vol24h статус long/short бирж, Gemini показывает как рекомендацию, считает прибыль за 1 день и отправляет инструкцию входа.
 15. Вечерний отчёт нормализует funding по выплатам в день: 1h, 4h и 8h биржи сравниваются через дневную доходность; маршруты ниже `$10/день`, отрицательные маршруты и маршруты со spread входа ниже `-0.8%` не выводятся.
 16. `/longfunding` отправляет summary и группирует результат: одна монета = одно сообщение; OI/24h volume только warning, не фильтр.
 17. Ручной `/longfunding` не использует Gemini; auto job в 21:00 с `GEMINI_API_KEY` фильтрует активы по долгосрочному качеству, исключая мемкоины, микрокапы и высокий риск резких свечей.
 18. `/longfunding` отдаёт результаты порциями и кнопка `Показать ещё` показывает следующую порцию без повторного скана.
 19. Longterm auto job запускается в 21:00 Europe/Kyiv / 18:00 UTC при наличии `REPORT_CHAT_ID`.
-20. Bitunix временно отключена: она не появляется в кнопках и не работает через прямые команды, но API-код сохранён для быстрого возврата.
-21. Оба `.md` файла обновлены перед push.
+20. Bitget и Aster активны и участвуют в `/analyze`, авто-отчёте 20:00 и `/longfunding`/авто-отчёте 21:00.
+21. Bitunix временно отключена: она не появляется в кнопках и не работает через прямые команды, но API-код сохранён для быстрого возврата.
+22. Оба `.md` файла обновлены перед push.
 
 ## Ограничения
 

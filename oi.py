@@ -8,6 +8,8 @@ OI_HIDE_BELOW_USD = 500_000
 OI_OK_USD = 1_000_000
 VOLUME_HIDE_BELOW_USD = 400_000
 VOLUME_OK_USD = 2_000_000
+EXCHANGE_OI_HIDE_BELOW_USD = {"xt": 150_000}
+EXCHANGE_VOLUME_HIDE_BELOW_USD = {"xt": 150_000}
 
 COINGECKO_DERIVATIVE_IDS = {
     "binance": "binance_futures",
@@ -21,6 +23,8 @@ COINGECKO_DERIVATIVE_IDS = {
     "coinw": "coinw_futures",
     "bitunix": "bitunix_futures",
     "kucoin": "kumex",
+    "bitget": "bitget_futures",
+    "aster": "aster",
 }
 
 _oi_cache = {}
@@ -201,6 +205,46 @@ def _fetch_native_gate_volume_map():
     return result
 
 
+def _fetch_native_bitget_volume_map():
+    r = requests.get(
+        "https://api.bitget.com/api/v2/mix/market/tickers",
+        params={"productType": "USDT-FUTURES"},
+        timeout=10,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if data.get("code") != "00000":
+        return {}
+    result = {}
+    for item in data.get("data", []):
+        symbol = str(item.get("symbol") or "").upper()
+        if not symbol.endswith("USDT"):
+            continue
+        try:
+            volume = float(item.get("quoteVolume") or item.get("usdtVolume") or 0)
+        except (TypeError, ValueError):
+            continue
+        _put_volume(result, symbol[:-len("USDT")], volume)
+    return result
+
+
+def _fetch_native_aster_volume_map():
+    r = requests.get("https://fapi.asterdex.com/fapi/v1/ticker/24hr", timeout=10)
+    r.raise_for_status()
+    items = r.json()
+    result = {}
+    for item in items if isinstance(items, list) else []:
+        symbol = str(item.get("symbol") or "").upper()
+        if not symbol.endswith("USDT"):
+            continue
+        try:
+            volume = float(item.get("quoteVolume") or 0)
+        except (TypeError, ValueError):
+            continue
+        _put_volume(result, symbol[:-len("USDT")], volume)
+    return result
+
+
 NATIVE_VOLUME_FETCHERS = {
     "binance": _fetch_native_binance_volume_map,
     "bybit": _fetch_native_bybit_volume_map,
@@ -209,17 +253,65 @@ NATIVE_VOLUME_FETCHERS = {
     "xt": _fetch_native_xt_volume_map,
     "phemex": _fetch_native_phemex_volume_map,
     "gate": _fetch_native_gate_volume_map,
+    "bitget": _fetch_native_bitget_volume_map,
+    "aster": _fetch_native_aster_volume_map,
 }
+
+
+def _fetch_native_bitget_oi_map():
+    r = requests.get(
+        "https://api.bitget.com/api/v2/mix/market/tickers",
+        params={"productType": "USDT-FUTURES"},
+        timeout=10,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if data.get("code") != "00000":
+        return {}
+    result = {}
+    for item in data.get("data", []):
+        symbol = str(item.get("symbol") or "").upper()
+        if not symbol.endswith("USDT"):
+            continue
+        try:
+            oi_usd = float(item.get("holdingAmount") or 0) * float(item.get("markPrice") or item.get("lastPr") or 0)
+        except (TypeError, ValueError):
+            continue
+        _put_volume(result, symbol[:-len("USDT")], oi_usd)
+    return result
+
+
+NATIVE_OI_FETCHERS = {
+    "bitget": _fetch_native_bitget_oi_map,
+}
+
+
+def get_oi_hide_threshold(exchange):
+    return EXCHANGE_OI_HIDE_BELOW_USD.get(exchange.lower(), OI_HIDE_BELOW_USD)
+
+
+def get_volume_hide_threshold(exchange):
+    return EXCHANGE_VOLUME_HIDE_BELOW_USD.get(exchange.lower(), VOLUME_HIDE_BELOW_USD)
 
 
 def get_exchange_oi_map(exchange):
     exchange = exchange.lower()
-    cg_id = COINGECKO_DERIVATIVE_IDS.get(exchange)
-    if not cg_id:
-        return {}
     now = time.time()
     if exchange in _oi_cache and now - _oi_cache_ts.get(exchange, 0) < _OI_CACHE_TTL:
         return _oi_cache[exchange]
+    native_fetcher = NATIVE_OI_FETCHERS.get(exchange)
+    if native_fetcher:
+        try:
+            result = native_fetcher()
+        except Exception:
+            result = {}
+        if result:
+            _oi_cache[exchange] = result
+            _oi_cache_ts[exchange] = now
+            return result
+    cg_id = COINGECKO_DERIVATIVE_IDS.get(exchange)
+    if not cg_id:
+        return {}
     url = f"https://api.coingecko.com/api/v3/derivatives/exchanges/{cg_id}"
     try:
         r = requests.get(url, params={"include_tickers": "all"}, timeout=8)
@@ -307,23 +399,24 @@ def get_24h_volume_usd(exchange, coin):
 
 
 def is_oi_allowed(exchange, coin):
-    """Hard filter: hide only confirmed OI below $500k.
+    """Hard filter: hide only confirmed OI below the exchange threshold.
 
     Missing CoinGecko data is kept visible as a warning because the exchange API
     data can still be valid while the OI provider is incomplete or rate-limited.
     """
     oi_usd = get_open_interest_usd(exchange, coin)
-    return oi_usd is None or oi_usd >= OI_HIDE_BELOW_USD
+    return oi_usd is None or oi_usd >= get_oi_hide_threshold(exchange)
 
 
 def is_volume_allowed(exchange, coin):
-    """Hard filter: hide only confirmed 24h turnover below $400k."""
+    """Hard filter: hide only confirmed 24h turnover below the exchange threshold."""
     volume_usd = get_24h_volume_usd(exchange, coin)
-    return volume_usd is None or volume_usd >= VOLUME_HIDE_BELOW_USD
+    return volume_usd is None or volume_usd >= get_volume_hide_threshold(exchange)
 
 
 def format_oi_status(exchange, coin, order_usd=15_000):
     oi_usd = get_open_interest_usd(exchange, coin)
+    hide_threshold = get_oi_hide_threshold(exchange)
     if oi_usd is None:
         return "⚠️ OI: нет данных"
     order_share = order_usd / oi_usd if oi_usd > 0 else 1
@@ -331,15 +424,18 @@ def format_oi_status(exchange, coin, order_usd=15_000):
     share_text = f"{order_share * 100:.2f}%"
     if oi_usd >= OI_OK_USD:
         return f"✅ OI {oi_text} | $15k = {share_text}"
+    if oi_usd < hide_threshold:
+        return f"🚫 OI {oi_text} | $15k = {share_text}"
     return f"⚠️ OI {oi_text} | $15k = {share_text}"
 
 
 def format_volume_status(exchange, coin):
     volume_usd = get_24h_volume_usd(exchange, coin)
+    hide_threshold = get_volume_hide_threshold(exchange)
     if volume_usd is None:
         return "⚠️ Vol24h: нет данных"
     volume_text = f"${volume_usd:,.0f}"
-    if volume_usd < VOLUME_HIDE_BELOW_USD:
+    if volume_usd < hide_threshold:
         return f"🚫 Vol24h {volume_text}"
     if volume_usd < VOLUME_OK_USD:
         return f"⚠️ Vol24h {volume_text}"
