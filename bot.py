@@ -878,7 +878,7 @@ def format_check_leg(coin, exchange, side, amount_usd):
     else:
         share = amount_usd / oi_usd if oi_usd > 0 else 1
         share_pct = share * 100
-        oi_line = f"OI `${oi_usd:,.0f}` | позиция `${amount_usd:,.0f}` = `{share_pct:.2f}%` от OI"
+        oi_line = f"OI `${oi_usd:,.0f}` | размер `${amount_usd:,.0f}` = `{share_pct:.2f}%` от OI"
         if share < 0.02:
             verdict = "✅ Доля позиции от OI < 2%: базово ок, но стакан/slippage всё равно проверить."
         elif share < 0.10:

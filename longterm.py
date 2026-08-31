@@ -11,7 +11,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 from ai import gemini_generate, get_last_gemini_error
-from analysis import calc_std
+from analysis import analyze_rates, calc_std, recent_trend_ok
 from config import EXCHANGES_ENABLED, GEMINI_API_KEY, REPORT_CHAT_ID, TEMPORARILY_DISABLED_EXCHANGES
 from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, EXCHANGE_SYMBOL_FETCHERS, phemex_get_all_symbols
 from oi import COINGECKO_DERIVATIVE_IDS
@@ -29,6 +29,12 @@ LONGTERM_GEMINI_CHUNK_SIZE = int(os.getenv("LONGTERM_GEMINI_CHUNK_SIZE", "15"))
 LONGTERM_MIN_OI_WARN_USD = float(os.getenv("LONGTERM_MIN_OI_WARN_USD", "1000000"))
 LONGTERM_MIN_VOL_WARN_USD = float(os.getenv("LONGTERM_MIN_VOL_WARN_USD", "400000"))
 LONGTERM_EXAMPLE_SYMBOLS = ("BCH", "XMR", "AMZNX", "ATH")
+
+# These venues remain fully available as the hedge leg. They are excluded only
+# from discovering/qualifying the primary funding-paying leg for 7+ day scans.
+# Keep this rule local to longterm.py so /report (20:00) and short-term tools do
+# not inherit it. Remove a key here to restore that venue as a long-term payer.
+LONGTERM_HEDGE_ONLY_EXCHANGES = frozenset({"kucoin", "gate", "mexc", "binance", "bybit"})
 
 _cg_market_cache = {}
 _cg_market_cache_ts = {}
@@ -75,6 +81,9 @@ class LongTermPair:
     daily_usd: float
     monthly_usd: float
     score: float
+    paying_exchange: str
+    paying_direction: str
+    paying_category: str
 
 
 def _mean(values):
@@ -215,7 +224,15 @@ def _leg_from_rows(exchange, symbol, rows, days):
     )
 
 
-def _pair_candidate(symbol, long_leg, short_leg):
+def _pair_candidate(
+    symbol,
+    long_leg,
+    short_leg,
+    *,
+    paying_exchange,
+    paying_direction,
+    paying_category,
+):
     long_positive_ratio, long_recent = _direction_quality(long_leg.rates, "LONG")
     short_positive_ratio, short_recent = _direction_quality(short_leg.rates, "SHORT")
     net_per_payment_pct = -long_leg.avg + short_leg.avg
@@ -234,7 +251,37 @@ def _pair_candidate(symbol, long_leg, short_leg):
     stability_penalty = long_leg.std + short_leg.std
     direction_bonus = long_positive_ratio + short_positive_ratio
     score = monthly_usd + direction_bonus * 100 - stability_penalty * 800
-    return LongTermPair(symbol, long_leg, short_leg, net_per_payment_pct, daily_usd, monthly_usd, score)
+    return LongTermPair(
+        symbol,
+        long_leg,
+        short_leg,
+        net_per_payment_pct,
+        daily_usd,
+        monthly_usd,
+        score,
+        paying_exchange,
+        paying_direction,
+        paying_category,
+    )
+
+
+def _paying_signal(leg):
+    metrics = analyze_rates(list(leg.rates))
+    if not metrics or metrics["category"] not in {"full", "partial"}:
+        return None
+    direction = metrics["direction"]
+    if not recent_trend_ok(leg.rates, direction):
+        return None
+    return direction, metrics["category"]
+
+
+def _paying_preference(pair):
+    category_rank = 1 if pair.paying_category == "full" else 0
+    paying_leg = pair.long if pair.paying_direction == "LONG" else pair.short
+    effective_daily_rate = (
+        -paying_leg.avg if pair.paying_direction == "LONG" else paying_leg.avg
+    ) * paying_leg.payments_per_day
+    return category_rank, effective_daily_rate
 
 
 def _symbol_universe(active_exchanges):
@@ -263,12 +310,28 @@ def scan_longterm_funding(days=LONGTERM_DAYS, active_exchanges=None):
         if fetcher and EXCHANGES_ENABLED.get(exchange, False) and exchange not in TEMPORARILY_DISABLED_EXCHANGES
     ]
     active = [exchange for exchange in active if exchange in EXCHANGE_FETCHERS]
+    paying_active = [exchange for exchange in active if exchange not in LONGTERM_HEDGE_ONLY_EXCHANGES]
+    if not paying_active:
+        return {
+            "days": days,
+            "symbols_scanned": 0,
+            "pairs_found": 0,
+            "groups": [],
+            "groups_total": 0,
+            "errors": {},
+            "active_exchanges": active,
+            "paying_exchanges": [],
+            "hedge_only_exchanges": active,
+        }
     for exchange in active:
         _fetch_cg_market(exchange)
 
     now_ms = int(time.time() * 1000)
     start_ms = now_ms - days * 24 * 60 * 60 * 1000
-    symbols = _symbol_universe(active)
+    # Candidate discovery belongs only to exchanges allowed to be the paying
+    # leg. Once a coin qualifies there, every active exchange is still fetched
+    # and considered as its opposite hedge leg.
+    symbols = _symbol_universe(paying_active)
     pairs = []
     errors = {}
 
@@ -287,11 +350,31 @@ def scan_longterm_funding(days=LONGTERM_DAYS, active_exchanges=None):
             if leg:
                 legs.append(leg)
             time.sleep(0.04)
-        for long_leg in legs:
-            for short_leg in legs:
-                if long_leg.exchange == short_leg.exchange:
+        paying_signals = []
+        for leg in legs:
+            if leg.exchange not in paying_active:
+                continue
+            signal = _paying_signal(leg)
+            if signal:
+                paying_signals.append((leg, *signal))
+
+        for paying_leg, paying_direction, paying_category in paying_signals:
+            for hedge_leg in legs:
+                if paying_leg.exchange == hedge_leg.exchange:
                     continue
-                pair = _pair_candidate(symbol, long_leg, short_leg)
+                long_leg, short_leg = (
+                    (paying_leg, hedge_leg)
+                    if paying_direction == "LONG"
+                    else (hedge_leg, paying_leg)
+                )
+                pair = _pair_candidate(
+                    symbol,
+                    long_leg,
+                    short_leg,
+                    paying_exchange=paying_leg.exchange,
+                    paying_direction=paying_direction,
+                    paying_category=paying_category,
+                )
                 if pair:
                     pairs.append(pair)
 
@@ -299,7 +382,11 @@ def scan_longterm_funding(days=LONGTERM_DAYS, active_exchanges=None):
     for pair in pairs:
         key = (pair.symbol, pair.long.exchange, pair.short.exchange)
         old = best_by_route.get(key)
-        if old is None or pair.score > old.score:
+        if (
+            old is None
+            or pair.score > old.score
+            or (pair.score == old.score and _paying_preference(pair) > _paying_preference(old))
+        ):
             best_by_route[key] = pair
     ranked = sorted(best_by_route.values(), key=lambda item: -item.score)
     grouped = {}
@@ -314,11 +401,21 @@ def scan_longterm_funding(days=LONGTERM_DAYS, active_exchanges=None):
         "groups_total": len(grouped),
         "errors": errors,
         "active_exchanges": active,
+        "paying_exchanges": paying_active,
+        "hedge_only_exchanges": [
+            exchange for exchange in active if exchange in LONGTERM_HEDGE_ONLY_EXCHANGES
+        ],
     }
 
 
 def format_longterm_summary(result):
     labels = ", ".join(EXCHANGE_LABELS.get(exchange, exchange.upper()) for exchange in result["active_exchanges"])
+    paying_labels = ", ".join(
+        EXCHANGE_LABELS.get(exchange, exchange.upper()) for exchange in result.get("paying_exchanges", ())
+    ) or "нет"
+    hedge_only_labels = ", ".join(
+        EXCHANGE_LABELS.get(exchange, exchange.upper()) for exchange in result.get("hedge_only_exchanges", ())
+    ) or "нет"
     before_gemini = result.get("groups_before_gemini")
     gemini_line = (
         f"После Gemini longterm-фильтра: `{len(result['groups'])}` из `{before_gemini}` монет\n"
@@ -328,6 +425,8 @@ def format_longterm_summary(result):
     return (
         "🧲 *Долгосрочный funding scan*\n\n"
         f"Биржи: `{labels}`\n"
+        f"💸 Платящая нога: `{paying_labels}`\n"
+        f"🛡️ Только хедж: `{hedge_only_labels}`\n"
         f"Период: `{result['days']}` дней\n"
         f"Размер: `${LONGTERM_AMOUNT_PER_LEG:,.0f}` на ногу\n"
         f"Монет проверено: `{result['symbols_scanned']}`\n"
@@ -349,8 +448,15 @@ def format_longterm_coin(symbol, pairs):
     for idx, pair in enumerate(pairs[:LONGTERM_VARIANTS_PER_COIN], 1):
         long_label = EXCHANGE_LABELS.get(pair.long.exchange, pair.long.exchange.upper())
         short_label = EXCHANGE_LABELS.get(pair.short.exchange, pair.short.exchange.upper())
+        paying_label = EXCHANGE_LABELS.get(pair.paying_exchange, pair.paying_exchange.upper())
+        paying_side = "🟢 LONG" if pair.paying_direction == "LONG" else "🔴 SHORT"
+        paying_category = "FULL" if pair.paying_category == "full" else "PARTIAL"
+        hedge_leg = pair.short if pair.paying_direction == "LONG" else pair.long
+        hedge_label = EXCHANGE_LABELS.get(hedge_leg.exchange, hedge_leg.exchange.upper())
         lines.append(
-            f"*#{idx}* 🟢 `{long_label}` avg `{pair.long.avg:+.4f}%` std `{pair.long.std:.4f}`\n"
+            f"*#{idx}* 💸 Платящая: `{paying_label}` {paying_side} `{paying_category}`\n"
+            f"    🛡️ Хедж: `{hedge_label}`\n"
+            f"    🟢 `{long_label}` avg `{pair.long.avg:+.4f}%` std `{pair.long.std:.4f}`\n"
             f"    🔴 `{short_label}` avg `{pair.short.avg:+.4f}%` std `{pair.short.std:.4f}`\n"
             f"    💰 `~${pair.monthly_usd:,.0f}/мес` | `${pair.daily_usd:,.1f}/день` | net `{pair.net_per_payment_pct:+.4f}%`"
         )
@@ -499,7 +605,18 @@ async def longterm_more_callback(update, context: ContextTypes.DEFAULT_TYPE):
 
 async def send_longterm_report(bot, chat_id, manual=False):
     prefix = "🔎 Запускаю долгосрочный funding scan..." if manual else "🕘 Авто-скан долгосрочного funding запущен..."
-    await bot.send_message(chat_id, prefix)
+    hedge_only = ", ".join(
+        EXCHANGE_LABELS.get(exchange, exchange.upper())
+        for exchange in sorted(LONGTERM_HEDGE_ONLY_EXCHANGES)
+    )
+    await bot.send_message(
+        chat_id,
+        f"{prefix}\n\n"
+        f"🛡️ {hedge_only} в longterm-скане не ищутся как платящая нога. "
+        "Из них активные и подключённые к scanner-боту остаются доступны как хедж "
+        "для FULL/PARTIAL-монет, "
+        "найденных на других биржах."
+    )
     result = await asyncio.to_thread(scan_longterm_funding)
     if not manual and GEMINI_API_KEY and LONGTERM_GEMINI_FILTER and result.get("groups"):
         await bot.send_message(

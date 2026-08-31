@@ -1,9 +1,6 @@
 import time
 import requests
 
-from config import BINANCE_PROXY_URL, BYBIT_PROXY_URL
-from exchanges import _proxies
-
 OI_HIDE_BELOW_USD = 500_000
 OI_OK_USD = 1_000_000
 VOLUME_HIDE_BELOW_USD = 400_000
@@ -34,8 +31,16 @@ _oi_cache = {}
 _oi_cache_ts = {}
 _volume_cache = {}
 _volume_cache_ts = {}
+_cg_tickers_cache = {}
+_cg_tickers_cache_ts = {}
 _OI_CACHE_TTL = 10 * 60
 _VOLUME_CACHE_TTL = 5 * 60
+_CG_TICKERS_CACHE_TTL = 5 * 60
+
+# Contract: liquidity data for this scanner must come from CoinGecko
+# Derivatives only. Do not use native exchange APIs for OI/24h volume here;
+# funding history and symbol lists can still use exchange APIs.
+LIQUIDITY_DATA_SOURCE = "coingecko_derivatives"
 
 
 def _normalize_coin(coin):
@@ -91,202 +96,13 @@ def _extract_volume_usd(ticker):
     return None
 
 
-def _put_volume(result, coin, value):
+def _put_liquidity_value(result, coin, value):
     if value is None:
         return
     coin = _normalize_coin(coin)
     if not coin:
         return
     result[coin] = max(result.get(coin, 0), float(value))
-
-
-def _fetch_native_kucoin_volume_map():
-    r = requests.get("https://api-futures.kucoin.com/api/v1/contracts/active", timeout=10)
-    r.raise_for_status()
-    items = r.json().get("data", [])
-    result = {}
-    for item in items:
-        symbol = str(item.get("symbol") or "").upper()
-        if not symbol.endswith("USDTM"):
-            continue
-        try:
-            volume = float(item.get("turnoverOf24h") or 0)
-        except (TypeError, ValueError):
-            continue
-        base = str(item.get("displayBaseCurrency") or item.get("baseCurrency") or "").upper()
-        if base == "XBT":
-            _put_volume(result, "BTC", volume)
-        _put_volume(result, base, volume)
-    return result
-
-
-def _fetch_native_toobit_volume_map():
-    r = requests.get("https://api.toobit.com/quote/v1/contract/ticker/24hr", timeout=10)
-    r.raise_for_status()
-    items = r.json()
-    result = {}
-    for item in items if isinstance(items, list) else []:
-        symbol = str(item.get("s") or "").upper()
-        if not symbol.endswith("-SWAP-USDT"):
-            continue
-        try:
-            volume = float(item.get("qv") or 0)
-        except (TypeError, ValueError):
-            continue
-        _put_volume(result, symbol[:-len("-SWAP-USDT")], volume)
-    return result
-
-
-def _fetch_native_xt_volume_map():
-    r = requests.get("https://fapi.xt.com/future/market/v1/public/q/tickers", timeout=10)
-    r.raise_for_status()
-    items = r.json().get("result", [])
-    result = {}
-    for item in items:
-        symbol = str(item.get("s") or "").upper()
-        if not symbol.endswith("_USDT"):
-            continue
-        try:
-            volume = float(item.get("v") or 0)
-        except (TypeError, ValueError):
-            continue
-        _put_volume(result, symbol[:-len("_USDT")], volume)
-    return result
-
-
-def _fetch_native_phemex_volume_map():
-    r = requests.get("https://api.phemex.com/md/v2/ticker/24hr/all", timeout=10)
-    r.raise_for_status()
-    items = r.json().get("result", [])
-    result = {}
-    for item in items:
-        symbol = str(item.get("symbol") or "").upper()
-        if not symbol.endswith("USDT"):
-            continue
-        try:
-            volume = float(item.get("turnoverRv") or 0)
-        except (TypeError, ValueError):
-            continue
-        _put_volume(result, symbol[:-len("USDT")], volume)
-    return result
-
-
-def _fetch_native_binance_volume_map():
-    r = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=10, proxies=_proxies(BINANCE_PROXY_URL))
-    r.raise_for_status()
-    result = {}
-    for item in r.json():
-        symbol = str(item.get("symbol") or "").upper()
-        if not symbol.endswith("USDT"):
-            continue
-        _put_volume(result, symbol[:-len("USDT")], item.get("quoteVolume"))
-    return result
-
-
-def _fetch_native_bybit_volume_map():
-    r = requests.get("https://api.bybit.com/v5/market/tickers", params={"category": "linear"}, timeout=10, proxies=_proxies(BYBIT_PROXY_URL))
-    r.raise_for_status()
-    data = r.json()
-    result = {}
-    for item in data.get("result", {}).get("list", []):
-        symbol = str(item.get("symbol") or "").upper()
-        if not symbol.endswith("USDT"):
-            continue
-        _put_volume(result, symbol[:-len("USDT")], item.get("turnover24h"))
-    return result
-
-
-def _fetch_native_gate_volume_map():
-    r = requests.get("https://api.gateio.ws/api/v4/futures/usdt/tickers", timeout=10)
-    r.raise_for_status()
-    result = {}
-    for item in r.json():
-        symbol = str(item.get("contract") or "").upper()
-        if not symbol.endswith("_USDT"):
-            continue
-        _put_volume(result, symbol[:-len("_USDT")], item.get("volume_24h_quote") or item.get("volume_24h_settle"))
-    return result
-
-
-def _fetch_native_bitget_volume_map():
-    r = requests.get(
-        "https://api.bitget.com/api/v2/mix/market/tickers",
-        params={"productType": "USDT-FUTURES"},
-        timeout=10,
-    )
-    r.raise_for_status()
-    data = r.json()
-    if data.get("code") != "00000":
-        return {}
-    result = {}
-    for item in data.get("data", []):
-        symbol = str(item.get("symbol") or "").upper()
-        if not symbol.endswith("USDT"):
-            continue
-        try:
-            volume = float(item.get("quoteVolume") or item.get("usdtVolume") or 0)
-        except (TypeError, ValueError):
-            continue
-        _put_volume(result, symbol[:-len("USDT")], volume)
-    return result
-
-
-def _fetch_native_aster_volume_map():
-    r = requests.get("https://fapi.asterdex.com/fapi/v1/ticker/24hr", timeout=10)
-    r.raise_for_status()
-    items = r.json()
-    result = {}
-    for item in items if isinstance(items, list) else []:
-        symbol = str(item.get("symbol") or "").upper()
-        if not symbol.endswith("USDT"):
-            continue
-        try:
-            volume = float(item.get("quoteVolume") or 0)
-        except (TypeError, ValueError):
-            continue
-        _put_volume(result, symbol[:-len("USDT")], volume)
-    return result
-
-
-NATIVE_VOLUME_FETCHERS = {
-    "binance": _fetch_native_binance_volume_map,
-    "bybit": _fetch_native_bybit_volume_map,
-    "kucoin": _fetch_native_kucoin_volume_map,
-    "toobit": _fetch_native_toobit_volume_map,
-    "xt": _fetch_native_xt_volume_map,
-    "phemex": _fetch_native_phemex_volume_map,
-    "gate": _fetch_native_gate_volume_map,
-    "bitget": _fetch_native_bitget_volume_map,
-    "aster": _fetch_native_aster_volume_map,
-}
-
-
-def _fetch_native_bitget_oi_map():
-    r = requests.get(
-        "https://api.bitget.com/api/v2/mix/market/tickers",
-        params={"productType": "USDT-FUTURES"},
-        timeout=10,
-    )
-    r.raise_for_status()
-    data = r.json()
-    if data.get("code") != "00000":
-        return {}
-    result = {}
-    for item in data.get("data", []):
-        symbol = str(item.get("symbol") or "").upper()
-        if not symbol.endswith("USDT"):
-            continue
-        try:
-            oi_usd = float(item.get("holdingAmount") or 0) * float(item.get("markPrice") or item.get("lastPr") or 0)
-        except (TypeError, ValueError):
-            continue
-        _put_volume(result, symbol[:-len("USDT")], oi_usd)
-    return result
-
-
-NATIVE_OI_FETCHERS = {
-    "bitget": _fetch_native_bitget_oi_map,
-}
 
 
 def get_oi_hide_threshold(exchange):
@@ -309,36 +125,36 @@ def is_liquidity_filter_disabled(exchange):
     return exchange.lower() in LIQUIDITY_FILTER_DISABLED_EXCHANGES
 
 
+def get_coingecko_tickers(exchange):
+    exchange = exchange.lower()
+    now = time.time()
+    if exchange in _cg_tickers_cache and now - _cg_tickers_cache_ts.get(exchange, 0) < _CG_TICKERS_CACHE_TTL:
+        return _cg_tickers_cache[exchange]
+    cg_id = COINGECKO_DERIVATIVE_IDS.get(exchange)
+    if not cg_id:
+        return []
+    url = f"https://api.coingecko.com/api/v3/derivatives/exchanges/{cg_id}"
+    try:
+        r = requests.get(url, params={"include_tickers": "all"}, timeout=8)
+        if r.status_code == 429:
+            return _cg_tickers_cache.get(exchange, [])
+        r.raise_for_status()
+        tickers = r.json().get("tickers") or []
+    except Exception:
+        return _cg_tickers_cache.get(exchange, [])
+    _cg_tickers_cache[exchange] = tickers
+    _cg_tickers_cache_ts[exchange] = now
+    return tickers
+
+
 def get_exchange_oi_map(exchange):
     exchange = exchange.lower()
     now = time.time()
     if exchange in _oi_cache and now - _oi_cache_ts.get(exchange, 0) < _OI_CACHE_TTL:
         return _oi_cache[exchange]
-    native_fetcher = NATIVE_OI_FETCHERS.get(exchange)
-    if native_fetcher:
-        try:
-            result = native_fetcher()
-        except Exception:
-            result = {}
-        if result:
-            _oi_cache[exchange] = result
-            _oi_cache_ts[exchange] = now
-            return result
-    cg_id = COINGECKO_DERIVATIVE_IDS.get(exchange)
-    if not cg_id:
-        return {}
-    url = f"https://api.coingecko.com/api/v3/derivatives/exchanges/{cg_id}"
-    try:
-        r = requests.get(url, params={"include_tickers": "all"}, timeout=8)
-        if r.status_code == 429:
-            # Do not poison the cache with an empty map on rate limits.
-            return _oi_cache.get(exchange, {})
-        r.raise_for_status()
-        data = r.json()
-    except Exception:
-        # Keep the last good OI snapshot if CoinGecko has a transient failure.
+    tickers = get_coingecko_tickers(exchange)
+    if not tickers:
         return _oi_cache.get(exchange, {})
-    tickers = data.get("tickers") or []
     result = {}
     for ticker in tickers:
         symbol = str(ticker.get("symbol") or "").upper()
@@ -364,38 +180,22 @@ def get_exchange_volume_map(exchange):
     if exchange in _volume_cache and now - _volume_cache_ts.get(exchange, 0) < _VOLUME_CACHE_TTL:
         return _volume_cache[exchange]
 
+    tickers = get_coingecko_tickers(exchange)
+    if not tickers:
+        return _volume_cache.get(exchange, {})
     result = {}
-    native_fetcher = NATIVE_VOLUME_FETCHERS.get(exchange)
-    if native_fetcher:
-        try:
-            result = native_fetcher()
-        except Exception:
-            result = {}
-
-    if not result:
-        cg_id = COINGECKO_DERIVATIVE_IDS.get(exchange)
-        if cg_id:
-            url = f"https://api.coingecko.com/api/v3/derivatives/exchanges/{cg_id}"
-            try:
-                r = requests.get(url, params={"include_tickers": "all"}, timeout=8)
-                if r.status_code == 429:
-                    return _volume_cache.get(exchange, {})
-                r.raise_for_status()
-                tickers = r.json().get("tickers") or []
-            except Exception:
-                return _volume_cache.get(exchange, {})
-            for ticker in tickers:
-                volume = _extract_volume_usd(ticker)
-                if volume is None:
-                    continue
-                base = str(ticker.get("base") or "").upper()
-                if base:
-                    _put_volume(result, base, volume)
-                symbol = str(ticker.get("symbol") or "").upper()
-                clean_symbol = symbol.replace("-", "").replace("_", "")
-                for suffix in ("USDT", "USD"):
-                    if clean_symbol.endswith(suffix):
-                        _put_volume(result, clean_symbol[:-len(suffix)], volume)
+    for ticker in tickers:
+        volume = _extract_volume_usd(ticker)
+        if volume is None:
+            continue
+        base = str(ticker.get("base") or "").upper()
+        if base:
+            _put_liquidity_value(result, base, volume)
+        symbol = str(ticker.get("symbol") or "").upper()
+        clean_symbol = symbol.replace("-", "").replace("_", "")
+        for suffix in ("USDT", "USD"):
+            if clean_symbol.endswith(suffix):
+                _put_liquidity_value(result, clean_symbol[:-len(suffix)], volume)
 
     if result:
         _volume_cache[exchange] = result

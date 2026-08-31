@@ -68,7 +68,7 @@ BINANCE_PROXY_URL=
 BYBIT_PROXY_URL=
 ```
 
-`BINANCE_PROXY_URL` и `BYBIT_PROXY_URL` — HTTP-прокси для обхода геоблокировки Binance (HTTP 451) и Bybit (HTTP 403). Формат: `http://user:pass@host:port`. Если не заданы, запросы идут напрямую. Прокси применяется ко всем вызовам Binance и Bybit: funding history, symbol list, order book quotes (`reports.py`) и 24h volume (`oi.py`).
+`BINANCE_PROXY_URL` и `BYBIT_PROXY_URL` — HTTP-прокси для обхода геоблокировки Binance (HTTP 451) и Bybit (HTTP 403). Формат: `http://user:pass@host:port`. Если не заданы, запросы идут напрямую. Прокси применяется к вызовам Binance и Bybit для funding history, symbol list и order book quotes (`reports.py`). OI/24h volume через эти прокси не ходят, потому что берутся только из CoinGecko.
 
 `GEMINI_API_KEY` нужен для `/ai`, AI-фильтра `/analyze` и Gemini-рекомендации вечернего отчёта. `REPORT_CHAT_ID` включает вечерний отчёт.
 
@@ -129,7 +129,11 @@ Binance, Bybit, Gate, XT, Toobit, KuCoin, Bitget and Aster `/analyze` use native
 
 ## Open Interest validation
 
-OI-проверка теперь является частью фильтра. Бот берёт open interest через CoinGecko Derivatives API по ID биржи, кэширует данные на 10 минут и показывает статус рядом с монетой.
+OI-проверка теперь является частью фильтра. Бот берёт open interest только через CoinGecko Derivatives API по ID биржи, кэширует данные на 10 минут и показывает статус рядом с монетой.
+
+Жёсткий контракт источника: OI/24h volume для этого scanner-бота нельзя брать напрямую из API бирж. Для всех бирж используется CoinGecko Derivatives `derivatives/exchanges/{id}?include_tickers=all`. Native exchange API разрешены только для funding history, symbol list и order book/spread, но не для OI/24h volume.
+
+`oi.py` использует общий кэш CoinGecko tickers на 5 минут: один snapshot биржи питает и OI, и 24h volume. Это снижает риск CoinGecko `429 rate limit`.
 
 Правило отображения:
 
@@ -137,7 +141,7 @@ OI-проверка теперь является частью фильтра. �
 - исключение: для XT hard-порог и зелёный OK-порог OI снижены до `$150,000`, другие биржи остаются на `$500,000` hide / `$1,000,000` OK;
 - Aster не фильтруется по OI, значение показывается только информационно;
 - автоотчёты `/report`/20:00 и `/longfunding`/21:00 не скрывают монеты по OI; OI показывается только как риск-статус ✅/⚠️/🚫;
-- Bitget OI берётся native из `holdingAmount * markPrice`, Aster OI берётся через CoinGecko `aster` только для отображения;
+- все OI-значения, включая Bitget и Aster, берутся через CoinGecko Derivatives;
 - transient CoinGecko errors/429 do not overwrite the last valid OI cache with empty data;
 - ⚠️ если OI от `$500,000` до `$1,000,000`, CoinGecko не отдал данные или пары нет в источнике;
 - ✅ если OI на конкретной бирже от `$1,000,000`;
@@ -147,7 +151,7 @@ OI-проверка теперь является частью фильтра. �
 
 ## 24h Volume validation
 
-24h volume/turnover является обязательным ликвидностным фильтром для активных бирж.
+24h volume/turnover является обязательным ликвидностным фильтром для активных бирж в ручном `/analyze`. Источник 24h volume тоже только CoinGecko Derivatives.
 
 Правило:
 
@@ -159,19 +163,7 @@ OI-проверка теперь является частью фильтра. �
 - ✅ если оборот от `$2,000,000`;
 - отсутствующие volume-данные не скрывают монету, чтобы не терять рабочие пары из-за rate-limit/API-сбоя, но в Telegram показывается `⚠️ Vol24h: нет данных`.
 
-Источники:
-
-- `kucoin`: native KuCoin Futures `turnoverOf24h`;
-- `toobit`: native Toobit USDT-M `/quote/v1/contract/ticker/24hr`, поле `qv`;
-- `xt`: native XT futures `/future/market/v1/public/q/tickers`, поле `v`;
-- `phemex`: native Phemex `/md/v2/ticker/24hr/all`, поле `turnoverRv`;
-- `binance`: native Binance Futures `quoteVolume` (через `BINANCE_PROXY_URL`);
-- `bybit`: native Bybit linear `turnover24h` (через `BYBIT_PROXY_URL`);
-- `bitget`: native Bitget Futures `/api/v2/mix/market/tickers`, поля `quoteVolume`/`usdtVolume`;
-- `aster`: native Aster `/fapi/v1/ticker/24hr`, поле `quoteVolume`;
-- `okx`, `bingx` и fallback для остальных: CoinGecko Derivatives `volume_24h`.
-
-Если native-источник недоступен (proxy не задан или API-ошибка), бот автоматически переключается на CoinGecko fallback.
+Источник для всех бирж один: CoinGecko Derivatives по `COINGECKO_DERIVATIVE_IDS` в `oi.py`. Код не должен добавлять native volume-fetchers для отдельных бирж, даже если биржа отдаёт turnover через свой API.
 
 Фильтр применяется как hard-filter в ручном `/analyze`. В вечернем отчёте и при подборе итоговой long/short пары OI/24h volume не скрывают монеты, а выводятся как риск-статус. Команда `/oi` показывает OI и 24h volume вместе.
 
@@ -271,7 +263,7 @@ help - Справка
 - ручная проверка одной монеты под конкретную дельта-нейтральную сделку;
 - сценарий: монета -> биржа первой ноги -> направление первой ноги -> биржа второй ноги -> размер позиции в USDT на каждую ногу;
 - вторая нога получает противоположное направление автоматически;
-- оценивает долю позиции от OI по каждой бирже: `<2%` ✅, `<10%` ⚠️, `>=10%` 🚫;
+- оценивает и печатает долю позиции от OI по каждой бирже для введённого размера, например `$8,000 = 1.14% от OI`; правила: `<2%` ✅, `<10%` ⚠️, `>=10%` 🚫;
 - показывает 24h volume как риск-статус, но не меняет настройки `/analyze` и автоотчётов;
 - зарегистрирована прямым `CommandHandler` до `unknown`, как `/ai`, `/funding` и `/oi`;
 - быстрый ввод: `/check DASH`.
@@ -291,6 +283,10 @@ help - Справка
 `/longfunding`:
 
 - ищет долгосрочные дельта-нейтральные связки со стабильным funding;
+- сначала ищет `full` + `partial` сигналы только на биржах, разрешённых как платящая нога; только после этого ищет хедж для найденных монет;
+- `kucoin`, `gate`, `mexc`, `binance`, `bybit` в longterm-скане не могут быть платящей ногой, но остаются кандидатами на вторую, хеджирующую ногу, если они активны и имеют fetcher в scanner-боте; MEXC в текущем реестре fetcher’ов отсутствует, но заранее внесён в hedge-only политику;
+- это ограничение локально для `longterm.py` (7+ дней) и не меняет `/report` в 20:00, краткосрочные сканеры, `/analyze`, `/filter` и `/funding`;
+- список хедж-only бирж хранится в одной константе `LONGTERM_HEDGE_ONLY_EXCHANGES`, поэтому любую из бирж можно быстро вернуть в роль платящей;
 - группирует результат по монетам: одна монета = одно сообщение, внутри несколько маршрутов long/short;
 - сохраняет до `LONGTERM_TOP_COINS` монет, по умолчанию 60, и отдаёт порциями по `LONGTERM_PAGE_SIZE`, по умолчанию 5;
 - после первой порции показывает inline-кнопку `Показать ещё`, которая не запускает повторный скан;
@@ -303,7 +299,7 @@ help - Справка
 `/instruction`:
 
 - отправляет инструкцию входа и риск-проверок без запуска отчёта;
-- первый пункт инструкции: OI ниже $500k бот скрывает, $500k-$1m показывает как ⚠️, $1m+ как ✅; 24h volume ниже $400k скрывает, $400k-$2m показывает как ⚠️, $2m+ как ✅; ордер не должен превышать 1–1.5% от всего OI.
+- первый пункт инструкции: в ручном `/analyze` OI ниже $500k бот скрывает, $500k-$1m показывает как ⚠️, $1m+ как ✅; 24h volume ниже $400k скрывает, $400k-$2m показывает как ⚠️, $2m+ как ✅; автоотчёты эти значения не скрывают; ордер не должен превышать 1–1.5% от всего OI.
 
 `/settings`:
 
@@ -320,7 +316,7 @@ help - Справка
 - `/analyze`: выбор биржи -> метод `Средняя ставка` или `Средний доход` -> период -> scan progress -> итог -> Gemini-фильтр.
 - `/oi`: ввод монеты -> мультивыбор бирж -> подтверждение -> OI + 24h volume рекомендация по каждой выбранной бирже.
 - `/check`: ввод монеты -> биржа первой ноги -> направление первой ноги -> биржа второй ноги -> размер позиции -> OI/Vol preview по обеим ногам.
-- `/longfunding`: ручной запуск долгосрочного скана -> стартовое сообщение -> summary -> первая порция монет -> кнопка `Показать ещё`.
+- `/longfunding`: ручной запуск долгосрочного скана -> стартовое сообщение с памяткой о hedge-only биржах -> summary с разделением ролей -> первая порция монет -> каждый маршрут явно показывает `Платящая` и `Хедж` -> кнопка `Показать ещё`.
 - `/settings`: inline-переключатели активных бирж + `Все ВКЛ/ВЫКЛ`.
 
 Тексты Telegram должны оставаться понятными, с emoji и Markdown-форматированием там, где это уже используется.
@@ -330,6 +326,8 @@ help - Справка
 Если задан `REPORT_CHAT_ID`, бот каждый день в 20:00 Europe/Kyiv запускает job queue задачу. На сервере время указано как 17:00 UTC.
 
 Отдельный долгосрочный funding-скан запускается каждый день в 21:00 Europe/Kyiv. На сервере время указано как 18:00 UTC. Он использует `/longfunding`-логику, дополнительно применяет Gemini longterm-фильтр и отправляет результат в `REPORT_CHAT_ID`.
+
+Важно: правило платящей/хеджирующей ноги относится только к этому скану 21:00. Скан 20:00 ниже следует своей прежней логике и не имеет hedge-only списка.
 
 Логика:
 
@@ -360,8 +358,8 @@ help - Справка
 | `coinw` | CoinW | Supabase collector, table `funding_rates` |
 | `kucoin` | KuCoin | public contract funding-rates |
 | `bitunix` | Bitunix | public get_funding_rate_history; временно отключена в `EXCHANGES_ENABLED` |
-| `bitget` | Bitget | public `/api/v2/mix/market/history-fund-rate` + native contracts/tickers |
-| `aster` | Aster | public `/fapi/v1/fundingRate` + native `exchangeInfo`/ticker |
+| `bitget` | Bitget | public `/api/v2/mix/market/history-fund-rate` + native contracts; OI/Vol только CoinGecko |
+| `aster` | Aster | public `/fapi/v1/fundingRate` + native `exchangeInfo`; OI/Vol только CoinGecko |
 
 ## Архитектура кода
 
@@ -413,7 +411,9 @@ longterm.py  - long-term stable funding scan and 21:00 auto job
 20. Longterm auto job запускается в 21:00 Europe/Kyiv / 18:00 UTC при наличии `REPORT_CHAT_ID`.
 21. Bitget и Aster активны и участвуют в `/analyze`, авто-отчёте 20:00 и `/longfunding`/авто-отчёте 21:00.
 22. Bitunix временно отключена: она не появляется в кнопках и не работает через прямые команды, но API-код сохранён для быстрого возврата.
-23. Оба `.md` файла обновлены перед push.
+23. `oi.py` не содержит native exchange API fetchers для OI/24h volume; источник ликвидности только CoinGecko Derivatives.
+24. OI и 24h volume используют общий CoinGecko ticker snapshot cache, чтобы не делать два запроса на одну биржу подряд.
+25. Оба `.md` файла обновлены перед push.
 
 ## Ограничения
 
