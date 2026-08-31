@@ -4,7 +4,8 @@ import asyncio
 import os
 import secrets
 import time
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, replace
 
 import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -14,7 +15,13 @@ from ai import gemini_generate, get_last_gemini_error
 from analysis import analyze_rates, calc_std, recent_trend_ok
 from config import EXCHANGES_ENABLED, GEMINI_API_KEY, REPORT_CHAT_ID, TEMPORARILY_DISABLED_EXCHANGES
 from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, EXCHANGE_SYMBOL_FETCHERS, phemex_get_all_symbols
-from oi import COINGECKO_DERIVATIVE_IDS
+from oi import (
+    COINGECKO_DERIVATIVE_IDS,
+    get_oi_hide_threshold,
+    get_oi_ok_threshold,
+    get_volume_hide_threshold,
+    get_volume_ok_threshold,
+)
 
 
 LONGTERM_DAYS = int(os.getenv("LONGTERM_DAYS", "7"))
@@ -34,13 +41,15 @@ LONGTERM_EXAMPLE_SYMBOLS = ("BCH", "XMR", "AMZNX", "ATH")
 # from discovering/qualifying the primary funding-paying leg for 7+ day scans.
 # Keep this rule local to longterm.py so /report (20:00) and short-term tools do
 # not inherit it. Remove a key here to restore that venue as a long-term payer.
-LONGTERM_HEDGE_ONLY_EXCHANGES = frozenset({"kucoin", "gate", "mexc", "binance", "bybit"})
+LONGTERM_HEDGE_ONLY_EXCHANGES = frozenset({"kucoin", "gate", "mexc", "binance", "bybit", "okx"})
 
 _cg_market_cache = {}
 _cg_market_cache_ts = {}
 _CG_CACHE_TTL = 15 * 60
 _longterm_sessions = {}
 _SESSION_TTL = 30 * 60
+_quote_cache = {}
+_QUOTE_CACHE_TTL = 60
 
 LONGTERM_GEMINI_PROMPT = """Действуй как риск-менеджер криптофонда для долгосрочной delta-neutral funding стратегии.
 Бот уже посчитал funding. Твоя задача НЕ пересчитывать funding, а отфильтровать только качество актива.
@@ -84,6 +93,7 @@ class LongTermPair:
     paying_exchange: str
     paying_direction: str
     paying_category: str
+    entry_spread_pct: float | None = None
 
 
 def _mean(values):
@@ -428,42 +438,132 @@ def format_longterm_summary(result):
         f"💸 Платящая нога: `{paying_labels}`\n"
         f"🛡️ Только хедж: `{hedge_only_labels}`\n"
         f"Период: `{result['days']}` дней\n"
-        f"Размер: `${LONGTERM_AMOUNT_PER_LEG:,.0f}` на ногу\n"
+        "Оценка прибыли: `$8,000` и `$20,000` на ногу\n"
         f"Монет проверено: `{result['symbols_scanned']}`\n"
         f"Связок найдено: `{result['pairs_found']}`\n\n"
         f"Монет с вариантами: `{result.get('groups_total', len(result['groups']))}`\n"
         f"{gemini_line}"
         f"Показываю порциями по `{LONGTERM_PAGE_SIZE}` монет\n\n"
-        "OI/24h volume не фильтруют результат, только дают warning."
+        "OI/24h volume и live-спред не фильтруют longterm-результат."
+    )
+
+
+def _format_leg_oi(leg, order_usd=15_000):
+    if leg.oi_usd is None:
+        return "⚠️ OI: нет данных"
+    share = order_usd / leg.oi_usd * 100 if leg.oi_usd > 0 else 100.0
+    if leg.oi_usd >= get_oi_ok_threshold(leg.exchange):
+        icon = "✅"
+    elif leg.oi_usd < get_oi_hide_threshold(leg.exchange):
+        icon = "🚫"
+    else:
+        icon = "⚠️"
+    return f"{icon} OI ${leg.oi_usd:,.0f} | $15k = {share:.2f}%"
+
+
+def _format_leg_volume(leg):
+    if leg.volume_24h_usd is None:
+        return "⚠️ Vol24h: нет данных"
+    if leg.volume_24h_usd < get_volume_hide_threshold(leg.exchange):
+        icon = "🚫"
+    elif leg.volume_24h_usd < get_volume_ok_threshold(leg.exchange):
+        icon = "⚠️"
+    else:
+        icon = "✅"
+    return f"{icon} Vol24h ${leg.volume_24h_usd:,.0f}"
+
+
+def _pair_daily_pct(pair):
+    return (
+        -pair.long.avg * pair.long.payments_per_day
+        + pair.short.avg * pair.short.payments_per_day
     )
 
 
 def format_longterm_coin(symbol, pairs):
-    best = pairs[0]
-    lines = [
-        f"🧲 *{symbol}*",
-        f"Best: `~${best.monthly_usd:,.0f}/мес`, вариантов: `{len(pairs)}`",
-        "",
-    ]
+    lines = [f"🧲 *{symbol}*", f"Вариантов: `{len(pairs)}`", ""]
     for idx, pair in enumerate(pairs[:LONGTERM_VARIANTS_PER_COIN], 1):
         long_label = EXCHANGE_LABELS.get(pair.long.exchange, pair.long.exchange.upper())
         short_label = EXCHANGE_LABELS.get(pair.short.exchange, pair.short.exchange.upper())
-        paying_label = EXCHANGE_LABELS.get(pair.paying_exchange, pair.paying_exchange.upper())
-        paying_side = "🟢 LONG" if pair.paying_direction == "LONG" else "🔴 SHORT"
-        paying_category = "FULL" if pair.paying_category == "full" else "PARTIAL"
-        hedge_leg = pair.short if pair.paying_direction == "LONG" else pair.long
-        hedge_label = EXCHANGE_LABELS.get(hedge_leg.exchange, hedge_leg.exchange.upper())
-        lines.append(
-            f"*#{idx}* 💸 Платящая: `{paying_label}` {paying_side} `{paying_category}`\n"
-            f"    🛡️ Хедж: `{hedge_label}`\n"
-            f"    🟢 `{long_label}` avg `{pair.long.avg:+.4f}%` std `{pair.long.std:.4f}`\n"
-            f"    🔴 `{short_label}` avg `{pair.short.avg:+.4f}%` std `{pair.short.std:.4f}`\n"
-            f"    💰 `~${pair.monthly_usd:,.0f}/мес` | `${pair.daily_usd:,.1f}/день` | net `{pair.net_per_payment_pct:+.4f}%`"
+        net_daily_pct = _pair_daily_pct(pair)
+        income_8k = 8_000 * net_daily_pct / 100
+        income_20k = 20_000 * net_daily_pct / 100
+        spread = (
+            f"{pair.entry_spread_pct:+.3f}%"
+            if pair.entry_spread_pct is not None
+            else "нет данных"
         )
-        warnings = _liquidity_warnings(pair)
-        if warnings:
-            lines.append("    ⚠️ " + " | ".join(warnings))
+        lines.append(
+            f"*#{idx}*\n"
+            f"🟢 Лонг: `{long_label}` avg `{pair.long.avg:+.4f}%` | "
+            f"`{pair.long.payments_per_day:.1f}` выплат/день | "
+            f"{_format_leg_oi(pair.long)} | {_format_leg_volume(pair.long)}\n"
+            f"🔴 Шорт: `{short_label}` avg `{pair.short.avg:+.4f}%` | "
+            f"`{pair.short.payments_per_day:.1f}` выплат/день | "
+            f"{_format_leg_oi(pair.short)} | {_format_leg_volume(pair.short)}\n"
+            f"📈 Чистый фандинг: `{net_daily_pct:+.4f}%` / день\n"
+            f"💰 Оценка: `${income_8k:,.2f}` за 1 день на позицию `$8,000` на ногу\n"
+            f"💰 Оценка: `${income_20k:,.2f}` за 1 день на позицию `$20,000` на ногу\n"
+            f"🚪 Спред входа: `{spread}`"
+        )
     return "\n".join(lines)
+
+
+def _cached_market_quote(symbol, exchange):
+    key = (symbol, exchange)
+    cached = _quote_cache.get(key)
+    now = time.time()
+    if cached and now - cached[0] < _QUOTE_CACHE_TTL:
+        return cached[1]
+    from reports import fetch_market_quote
+
+    try:
+        quote = fetch_market_quote(symbol, exchange)
+    except Exception:
+        quote = None
+    _quote_cache[key] = (now, quote)
+    return quote
+
+
+def _enrich_entry_spreads(groups):
+    """Fetch display-only live spreads for the routes on one Telegram page."""
+    visible = [
+        pair
+        for _symbol, pairs in groups
+        for pair in pairs[:LONGTERM_VARIANTS_PER_COIN]
+    ]
+    quote_keys = {
+        (pair.symbol, exchange)
+        for pair in visible
+        for exchange in (pair.long.exchange, pair.short.exchange)
+    }
+    quotes = {}
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(quote_keys)))) as pool:
+        futures = {
+            pool.submit(_cached_market_quote, symbol, exchange): (symbol, exchange)
+            for symbol, exchange in quote_keys
+        }
+        for future in as_completed(futures):
+            try:
+                quotes[futures[future]] = future.result()
+            except Exception:
+                quotes[futures[future]] = None
+
+    from reports import entry_spread_pct
+
+    enriched_groups = []
+    for symbol, pairs in groups:
+        enriched = []
+        for pair in pairs:
+            if len(enriched) < LONGTERM_VARIANTS_PER_COIN:
+                spread = entry_spread_pct(
+                    quotes.get((symbol, pair.long.exchange)),
+                    quotes.get((symbol, pair.short.exchange)),
+                )
+                pair = replace(pair, entry_spread_pct=spread)
+            enriched.append(pair)
+        enriched_groups.append((symbol, enriched))
+    return enriched_groups
 
 
 def _gemini_candidate_row(symbol, pairs):
@@ -576,7 +676,8 @@ async def send_longterm_page(bot, chat_id, token, offset):
     groups = session["groups"]
     total = len(groups)
     end = min(offset + LONGTERM_PAGE_SIZE, total)
-    for symbol, pairs in groups[offset:end]:
+    page_groups = await asyncio.to_thread(_enrich_entry_spreads, groups[offset:end])
+    for symbol, pairs in page_groups:
         await bot.send_message(chat_id, format_longterm_coin(symbol, pairs), parse_mode="Markdown")
 
     markup = _more_markup(token, end, total)
