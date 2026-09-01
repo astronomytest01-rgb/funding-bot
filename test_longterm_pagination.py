@@ -26,6 +26,7 @@ class LongTermDisplayTests(unittest.TestCase):
         self.assertNotIn("#1", text)
         self.assertIn("$8,000", text)
         self.assertIn("$20,000", text)
+        self.assertNotIn("Gemini", text)
 
     def test_quotes_only_for_visible_route_and_missing_quote_keeps_coin(self):
         best = pair_for("TEST")
@@ -48,7 +49,7 @@ class LongTermDisplayTests(unittest.TestCase):
         self.assertIn("Gemini рекомендует: `1` из `3`", text)
         self.assertIn("Доступно к показу: `3` монет", text)
 
-    def test_gemini_ranks_and_labels_without_deleting_candidates(self):
+    def test_gemini_is_separate_and_preserves_mathematical_order(self):
         groups = [(symbol, [pair_for(symbol)]) for symbol in ("LOW", "KEEPER", "OTHER")]
         result = {"groups": groups}
         with (
@@ -57,16 +58,53 @@ class LongTermDisplayTests(unittest.TestCase):
             patch.object(longterm, "gemini_generate", return_value="KEEP KEEPER — quality"),
             patch.object(longterm.time, "sleep"),
         ):
-            ranked, note = longterm.apply_longterm_gemini_filter(result)
+            reviewed, note = longterm.apply_longterm_gemini_filter(result)
 
-        self.assertEqual([symbol for symbol, _pairs in ranked["groups"]], ["KEEPER", "LOW", "OTHER"])
-        self.assertEqual(len(ranked["groups"]), 3)
-        self.assertTrue(ranked["groups"][0][1][0].ai_recommended)
-        self.assertFalse(ranked["groups"][1][1][0].ai_recommended)
+        self.assertEqual([symbol for symbol, _pairs in reviewed["groups"]], ["LOW", "KEEPER", "OTHER"])
+        self.assertEqual(len(reviewed["groups"]), 3)
+        self.assertFalse(reviewed["groups"][0][1][0].ai_recommended)
+        self.assertTrue(reviewed["groups"][1][1][0].ai_recommended)
+        recommendation = "\n".join(longterm.format_longterm_gemini_recommendations(reviewed))
+        self.assertIn("KEEPER — quality", recommendation)
+        self.assertNotIn("• LOW", recommendation)
+        self.assertNotIn("Gemini", longterm.format_longterm_coin(*reviewed["groups"][1]))
         self.assertIn("Все 3 математических кандидатов сохранены", note)
 
 
 class LongTermPaginationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_auto_report_sends_math_page_before_separate_gemini_block(self):
+        groups = [(symbol, [pair_for(symbol)]) for symbol in ("LOW", "KEEPER")]
+        scan_result = {"groups": groups}
+
+        async def send_math_page(bot, chat_id, token, offset):
+            await bot.send_message(chat_id, "MATH PAGE")
+
+        bot = Mock(send_message=AsyncMock())
+        with (
+            patch.object(longterm, "GEMINI_API_KEY", "test"),
+            patch.object(longterm, "LONGTERM_GEMINI_FILTER", True),
+            patch.object(longterm, "scan_longterm_funding", return_value=scan_result),
+            patch.object(longterm, "apply_longterm_gemini_filter") as apply_gemini,
+            patch.object(longterm, "format_longterm_summary", return_value="SUMMARY"),
+            patch.object(longterm, "_save_session", return_value="token"),
+            patch.object(longterm, "send_longterm_page", side_effect=send_math_page),
+        ):
+            reviewed = dict(scan_result)
+            reviewed.update(
+                gemini_reviewed_symbols=["LOW", "KEEPER"],
+                gemini_recommended_symbols=["KEEPER"],
+                gemini_recommendation_rows=["• KEEPER — quality"],
+                gemini_errors=[],
+            )
+            apply_gemini.return_value = reviewed, "internal note"
+            await longterm.send_longterm_report(bot, 1, manual=False)
+
+        messages = [call.args[1] for call in bot.send_message.call_args_list]
+        self.assertLess(messages.index("SUMMARY"), messages.index("MATH PAGE"))
+        gemini_index = next(i for i, message in enumerate(messages) if message.startswith("🤖 Gemini —"))
+        self.assertLess(messages.index("MATH PAGE"), gemini_index)
+        self.assertNotIn("internal note", messages)
+
     async def test_twelve_coins_paginate_without_rescan_or_duplicates(self):
         groups = [(f"COIN{i}", [pair_for(f"COIN{i}")]) for i in range(12)]
         bot = Mock(send_message=AsyncMock())

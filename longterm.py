@@ -647,15 +647,8 @@ def _pair_daily_pct(pair):
 
 
 def format_longterm_coin(symbol, pairs):
-    # Preserve scanner ranking and Gemini input; collapse routes only for display.
+    # Keep the mathematical report independent from the optional Gemini review.
     lines = [f"🧲 *{symbol}*"]
-    ai_status = pairs[0].ai_recommended if pairs else None
-    if ai_status is True:
-        lines.append("🤖 Gemini: ✅ приоритет для ручной проверки")
-    elif ai_status is False:
-        lines.append("🤖 Gemini: ⚠️ не вошла в приоритет, но математика прошла")
-    else:
-        lines.append("🤖 Gemini: не проверена")
     for pair in pairs[:1]:
         long_label = EXCHANGE_LABELS.get(pair.long.exchange, pair.long.exchange.upper())
         short_label = EXCHANGE_LABELS.get(pair.short.exchange, pair.short.exchange.upper())
@@ -770,8 +763,66 @@ def _extract_gemini_keep_symbols(answer, candidates):
     return keep
 
 
+def _extract_gemini_recommendation_rows(answers, allowed_symbols):
+    allowed = {symbol.upper(): symbol for symbol in allowed_symbols}
+    rows = []
+    seen = set()
+    for answer in answers:
+        for raw_line in answer.splitlines():
+            line = raw_line.strip().lstrip("•- ")
+            if not line.upper().startswith("KEEP "):
+                continue
+            recommendation = line.split(" ", 1)[1].strip()
+            if "—" in recommendation:
+                raw_symbol, _separator, reason = recommendation.partition("—")
+            elif " - " in recommendation:
+                raw_symbol, _separator, reason = recommendation.partition(" - ")
+            else:
+                raw_symbol, reason = recommendation, ""
+            token = raw_symbol.strip().upper()
+            token = token.replace("$", "").replace("`", "").replace("*", "")
+            symbol = allowed.get(token)
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            suffix = f" — {reason.strip()}" if reason.strip() else ""
+            rows.append(f"• {symbol}{suffix}")
+    return rows
+
+
+def format_longterm_gemini_recommendations(result, max_chars=3500):
+    """Build a separate Telegram section; never mix AI labels into math cards."""
+    rows = result.get("gemini_recommendation_rows", ())
+    reviewed = len(result.get("gemini_reviewed_symbols", ()))
+    recommended = len(result.get("gemini_recommended_symbols", ()))
+    errors = result.get("gemini_errors", ())
+    lines = [
+        "🤖 Gemini — отдельная рекомендация",
+        "",
+        "Полный математический список выше не изменён; все его монеты доступны по кнопке «Показать ещё».",
+        f"Gemini рекомендует {recommended} из {reviewed} проверенных монет:",
+        "",
+    ]
+    lines.extend(rows or ["Нет монет, которые Gemini рекомендует в этой выдаче."])
+    if errors:
+        lines.extend(["", f"⚠️ Часть Gemini-порций не ответила: {errors[0]}"])
+
+    chunks = []
+    current = ""
+    for line in lines:
+        candidate = f"{current}\n{line}" if current else line
+        if current and len(candidate) > max_chars:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 def apply_longterm_gemini_filter(result):
-    """Rank and label longterm groups with Gemini without deleting math results."""
+    """Attach a separate Gemini recommendation without changing math output."""
     if not GEMINI_API_KEY or not LONGTERM_GEMINI_FILTER or not result.get("groups"):
         return result, None
 
@@ -796,29 +847,26 @@ def apply_longterm_gemini_filter(result):
         time.sleep(1)
 
     if errors and not ai_notes:
-        return result, "⚠️ Gemini-ранжирование не ответило; все математические результаты сохранены: " + errors[0]
+        return result, "⚠️ Gemini не ответил; полный математический результат сохранён: " + errors[0]
 
-    ranked_groups = []
+    labeled_groups = []
     for symbol, pairs in groups:
         ai_recommended = True if symbol in kept_symbols else False if symbol in reviewed_symbols else None
-        ranked_groups.append((symbol, [replace(pair, ai_recommended=ai_recommended) for pair in pairs]))
-    ranked_groups.sort(
-        key=lambda group: (
-            0 if group[0] in kept_symbols else 1 if group[0] in reviewed_symbols else 2,
-            -group[1][0].score,
-        )
-    )
+        labeled_groups.append((symbol, [replace(pair, ai_recommended=ai_recommended) for pair in pairs]))
     filtered = dict(result)
     filtered["groups_before_gemini"] = len(groups)
-    filtered["groups"] = ranked_groups
+    filtered["groups"] = labeled_groups
     filtered["gemini_recommended_symbols"] = sorted(kept_symbols)
     filtered["gemini_reviewed_symbols"] = sorted(reviewed_symbols)
     filtered["gemini_notes"] = ai_notes
     filtered["gemini_errors"] = errors
+    filtered["gemini_recommendation_rows"] = _extract_gemini_recommendation_rows(
+        ai_notes, [symbol for symbol, _pairs in groups]
+    )
     note = (
-        f"🤖 Gemini longterm-ранжирование: рекомендует {len(kept_symbols)} "
+        f"🤖 Gemini longterm-рекомендация: {len(kept_symbols)} "
         f"из {len(reviewed_symbols)} проверенных монет. Все {len(groups)} математических "
-        "кандидатов сохранены в выдаче."
+        "кандидатов сохранены в исходном порядке."
     )
     if errors:
         note += f"\n⚠️ Часть Gemini-порций не ответила: {errors[0]}"
@@ -921,14 +969,21 @@ async def send_longterm_report(bot, chat_id, manual=False):
             "🤖 Gemini проверяет монеты на долгосрок: капитализация, серьёзность, риск 30-50% свечи, мем/скам риск...",
         )
         result, gemini_note = await asyncio.to_thread(apply_longterm_gemini_filter, result)
-        if gemini_note:
-            await bot.send_message(chat_id, gemini_note)
+    else:
+        gemini_note = None
     await bot.send_message(chat_id, format_longterm_summary(result), parse_mode="Markdown")
     if not result["groups"]:
         await bot.send_message(chat_id, "✅ Подходящих долгосрочных связок сейчас нет.")
         return
     token = _save_session(result)
     await send_longterm_page(bot, chat_id, token, 0)
+    if not manual:
+        recommendation_chunks = format_longterm_gemini_recommendations(result)
+        if result.get("gemini_reviewed_symbols"):
+            for chunk in recommendation_chunks:
+                await bot.send_message(chat_id, chunk)
+        elif gemini_note:
+            await bot.send_message(chat_id, gemini_note)
 
 
 async def auto_longterm_job(context: ContextTypes.DEFAULT_TYPE):
