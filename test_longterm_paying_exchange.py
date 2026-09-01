@@ -9,6 +9,45 @@ def _rows(rate, count=21):
 
 
 class LongTermPayingExchangeTests(unittest.TestCase):
+    def test_native_symbol_loader_fixes_are_local_to_longterm(self):
+        self.assertIsNone(longterm.EXCHANGE_SYMBOL_FETCHERS.get("bingx"))
+        self.assertIsNone(longterm.EXCHANGE_SYMBOL_FETCHERS.get("okx"))
+        self.assertIsNone(longterm.EXCHANGE_SYMBOL_FETCHERS.get("coinw"))
+        self.assertIn("bingx", longterm.LONGTERM_NATIVE_SYMBOL_FETCHERS)
+        self.assertIn("okx", longterm.LONGTERM_NATIVE_SYMBOL_FETCHERS)
+        self.assertIn("coinw", longterm.LONGTERM_NATIVE_SYMBOL_FETCHERS)
+
+    def test_full_payer_universe_is_scanned_without_180_coin_cap(self):
+        symbols = [f"COIN{index}" for index in range(250)]
+        payer_data = {symbol: _rows(-0.10) for symbol in symbols}
+        hedge_data = {symbol: _rows(0.01) for symbol in symbols}
+
+        def fetcher(data):
+            return lambda symbol, start_ms, now_ms: (data.get(symbol, []), symbol)
+
+        with (
+            patch.object(longterm, "EXCHANGE_FETCHERS", {
+                "xt": fetcher(payer_data),
+                "binance": fetcher(hedge_data),
+            }),
+            patch.object(longterm, "EXCHANGE_SYMBOL_FETCHERS", {
+                "xt": lambda: symbols,
+                "binance": lambda: symbols,
+            }),
+            patch.object(longterm, "LONGTERM_EXAMPLE_SYMBOLS", ()),
+            patch.object(longterm, "_fetch_cg_market", return_value={}),
+            patch.object(longterm, "_market_meta", return_value=(None, None)),
+            patch.object(longterm.time, "sleep"),
+        ):
+            result = longterm.scan_longterm_funding(days=7, active_exchanges=["xt", "binance"])
+
+        self.assertEqual(result["symbols_scanned"], 250)
+        self.assertEqual(result["coins_passing_funding"], 250)
+        self.assertEqual(result["coins_with_hedge"], 250)
+        self.assertEqual(result["coins_passing_income"], 250)
+        self.assertEqual(len(result["groups"]), 250)
+        self.assertEqual(result["funding_requests"], 500)
+
     def test_hedge_only_exchanges_never_discover_payer_but_remain_hedges(self):
         xt_data = {
             "PAYLONG": _rows(-0.10),

@@ -346,6 +346,32 @@ def okx_fetch(coin, start_ms, end_ms):
     return [], last_err
 
 
+def okx_get_all_symbols():
+    """Returns live USDT-settled perpetual swap base coins from OKX."""
+    r = requests.get(
+        "https://www.okx.com/api/v5/public/instruments",
+        params={"instType": "SWAP"},
+        timeout=10,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if data.get("code") != "0":
+        raise ValueError(data.get("msg", "OKX API error"))
+    coins = []
+    seen = set()
+    for item in data.get("data", []):
+        if item.get("state") != "live" or item.get("settleCcy") != "USDT":
+            continue
+        symbol = str(item.get("instId") or "").upper()
+        if not symbol.endswith("-USDT-SWAP"):
+            continue
+        coin = symbol[:-len("-USDT-SWAP")]
+        if coin and coin not in seen:
+            coins.append(coin)
+            seen.add(coin)
+    return coins
+
+
 # ─────────────────────────────────────────────
 # BYBIT API
 # ─────────────────────────────────────────────
@@ -471,6 +497,30 @@ def bingx_fetch(coin, start_ms, end_ms):
         last_err = str(e)
 
     return [], last_err
+
+
+def bingx_get_all_symbols():
+    """Returns active API-tradable USDT perpetual base coins from BingX."""
+    r = requests.get(
+        "https://open-api.bingx.com/openApi/swap/v2/quote/contracts",
+        timeout=10,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if data.get("code") != 0:
+        raise ValueError(data.get("msg", "BingX API error"))
+    coins = []
+    seen = set()
+    for item in data.get("data", []):
+        if item.get("status") != 1 or str(item.get("apiStateOpen", "")).lower() != "true":
+            continue
+        if str(item.get("currency") or "").upper() != "USDT":
+            continue
+        coin = str(item.get("asset") or "").upper()
+        if coin and coin not in seen:
+            coins.append(coin)
+            seen.add(coin)
+    return coins
 
 
 # ─────────────────────────────────────────────
@@ -832,6 +882,27 @@ def coinw_fetch(coin, start_ms, end_ms):
 
     except Exception as e:
         return [], str(e)
+
+
+def coinw_get_all_symbols():
+    """Returns online USDT perpetual base coins from CoinW."""
+    r = requests.get("https://api.coinw.com/v1/perpum/instruments", timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("code") != 0:
+        raise ValueError(data.get("msg", "CoinW API error"))
+    coins = []
+    seen = set()
+    for item in data.get("data", []):
+        if str(item.get("status") or "").lower() != "online":
+            continue
+        if str(item.get("quote") or "").lower() != "usdt":
+            continue
+        coin = str(item.get("base") or item.get("name") or "").upper()
+        if coin and coin not in seen:
+            coins.append(coin)
+            seen.add(coin)
+    return coins
 
 
 def phemex_get_all_symbols():

@@ -14,7 +14,14 @@ from telegram.ext import ContextTypes
 from ai import gemini_generate, get_last_gemini_error
 from analysis import analyze_rates, calc_std, recent_trend_ok
 from config import EXCHANGES_ENABLED, GEMINI_API_KEY, REPORT_CHAT_ID, TEMPORARILY_DISABLED_EXCHANGES
-from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, EXCHANGE_SYMBOL_FETCHERS, phemex_get_all_symbols
+from exchanges import (
+    EXCHANGE_FETCHERS,
+    EXCHANGE_LABELS,
+    EXCHANGE_SYMBOL_FETCHERS,
+    bingx_get_all_symbols,
+    coinw_get_all_symbols,
+    okx_get_all_symbols,
+)
 from oi import (
     COINGECKO_DERIVATIVE_IDS,
     get_oi_hide_threshold,
@@ -27,26 +34,29 @@ from oi import (
 LONGTERM_DAYS = int(os.getenv("LONGTERM_DAYS", "7"))
 LONGTERM_AMOUNT_PER_LEG = float(os.getenv("LONGTERM_AMOUNT_PER_LEG", "20000"))
 LONGTERM_MIN_MONTHLY_USD = float(os.getenv("LONGTERM_MIN_MONTHLY_USD", "300"))
-LONGTERM_SYMBOL_LIMIT = int(os.getenv("LONGTERM_SYMBOL_LIMIT", "180"))
-LONGTERM_TOP_COINS = int(os.getenv("LONGTERM_TOP_COINS", "60"))
 LONGTERM_PAGE_SIZE = int(os.getenv("LONGTERM_PAGE_SIZE", "5"))
 LONGTERM_GEMINI_FILTER = os.getenv("LONGTERM_GEMINI_FILTER", "1").lower() not in ("0", "false", "off", "no")
 LONGTERM_GEMINI_CHUNK_SIZE = int(os.getenv("LONGTERM_GEMINI_CHUNK_SIZE", "15"))
 LONGTERM_MIN_OI_WARN_USD = float(os.getenv("LONGTERM_MIN_OI_WARN_USD", "1000000"))
 LONGTERM_MIN_VOL_WARN_USD = float(os.getenv("LONGTERM_MIN_VOL_WARN_USD", "400000"))
-LONGTERM_EXAMPLE_SYMBOLS = ("BCH", "XMR", "AMZNX", "ATH")
+LONGTERM_EXAMPLE_SYMBOLS = ()
 
 # These venues remain fully available as the hedge leg. They are excluded only
 # from discovering/qualifying the primary funding-paying leg for 7+ day scans.
 # Keep this rule local to longterm.py so /report (20:00) and short-term tools do
 # not inherit it. Remove a key here to restore that venue as a long-term payer.
 LONGTERM_HEDGE_ONLY_EXCHANGES = frozenset({"kucoin", "gate", "mexc", "binance", "bybit", "okx"})
+LONGTERM_NATIVE_SYMBOL_FETCHERS = {
+    "bingx": bingx_get_all_symbols,
+    "coinw": coinw_get_all_symbols,
+    "okx": okx_get_all_symbols,
+}
 
 _cg_market_cache = {}
 _cg_market_cache_ts = {}
 _CG_CACHE_TTL = 15 * 60
 _longterm_sessions = {}
-_SESSION_TTL = 30 * 60
+_SESSION_TTL = 2 * 60 * 60
 _quote_cache = {}
 _QUOTE_CACHE_TTL = 60
 
@@ -93,6 +103,7 @@ class LongTermPair:
     paying_direction: str
     paying_category: str
     entry_spread_pct: float | None = None
+    ai_recommended: bool | None = None
 
 
 def _mean(values):
@@ -293,27 +304,54 @@ def _paying_preference(pair):
     return category_rank, effective_daily_rate
 
 
-def _symbol_universe(active_exchanges):
-    counts = {}
+def _symbol_catalog(active_exchanges):
+    """Load native symbol lists and retain exact exchange membership per coin."""
+    memberships = {}
+    symbol_counts = {}
+    errors = {}
     for exchange in active_exchanges:
-        fetcher = EXCHANGE_SYMBOL_FETCHERS.get(exchange)
-        try:
-            symbols = fetcher() if fetcher else phemex_get_all_symbols()
-        except Exception:
+        fetcher = EXCHANGE_SYMBOL_FETCHERS.get(exchange) or LONGTERM_NATIVE_SYMBOL_FETCHERS.get(exchange)
+        if not fetcher:
+            errors[exchange] = "symbol fetcher is not configured"
+            symbol_counts[exchange] = 0
             continue
-        for symbol in symbols:
-            coin = _normalize_coin(symbol)
-            if coin:
-                counts[coin] = counts.get(coin, 0) + 1
-    for symbol in LONGTERM_EXAMPLE_SYMBOLS:
-        counts[symbol] = max(counts.get(symbol, 0), 99)
-    ordered = sorted(counts, key=lambda coin: (-counts[coin], coin))
-    if LONGTERM_SYMBOL_LIMIT > 0:
-        return ordered[:LONGTERM_SYMBOL_LIMIT]
-    return ordered
+        try:
+            symbols = fetcher()
+        except Exception as exc:
+            errors[exchange] = str(exc)
+            symbol_counts[exchange] = 0
+            continue
+        normalized = {_normalize_coin(symbol) for symbol in symbols}
+        normalized.discard("")
+        symbol_counts[exchange] = len(normalized)
+        for coin in normalized:
+            memberships.setdefault(coin, set()).add(exchange)
+    ordered = sorted(memberships, key=lambda coin: (-len(memberships[coin]), coin))
+    return ordered, memberships, symbol_counts, errors
 
 
-def scan_longterm_funding(days=LONGTERM_DAYS, active_exchanges=None):
+def _is_funding_api_failure(detail):
+    text = str(detail or "").strip().lower()
+    if not text:
+        return False
+    no_data_prefixes = (
+        "нет данны",
+        "нет ставок",
+        "no data",
+        "no funding",
+    )
+    return not text.startswith(no_data_prefixes)
+
+
+def scan_longterm_funding(days=LONGTERM_DAYS, active_exchanges=None, progress_callback=None):
+    def progress(message):
+        if not progress_callback:
+            return
+        try:
+            progress_callback(message)
+        except Exception:
+            pass
+
     active = active_exchanges or [
         exchange for exchange, fetcher in EXCHANGE_FETCHERS.items()
         if fetcher and EXCHANGES_ENABLED.get(exchange, False) and exchange not in TEMPORARILY_DISABLED_EXCHANGES
@@ -331,42 +369,124 @@ def scan_longterm_funding(days=LONGTERM_DAYS, active_exchanges=None):
             "active_exchanges": active,
             "paying_exchanges": [],
             "hedge_only_exchanges": active,
+            "symbol_counts": {},
+            "symbol_list_errors": {},
+            "paying_signals_found": 0,
+            "coins_passing_funding": 0,
+            "coins_with_hedge": 0,
+            "coins_passing_income": 0,
+            "funding_requests": 0,
+            "funding_empty": 0,
+            "funding_failures": 0,
         }
+    all_symbols, memberships, symbol_counts, symbol_list_errors = _symbol_catalog(active)
+    symbols = [
+        symbol for symbol in all_symbols
+        if memberships[symbol].intersection(paying_active)
+    ]
+    for symbol in LONGTERM_EXAMPLE_SYMBOLS:
+        symbol = _normalize_coin(symbol)
+        if symbol and symbol not in memberships:
+            memberships[symbol] = set(paying_active)
+            symbols.append(symbol)
+    symbols = sorted(set(symbols), key=lambda coin: (-len(memberships[coin]), coin))
+    progress(
+        f"📋 Longterm universe: {len(symbols)} уникальных монет. "
+        "Этап 1/2: проверяю все платящие биржи..."
+    )
     for exchange in active:
         _fetch_cg_market(exchange)
 
     now_ms = int(time.time() * 1000)
     start_ms = now_ms - days * 24 * 60 * 60 * 1000
-    # Candidate discovery belongs only to exchanges allowed to be the paying
-    # leg. Once a coin qualifies there, every active exchange is still fetched
-    # and considered as its opposite hedge leg.
-    symbols = _symbol_universe(paying_active)
     pairs = []
     errors = {}
+    funding_requests = 0
+    funding_empty = 0
+    funding_failures = 0
+    paying_legs_by_symbol = {}
+    paying_signals_by_symbol = {}
 
-    for symbol in symbols:
+    # Stage 1: scan every listed coin on every eligible payer venue. Native
+    # memberships avoid querying thousands of contracts an exchange does not list.
+    for symbol_index, symbol in enumerate(symbols, 1):
         legs = []
-        for exchange in active:
+        paying_signals = []
+        for exchange in paying_active:
+            if exchange not in memberships.get(symbol, ()) and exchange not in symbol_list_errors:
+                continue
             fetcher = EXCHANGE_FETCHERS.get(exchange)
             if not fetcher:
                 continue
+            funding_requests += 1
             try:
-                rows, _sym = fetcher(symbol, start_ms, now_ms)
+                rows, detail = fetcher(symbol, start_ms, now_ms)
             except Exception as exc:
                 errors[f"{exchange}:{symbol}"] = str(exc)
                 rows = []
+                detail = exc
+            if not rows:
+                funding_empty += 1
+                if _is_funding_api_failure(detail):
+                    funding_failures += 1
+                    errors.setdefault(f"{exchange}:{symbol}", str(detail))
+            leg = _leg_from_rows(exchange, symbol, rows, days) if rows else None
+            if leg:
+                legs.append(leg)
+                signal = _paying_signal(leg)
+                if signal:
+                    paying_signals.append((leg, *signal))
+            time.sleep(0.04)
+        if legs:
+            paying_legs_by_symbol[symbol] = legs
+        if paying_signals:
+            paying_signals_by_symbol[symbol] = paying_signals
+        if symbol_index % 200 == 0 or symbol_index == len(symbols):
+            progress(
+                f"⏳ Longterm этап 1/2: {symbol_index}/{len(symbols)} монет; "
+                f"FULL/PARTIAL + trend: {len(paying_signals_by_symbol)}."
+            )
+
+    coins_with_hedge = 0
+    # Stage 2: only coins with a qualified payer signal query hedge-only venues.
+    # Other payer venues were already loaded in stage 1 and can also be hedges.
+    qualified_items = list(paying_signals_by_symbol.items())
+    progress(
+        f"🛡️ Longterm этап 2/2: ищу хедж для {len(qualified_items)} монет..."
+    )
+    for qualified_index, (symbol, paying_signals) in enumerate(qualified_items, 1):
+        legs = list(paying_legs_by_symbol.get(symbol, ()))
+        for exchange in active:
+            if exchange in paying_active:
+                continue
+            if exchange not in memberships.get(symbol, ()) and exchange not in symbol_list_errors:
+                continue
+            fetcher = EXCHANGE_FETCHERS.get(exchange)
+            if not fetcher:
+                continue
+            funding_requests += 1
+            try:
+                rows, detail = fetcher(symbol, start_ms, now_ms)
+            except Exception as exc:
+                errors[f"{exchange}:{symbol}"] = str(exc)
+                rows = []
+                detail = exc
+            if not rows:
+                funding_empty += 1
+                if _is_funding_api_failure(detail):
+                    funding_failures += 1
+                    errors.setdefault(f"{exchange}:{symbol}", str(detail))
             leg = _leg_from_rows(exchange, symbol, rows, days) if rows else None
             if leg:
                 legs.append(leg)
             time.sleep(0.04)
-        paying_signals = []
-        for leg in legs:
-            if leg.exchange not in paying_active:
-                continue
-            signal = _paying_signal(leg)
-            if signal:
-                paying_signals.append((leg, *signal))
 
+        if any(
+            paying_leg.exchange != hedge_leg.exchange
+            for paying_leg, _direction, _category in paying_signals
+            for hedge_leg in legs
+        ):
+            coins_with_hedge += 1
         for paying_leg, paying_direction, paying_category in paying_signals:
             for hedge_leg in legs:
                 if paying_leg.exchange == hedge_leg.exchange:
@@ -386,6 +506,11 @@ def scan_longterm_funding(days=LONGTERM_DAYS, active_exchanges=None):
                 )
                 if pair:
                     pairs.append(pair)
+        if qualified_index % 50 == 0 or qualified_index == len(qualified_items):
+            progress(
+                f"⏳ Longterm этап 2/2: {qualified_index}/{len(qualified_items)}; "
+                f"монет со второй ногой: {coins_with_hedge}."
+            )
 
     best_by_route = {}
     for pair in pairs:
@@ -406,7 +531,7 @@ def scan_longterm_funding(days=LONGTERM_DAYS, active_exchanges=None):
         "days": days,
         "symbols_scanned": len(symbols),
         "pairs_found": len(ranked),
-        "groups": [(symbol, grouped[symbol]) for symbol in top_symbols[:LONGTERM_TOP_COINS]],
+        "groups": [(symbol, grouped[symbol]) for symbol in top_symbols],
         "groups_total": len(grouped),
         "errors": errors,
         "active_exchanges": active,
@@ -414,6 +539,15 @@ def scan_longterm_funding(days=LONGTERM_DAYS, active_exchanges=None):
         "hedge_only_exchanges": [
             exchange for exchange in active if exchange in LONGTERM_HEDGE_ONLY_EXCHANGES
         ],
+        "symbol_counts": symbol_counts,
+        "symbol_list_errors": symbol_list_errors,
+        "paying_signals_found": sum(len(signals) for signals in paying_signals_by_symbol.values()),
+        "coins_passing_funding": len(paying_signals_by_symbol),
+        "coins_with_hedge": coins_with_hedge,
+        "coins_passing_income": len(grouped),
+        "funding_requests": funding_requests,
+        "funding_empty": funding_empty,
+        "funding_failures": funding_failures,
     }
 
 
@@ -426,11 +560,14 @@ def format_longterm_summary(result):
         EXCHANGE_LABELS.get(exchange, exchange.upper()) for exchange in result.get("hedge_only_exchanges", ())
     ) or "нет"
     before_gemini = result.get("groups_before_gemini")
-    gemini_line = (
-        f"После Gemini longterm-фильтра: `{len(result['groups'])}` из `{before_gemini}` монет\n"
-        if before_gemini is not None
-        else ""
-    )
+    gemini_line = ""
+    if before_gemini is not None:
+        recommended = len(result.get("gemini_recommended_symbols", ()))
+        reviewed = len(result.get("gemini_reviewed_symbols", ()))
+        gemini_line = (
+            f"Gemini рекомендует: `{recommended}` из `{reviewed}` проверенных; "
+            "монеты не удаляются\n"
+        )
     selected_before_gemini = before_gemini if before_gemini is not None else len(result["groups"])
     total_coins = result.get("groups_total", selected_before_gemini)
     limit_line = (
@@ -441,6 +578,15 @@ def format_longterm_summary(result):
         f"⚠️ Ошибок получения funding: `{len(result['errors'])}`; результат может быть неполным.\n"
         if result.get("errors") else ""
     )
+    symbol_error_line = (
+        "⚠️ Не загрузились списки монет: `"
+        + ", ".join(
+            EXCHANGE_LABELS.get(exchange, exchange.upper())
+            for exchange in result.get("symbol_list_errors", {})
+        )
+        + "`; для них включён fail-open по общему universe.\n"
+        if result.get("symbol_list_errors") else ""
+    )
     return (
         "🧲 *Долгосрочный funding scan*\n\n"
         f"Биржи: `{labels}`\n"
@@ -448,13 +594,21 @@ def format_longterm_summary(result):
         f"🛡️ Только хедж: `{hedge_only_labels}`\n"
         f"Период: `{result['days']}` дней\n"
         "Оценка прибыли: `$8,000` и `$20,000` на ногу\n"
-        f"Монет проверено: `{result['symbols_scanned']}`\n"
+        f"Монет в universe платящих бирж: `{result['symbols_scanned']}`\n"
+        f"Прошли FULL/PARTIAL + trend: `{result.get('coins_passing_funding', 0)}` монет "
+        f"(`{result.get('paying_signals_found', 0)}` сигналов)\n"
+        f"Найдена вторая нога: `{result.get('coins_with_hedge', 0)}` монет\n"
+        f"Прошли доходность: `{result.get('coins_passing_income', result.get('groups_total', 0))}` монет\n"
+        f"Funding API: `{result.get('funding_requests', 0)}` запросов, "
+        f"`{result.get('funding_empty', 0)}` без достаточной истории, "
+        f"`{result.get('funding_failures', len(result.get('errors', {})))}` API-ошибок\n"
         f"Маршрутов до Gemini (включая альтернативы): `{result['pairs_found']}`\n"
         f"Монет по funding-фильтрам: `{total_coins}`\n"
         f"{limit_line}"
         f"{gemini_line}"
         f"Доступно к показу: `{len(result['groups'])}` монет — по одной лучшей связке\n"
         f"{error_line}"
+        f"{symbol_error_line}"
         f"Показываю порциями по `{LONGTERM_PAGE_SIZE}` монет\n\n"
         "OI/24h volume и live-спред не фильтруют longterm-результат."
     )
@@ -495,6 +649,13 @@ def _pair_daily_pct(pair):
 def format_longterm_coin(symbol, pairs):
     # Preserve scanner ranking and Gemini input; collapse routes only for display.
     lines = [f"🧲 *{symbol}*"]
+    ai_status = pairs[0].ai_recommended if pairs else None
+    if ai_status is True:
+        lines.append("🤖 Gemini: ✅ приоритет для ручной проверки")
+    elif ai_status is False:
+        lines.append("🤖 Gemini: ⚠️ не вошла в приоритет, но математика прошла")
+    else:
+        lines.append("🤖 Gemini: не проверена")
     for pair in pairs[:1]:
         long_label = EXCHANGE_LABELS.get(pair.long.exchange, pair.long.exchange.upper())
         short_label = EXCHANGE_LABELS.get(pair.short.exchange, pair.short.exchange.upper())
@@ -610,12 +771,13 @@ def _extract_gemini_keep_symbols(answer, candidates):
 
 
 def apply_longterm_gemini_filter(result):
-    """Filter longterm groups by asset quality. If Gemini fails, return result unchanged."""
+    """Rank and label longterm groups with Gemini without deleting math results."""
     if not GEMINI_API_KEY or not LONGTERM_GEMINI_FILTER or not result.get("groups"):
         return result, None
 
     groups = result["groups"]
     kept_symbols = set()
+    reviewed_symbols = set()
     ai_notes = []
     errors = []
     for i in range(0, len(groups), LONGTERM_GEMINI_CHUNK_SIZE):
@@ -629,21 +791,34 @@ def apply_longterm_gemini_filter(result):
             errors.append(get_last_gemini_error() or "no response")
             continue
         kept_symbols.update(_extract_gemini_keep_symbols(answer, symbols))
+        reviewed_symbols.update(symbols)
         ai_notes.append(answer)
         time.sleep(1)
 
     if errors and not ai_notes:
-        return result, "⚠️ Gemini-фильтр долгосрока не ответил, показываю математический результат без AI-фильтра: " + errors[0]
+        return result, "⚠️ Gemini-ранжирование не ответило; все математические результаты сохранены: " + errors[0]
 
-    filtered_groups = [(symbol, pairs) for symbol, pairs in groups if symbol in kept_symbols]
+    ranked_groups = []
+    for symbol, pairs in groups:
+        ai_recommended = True if symbol in kept_symbols else False if symbol in reviewed_symbols else None
+        ranked_groups.append((symbol, [replace(pair, ai_recommended=ai_recommended) for pair in pairs]))
+    ranked_groups.sort(
+        key=lambda group: (
+            0 if group[0] in kept_symbols else 1 if group[0] in reviewed_symbols else 2,
+            -group[1][0].score,
+        )
+    )
     filtered = dict(result)
     filtered["groups_before_gemini"] = len(groups)
-    filtered["groups"] = filtered_groups
+    filtered["groups"] = ranked_groups
+    filtered["gemini_recommended_symbols"] = sorted(kept_symbols)
+    filtered["gemini_reviewed_symbols"] = sorted(reviewed_symbols)
     filtered["gemini_notes"] = ai_notes
     filtered["gemini_errors"] = errors
     note = (
-        f"🤖 Gemini longterm-фильтр: оставил {len(filtered_groups)} из {len(groups)} монет "
-        "по критерию качества актива для долгосрока."
+        f"🤖 Gemini longterm-ранжирование: рекомендует {len(kept_symbols)} "
+        f"из {len(reviewed_symbols)} проверенных монет. Все {len(groups)} математических "
+        "кандидатов сохранены в выдаче."
     )
     if errors:
         note += f"\n⚠️ Часть Gemini-порций не ответила: {errors[0]}"
@@ -734,7 +909,12 @@ async def send_longterm_report(bot, chat_id, manual=False):
         "для FULL/PARTIAL-монет, "
         "найденных на других биржах."
     )
-    result = await asyncio.to_thread(scan_longterm_funding)
+    loop = asyncio.get_running_loop()
+
+    def report_progress(message):
+        asyncio.run_coroutine_threadsafe(bot.send_message(chat_id, message), loop)
+
+    result = await asyncio.to_thread(scan_longterm_funding, LONGTERM_DAYS, None, report_progress)
     if not manual and GEMINI_API_KEY and LONGTERM_GEMINI_FILTER and result.get("groups"):
         await bot.send_message(
             chat_id,

@@ -41,11 +41,29 @@ class LongTermDisplayTests(unittest.TestCase):
             active_exchanges=["xt", "okx"], days=7, symbols_scanned=180,
             pairs_found=100, groups_total=20, groups_before_gemini=20,
             groups=[("TEST", [pair_for("TEST")])] * 3, errors={},
+            gemini_recommended_symbols=["TEST"], gemini_reviewed_symbols=["TEST", "TWO", "THREE"],
         )
         text = longterm.format_longterm_summary(result)
         self.assertIn("Маршрутов до Gemini (включая альтернативы): `100`", text)
-        self.assertIn("После Gemini longterm-фильтра: `3` из `20` монет", text)
+        self.assertIn("Gemini рекомендует: `1` из `3`", text)
         self.assertIn("Доступно к показу: `3` монет", text)
+
+    def test_gemini_ranks_and_labels_without_deleting_candidates(self):
+        groups = [(symbol, [pair_for(symbol)]) for symbol in ("LOW", "KEEPER", "OTHER")]
+        result = {"groups": groups}
+        with (
+            patch.object(longterm, "GEMINI_API_KEY", "test"),
+            patch.object(longterm, "LONGTERM_GEMINI_FILTER", True),
+            patch.object(longterm, "gemini_generate", return_value="KEEP KEEPER — quality"),
+            patch.object(longterm.time, "sleep"),
+        ):
+            ranked, note = longterm.apply_longterm_gemini_filter(result)
+
+        self.assertEqual([symbol for symbol, _pairs in ranked["groups"]], ["KEEPER", "LOW", "OTHER"])
+        self.assertEqual(len(ranked["groups"]), 3)
+        self.assertTrue(ranked["groups"][0][1][0].ai_recommended)
+        self.assertFalse(ranked["groups"][1][1][0].ai_recommended)
+        self.assertIn("Все 3 математических кандидатов сохранены", note)
 
 
 class LongTermPaginationTests(unittest.IsolatedAsyncioTestCase):
