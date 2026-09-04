@@ -4,6 +4,13 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 REPORT_CHAT_ID = os.environ.get("REPORT_CHAT_ID", "")
 
+# Auto-report schedule is expressed in Kyiv local time so DST changes do not
+# shift Telegram delivery by one hour.
+REPORT_TIMEZONE = "Europe/Kyiv"
+EVENING_REPORT_HOUR_LOCAL = 20
+LONGTERM_REPORT_HOUR_LOCAL = 22
+REPORT_JOB_MISFIRE_GRACE_SECONDS = 2 * 60 * 60
+
 # CoinW — данные из Supabase (коллектор собирает каждые 8 часов)
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
@@ -22,7 +29,7 @@ MIN_POS_RATIO = 0.30
 RECENT_TREND_RATES = 4
 RECENT_TREND_MIN_GOOD_RATIO = 0.50
 
-# Вечерний авто-отчёт: 20:00 Europe/Kyiv = 17:00 UTC.
+# Вечерний авто-отчёт: 20:00 Europe/Kyiv.
 AUTO_SCAN_AMOUNT = 20000
 AUTO_SCAN_THRESHOLD = 29
 AUTO_SCAN_DAYS = 3

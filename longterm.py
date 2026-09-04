@@ -944,7 +944,7 @@ async def longterm_more_callback(update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_longterm_report(bot, chat_id, manual=False):
-    prefix = "🔎 Запускаю долгосрочный funding scan..." if manual else "🕘 Авто-скан долгосрочного funding запущен..."
+    prefix = "🔎 Запускаю долгосрочный funding scan..." if manual else "🕙 Авто-скан долгосрочного funding запущен..."
     hedge_only = ", ".join(
         EXCHANGE_LABELS.get(exchange, exchange.upper())
         for exchange in sorted(LONGTERM_HEDGE_ONLY_EXCHANGES)

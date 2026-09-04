@@ -9,6 +9,7 @@ import asyncio
 import time
 import requests
 from datetime import datetime, time as dt_time, timezone
+from zoneinfo import ZoneInfo
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -30,13 +31,17 @@ from analysis import (
 from config import (
     BOT_TOKEN,
     DEFAULT_DAYS,
+    EVENING_REPORT_HOUR_LOCAL,
     EXCHANGES_ENABLED,
     GEMINI_API_KEY,
+    LONGTERM_REPORT_HOUR_LOCAL,
     MAX_OUTLIER_PCT,
     MIN_NEG_RATIO,
     MIN_POS_RATIO,
     NEG_AVG_THRESHOLD,
     REPORT_CHAT_ID,
+    REPORT_JOB_MISFIRE_GRACE_SECONDS,
+    REPORT_TIMEZONE,
     STABILITY_THRESHOLD,
     TEMPORARILY_DISABLED_EXCHANGES,
 )
@@ -64,6 +69,28 @@ from reports import auto_scan_job, run_evening_report, send_entry_instructions
 def temporary_disabled_text():
     labels = [EXCHANGE_LABELS.get(e, e.upper()) for e in TEMPORARILY_DISABLED_EXCHANGES]
     return ", ".join(sorted(labels))
+
+
+def register_auto_report_jobs(job_queue):
+    """Register daily reports in Kyiv time with protection from short scheduler delays."""
+    report_tz = ZoneInfo(REPORT_TIMEZONE)
+    job_kwargs = {
+        "misfire_grace_time": REPORT_JOB_MISFIRE_GRACE_SECONDS,
+        "coalesce": True,
+        "max_instances": 1,
+    }
+    job_queue.run_daily(
+        auto_scan_job,
+        time=dt_time(hour=EVENING_REPORT_HOUR_LOCAL, tzinfo=report_tz),
+        name="evening_auto_report",
+        job_kwargs=job_kwargs,
+    )
+    job_queue.run_daily(
+        auto_longterm_job,
+        time=dt_time(hour=LONGTERM_REPORT_HOUR_LOCAL, tzinfo=report_tz),
+        name="longterm_auto_report",
+        job_kwargs=job_kwargs,
+    )
 
 WAIT_ANALYZE_COINS = 1
 WAIT_SHOW_COIN = 3
@@ -2170,7 +2197,8 @@ def settings_text():
         f"Макс. выбросов: `{MAX_OUTLIER_PCT}%`\\n"
         f"Neg avg порог: `{NEG_AVG_THRESHOLD}%`\\n"
         f"Gemini AI: `{'включён' if GEMINI_API_KEY else 'не настроен'}`\\n"
-        f"Вечерний отчёт 20:00 Киев: `{'включён' if REPORT_CHAT_ID else 'не настроен'}`\\n\\n"
+        f"Вечерний отчёт 20:00 Киев: `{'включён' if REPORT_CHAT_ID else 'не настроен'}`\\n"
+        f"Longterm отчёт 22:00 Киев: `{'включён' if REPORT_CHAT_ID else 'не настроен'}`\\n\\n"
         f"Временно отключены: `{temporary_disabled_text()}` — API-код сохранён, можно быстро вернуть.\\n\\n"
         "Категории:\\n"
         "✅ *ПОДХОДИТ* — стабильность ок\\n"
@@ -2486,15 +2514,14 @@ def main():
     app.add_handler(oi_conv)
 
     if REPORT_CHAT_ID and app.job_queue:
-        app.job_queue.run_daily(auto_scan_job, time=dt_time(hour=17, minute=0, second=0, tzinfo=timezone.utc))
-        app.job_queue.run_daily(auto_longterm_job, time=dt_time(hour=18, minute=0, second=0, tzinfo=timezone.utc))
+        register_auto_report_jobs(app.job_queue)
 
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
     print("Бот запущен...")
     if REPORT_CHAT_ID:
-        print("Вечерний отчёт включён: 20:00 Europe/Kyiv / 17:00 UTC")
-        print("Longterm funding отчёт включён: 21:00 Europe/Kyiv / 18:00 UTC")
+        print("Вечерний отчёт включён: 20:00 Europe/Kyiv")
+        print("Longterm funding отчёт включён: 22:00 Europe/Kyiv")
     app.run_polling()
 
 

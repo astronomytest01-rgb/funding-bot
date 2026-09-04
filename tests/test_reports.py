@@ -55,9 +55,7 @@ class EveningReportPairTests(unittest.TestCase):
         }
 
         with patch.object(reports, "fetch_exchange_average", side_effect=lambda _coin, ex, _start, _end: fake[ex]), \
-             patch.object(reports, "fetch_market_quote", side_effect=lambda _coin, ex: quotes[ex]), \
-             patch.object(reports, "is_oi_allowed", return_value=True), \
-             patch.object(reports, "is_volume_allowed", return_value=True):
+             patch.object(reports, "fetch_market_quote", side_effect=lambda _coin, ex: quotes[ex]):
             pair = reports.find_delta_pair_for_signal("ACE", signal, 1, ["phemex", "kucoin"])
 
         self.assertIsNone(pair)
@@ -90,9 +88,7 @@ class EveningReportPairTests(unittest.TestCase):
         with patch.object(reports, "AUTO_REPORT_MIN_DAILY_USD", 0), \
              patch.object(reports, "AUTO_REPORT_MIN_ENTRY_SPREAD_PCT", -2.0), \
              patch.object(reports, "fetch_exchange_average", side_effect=lambda _coin, ex, _start, _end: fake[ex]), \
-             patch.object(reports, "fetch_market_quote", side_effect=lambda _coin, ex: quotes[ex]), \
-             patch.object(reports, "is_oi_allowed", return_value=True), \
-             patch.object(reports, "is_volume_allowed", return_value=True):
+             patch.object(reports, "fetch_market_quote", side_effect=lambda _coin, ex: quotes[ex]):
             pair = reports.find_delta_pair_for_signal("COTI", signal, 1, ["phemex", "kucoin"])
 
         self.assertIsNotNone(pair)
@@ -138,9 +134,7 @@ class EveningReportPairTests(unittest.TestCase):
         with patch.object(reports, "AUTO_REPORT_MIN_DAILY_USD", 0), \
              patch.object(reports, "AUTO_REPORT_MIN_ENTRY_SPREAD_PCT", -0.8), \
              patch.object(reports, "fetch_exchange_average", side_effect=lambda _coin, ex, _start, _end: fake[ex]), \
-             patch.object(reports, "fetch_market_quote", side_effect=lambda _coin, ex: quotes[ex]), \
-             patch.object(reports, "is_oi_allowed", return_value=True), \
-             patch.object(reports, "is_volume_allowed", return_value=True):
+             patch.object(reports, "fetch_market_quote", side_effect=lambda _coin, ex: quotes[ex]):
             pair = reports.find_delta_pair_for_signal("HOME", signal, 1, ["okx", "phemex", "kucoin"])
 
         self.assertIsNotNone(pair)
