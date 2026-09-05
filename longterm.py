@@ -80,6 +80,7 @@ NO_KEEPERS"""
 
 @dataclass(frozen=True)
 class LongTermLeg:
+    """Funding rates are stored newest first, regardless of API response order."""
     exchange: str
     rates: tuple[float, ...]
     avg: float
@@ -211,13 +212,14 @@ def _liquidity_warnings(pair):
 def _direction_quality(rates, side):
     income_rates = tuple((-r if side == "LONG" else r) for r in rates)
     positive_ratio = sum(1 for r in income_rates if r >= 0) / len(income_rates)
-    recent = income_rates[-min(6, len(income_rates)) :]
+    recent = income_rates[:6]
     return positive_ratio, _mean(recent)
 
 
 def _clean_rates(rows):
+    """Normalize all exchange histories to newest-first before dropping timestamps."""
     rates = []
-    for _ts, rate in rows:
+    for _ts, rate in sorted(rows, key=lambda row: row[0], reverse=True):
         try:
             value = float(rate)
         except (TypeError, ValueError):
@@ -237,7 +239,7 @@ def _leg_from_rows(exchange, symbol, rows, days):
         rates=rates,
         avg=_mean(rates),
         std=calc_std(rates),
-        latest=rates[-1],
+        latest=rates[0],
         payments_per_day=len(rates) / days,
         oi_usd=oi_usd,
         volume_24h_usd=volume_24h_usd,
@@ -290,7 +292,9 @@ def _paying_signal(leg):
     if not metrics or metrics["category"] not in {"full", "partial"}:
         return None
     direction = metrics["direction"]
-    if not recent_trend_ok(leg.rates, direction):
+    # The shared analysis helper expects oldest-first histories; other scans
+    # already use that contract. Longterm stores newest-first explicitly.
+    if not recent_trend_ok(tuple(reversed(leg.rates)), direction):
         return None
     return direction, metrics["category"]
 
