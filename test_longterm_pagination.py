@@ -77,7 +77,14 @@ class LongTermPaginationTests(unittest.IsolatedAsyncioTestCase):
         scan_result = {"groups": groups}
 
         async def send_math_page(bot, chat_id, token, offset):
+            events.append("math")
             await bot.send_message(chat_id, "MATH PAGE")
+
+        events = []
+
+        def apply_review(result):
+            events.append("gemini")
+            return reviewed, "internal note"
 
         bot = Mock(send_message=AsyncMock())
         with (
@@ -96,7 +103,7 @@ class LongTermPaginationTests(unittest.IsolatedAsyncioTestCase):
                 gemini_recommendation_rows=["• KEEPER — quality"],
                 gemini_errors=[],
             )
-            apply_gemini.return_value = reviewed, "internal note"
+            apply_gemini.side_effect = apply_review
             await longterm.send_longterm_report(bot, 1, manual=False)
 
         messages = [call.args[1] for call in bot.send_message.call_args_list]
@@ -104,6 +111,7 @@ class LongTermPaginationTests(unittest.IsolatedAsyncioTestCase):
         gemini_index = next(i for i, message in enumerate(messages) if message.startswith("🤖 Gemini —"))
         self.assertLess(messages.index("MATH PAGE"), gemini_index)
         self.assertNotIn("internal note", messages)
+        self.assertEqual(events, ["math", "gemini"])
 
     async def test_twelve_coins_paginate_without_rescan_or_duplicates(self):
         groups = [(f"COIN{i}", [pair_for(f"COIN{i}")]) for i in range(12)]
@@ -117,12 +125,12 @@ class LongTermPaginationTests(unittest.IsolatedAsyncioTestCase):
             token = longterm._save_session({"groups": groups})
             await longterm.send_longterm_page(bot, 1, token, 0)
             first_button = bot.send_message.call_args.kwargs["reply_markup"].inline_keyboard[0][0]
-            self.assertEqual(first_button.callback_data, f"lt_more:{token}:5")
+            self.assertEqual(first_button.callback_data, f"lt_more:{token}:other:5")
 
             query = Mock(data=first_button.callback_data, answer=AsyncMock(), message=Mock(chat_id=1))
             await longterm.longterm_more_callback(Mock(callback_query=query), Mock(bot=bot))
             second_button = bot.send_message.call_args.kwargs["reply_markup"].inline_keyboard[0][0]
-            self.assertEqual(second_button.callback_data, f"lt_more:{token}:10")
+            self.assertEqual(second_button.callback_data, f"lt_more:{token}:other:10")
             self.assertEqual(second_button.text, "Показать ещё 2")
 
             query.data = second_button.callback_data

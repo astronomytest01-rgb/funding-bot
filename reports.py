@@ -1,14 +1,24 @@
 import asyncio
+import os
+import secrets
 import time
 
 import requests
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 from ai import gemini_analyze_bulk, get_last_gemini_error
 from analysis import analyze_rates, calc_std, get_active_exchanges, recent_trend_ok
+from asset_groups import GROUP_LABELS, GROUP_ORDER, group_items
 from config import AUTO_REPORT_MIN_DAILY_USD, AUTO_REPORT_MIN_ENTRY_SPREAD_PCT, AUTO_SCAN_AMOUNT, AUTO_SCAN_DAYS, GEMINI_API_KEY, REPORT_CHAT_ID, TEMPORARILY_DISABLED_EXCHANGES
 from exchanges import EXCHANGE_FETCHERS, EXCHANGE_LABELS, EXCHANGE_SYMBOL_FETCHERS, _proxies, phemex_get_all_symbols
-from oi import format_oi_status, format_volume_status
+from oi import format_oi_status, format_volume_status, is_oi_allowed, is_volume_allowed
+
+
+EVENING_PAGE_SIZE = int(os.getenv("EVENING_PAGE_SIZE", "5"))
+EVENING_GEMINI_TIMEOUT_SECONDS = int(os.getenv("EVENING_GEMINI_TIMEOUT_SECONDS", "90"))
+_evening_sessions = {}
+_EVENING_SESSION_TTL = 2 * 60 * 60
 
 
 def temporary_disabled_text():
@@ -203,6 +213,13 @@ def fetch_market_quote(coin, exchange):
     if exchange == "coinw":
         data = public_get_json("https://api.coinw.com", "/v1/perpumPublic/depth", {"base": base})
         return best_book_prices(data)
+    if exchange == "weex":
+        data = public_get_json(
+            "https://api-contract.weex.com",
+            "/capi/v3/market/depth",
+            {"symbol": f"{base}USDT", "limit": "15"},
+        )
+        return best_book_prices(data)
     return None
 
 
@@ -304,8 +321,160 @@ def find_delta_pair_for_signal(coin, signal, days, active_exchanges):
     }
 
 
+def format_evening_pair(pair):
+    long_label = EXCHANGE_LABELS.get(pair["long_ex"], pair["long_ex"])
+    short_label = EXCHANGE_LABELS.get(pair["short_ex"], pair["short_ex"])
+    return (
+        f"*{pair['coin']}*\n"
+        f"🟢 Лонг: `{long_label}` avg `{pair['long_avg']:+.4f}%` | "
+        f"`{pair['long_payments_per_day']:.1f}` выплат/день | "
+        f"{format_oi_status(pair['long_ex'], pair['coin'])} | "
+        f"{format_volume_status(pair['long_ex'], pair['coin'])}\n"
+        f"🔴 Шорт: `{short_label}` avg `{pair['short_avg']:+.4f}%` | "
+        f"`{pair['short_payments_per_day']:.1f}` выплат/день | "
+        f"{format_oi_status(pair['short_ex'], pair['coin'])} | "
+        f"{format_volume_status(pair['short_ex'], pair['coin'])}\n"
+        f"📈 Чистый фандинг: `{pair['net_daily_pct']:+.4f}%` / день\n"
+        f"💰 Оценка: `${pair['daily_income_usd']:.2f}` за 1 день на позицию "
+        f"`${AUTO_SCAN_AMOUNT:,.0f}` на ногу\n"
+        f"🚪 Спред входа: `{pair['entry_spread_pct']:+.3f}%`"
+    )
+
+
+def _cleanup_evening_sessions():
+    cutoff = time.time() - _EVENING_SESSION_TTL
+    for token, session in list(_evening_sessions.items()):
+        if session["created_at"] < cutoff:
+            _evening_sessions.pop(token, None)
+
+
+def _save_evening_session(pairs):
+    _cleanup_evening_sessions()
+    token = secrets.token_urlsafe(6)
+    _evening_sessions[token] = {
+        "created_at": time.time(),
+        "groups": group_items(pairs, lambda pair: pair["coin"]),
+    }
+    return token
+
+
+def _evening_more_markup(token, group_key, next_offset, total):
+    if next_offset >= total:
+        return None
+    count = min(EVENING_PAGE_SIZE, total - next_offset)
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            f"Показать ещё {count}",
+            callback_data=f"ev_more:{token}:{group_key}:{next_offset}",
+        )
+    ]])
+
+
+async def send_evening_group_page(bot, chat_id, token, group_key, offset):
+    session = _evening_sessions.get(token)
+    if not session:
+        await bot.send_message(chat_id, "Сессия вечернего отчёта устарела. Запусти /report ещё раз.")
+        return
+    pairs = session["groups"].get(group_key, [])
+    total = len(pairs)
+    end = min(offset + EVENING_PAGE_SIZE, total)
+    page = pairs[offset:end]
+    if not page:
+        return
+    text = f"{GROUP_LABELS[group_key]} — {total}\n\n" + "\n\n".join(format_evening_pair(pair) for pair in page)
+    await bot.send_message(
+        chat_id,
+        text,
+        parse_mode="Markdown",
+        reply_markup=_evening_more_markup(token, group_key, end, total),
+    )
+
+
+async def send_evening_pages(bot, chat_id, pairs):
+    token = _save_evening_session(pairs)
+    grouped = _evening_sessions[token]["groups"]
+    counts = " · ".join(f"{GROUP_LABELS[key]}: {len(grouped[key])}" for key in GROUP_ORDER)
+    await bot.send_message(
+        chat_id,
+        f"🤖 *ВЕЧЕРНИЙ ОТЧЁТ* — база {AUTO_SCAN_DAYS} дня, "
+        f"позиция ${AUTO_SCAN_AMOUNT:,.0f} на ногу\n\n{counts}",
+        parse_mode="Markdown",
+    )
+    for group_key in GROUP_ORDER:
+        await send_evening_group_page(bot, chat_id, token, group_key, 0)
+    return token
+
+
+async def evening_more_callback(update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _prefix, token, group_key, offset_raw = query.data.split(":", 3)
+        if group_key not in GROUP_ORDER:
+            raise ValueError("unknown group")
+        offset = int(offset_raw)
+    except Exception:
+        await query.message.reply_text("Не смог открыть следующую группу. Запусти /report ещё раз.")
+        return
+    await send_evening_group_page(context.bot, query.message.chat_id, token, group_key, offset)
+
+
+async def _collect_evening_gemini(signals):
+    chunks = []
+    errors = []
+    total_chunks = (len(signals) + 14) // 15
+    for i in range(0, len(signals), 15):
+        part = signals[i:i + 15]
+        chunk_index = i // 15 + 1
+        text_rows = []
+        for signal in part:
+            direction = "ЛОНГ" if signal["direction"] == "LONG" else "ШОРТ"
+            text_rows.append(
+                f"- {signal['coin']} ({direction}, "
+                f"{EXCHANGE_LABELS.get(signal['exchange'], signal['exchange'])}, "
+                f"avg {signal['avg']:+.4f}%)"
+            )
+        answer = await gemini_report_recommendation(text_rows, AUTO_SCAN_DAYS, chunk_index, total_chunks)
+        if answer:
+            chunks.append(answer)
+        else:
+            errors.append(
+                f"порция {chunk_index}/{total_chunks}: "
+                f"{get_last_gemini_error() or 'timeout/no response'}"
+            )
+        await asyncio.sleep(1)
+    return chunks, errors
+
+
+async def send_evening_gemini_recommendations(context, chat_id, signals):
+    if not GEMINI_API_KEY:
+        await context.bot.send_message(chat_id, "⚠️ Gemini не настроен; основной отчёт уже отправлен.")
+        return
+    await context.bot.send_message(
+        chat_id,
+        f"🤖 Gemini отдельно проверяет {len(signals)} найденных монет. Основной список уже доступен.",
+    )
+    try:
+        chunks, errors = await asyncio.wait_for(
+            _collect_evening_gemini(signals),
+            timeout=EVENING_GEMINI_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        chunks, errors = [], [f"общий timeout {EVENING_GEMINI_TIMEOUT_SECONDS} сек."]
+    if chunks:
+        report = "🤖 *Gemini — отдельная рекомендация*\n\n" + "\n".join(chunks)
+        for chunk in [report[i:i + 4000] for i in range(0, len(report), 4000)]:
+            await context.bot.send_message(chat_id, chunk, parse_mode="Markdown")
+    if errors:
+        await context.bot.send_message(
+            chat_id,
+            "⚠️ Gemini не завершил весь анализ. Основной отчёт не затронут.\n"
+            + "\n".join(errors[:3]),
+        )
+
+
 async def run_evening_report(context: ContextTypes.DEFAULT_TYPE, chat_id: int, manual=False):
-    """Вечерний отчёт: full-фильтр → Gemini-рекомендация → лучшая delta-neutral пара."""
+    """Вечерний отчёт: full-фильтр → пары и страницы → отдельная Gemini-рекомендация."""
     active = get_active_exchanges()
     if not active:
         await context.bot.send_message(chat_id, "❌ Вечерний отчёт: нет активных бирж.")
@@ -376,31 +545,6 @@ async def run_evening_report(context: ContextTypes.DEFAULT_TYPE, chat_id: int, m
             best_signal_by_coin[coin] = signal
 
     report_coins = list(best_signal_by_coin.keys())
-    gemini_chunks = []
-    gemini_errors = []
-    if GEMINI_API_KEY:
-        await context.bot.send_message(chat_id, f"🤖 Gemini готовит рекомендацию по {len(report_coins)} монетам, но не удаляет их из отчёта...")
-        signals = list(best_signal_by_coin.values())
-        total_chunks = (len(signals) + 14) // 15
-        for i in range(0, len(signals), 15):
-            part = signals[i:i+15]
-            chunk_index = i // 15 + 1
-            text_rows = []
-            for s in part:
-                direction = "ЛОНГ" if s["direction"] == "LONG" else "ШОРТ"
-                text_rows.append(
-                    f"- {s['coin']} ({direction}, {EXCHANGE_LABELS.get(s['exchange'], s['exchange'])}, avg {s['avg']:+.4f}%)"
-                )
-            answer = await gemini_report_recommendation(text_rows, AUTO_SCAN_DAYS, chunk_index, total_chunks)
-            if answer:
-                gemini_chunks.append(answer)
-            else:
-                reason = get_last_gemini_error() or "timeout/no response"
-                gemini_errors.append(f"порция {chunk_index}/{total_chunks}: {reason}")
-            await asyncio.sleep(1)
-    else:
-        await context.bot.send_message(chat_id, "⚠️ GEMINI_API_KEY не задан: блок рекомендации Gemini пропущен.")
-
     pairs = []
     for coin in report_coins:
         pair = find_delta_pair_for_signal(coin, best_signal_by_coin[coin], AUTO_SCAN_DAYS, active)
@@ -412,56 +556,19 @@ async def run_evening_report(context: ContextTypes.DEFAULT_TYPE, chat_id: int, m
             chat_id,
             f"⚠️ Не нашёл дельта-нейтральных пар по FULL-монетам с доходом от ${AUTO_REPORT_MIN_DAILY_USD:.0f}/день."
         )
-        if gemini_chunks:
-            gemini_report = "🤖 *Gemini-рекомендация* — не фильтр, а ручная проверка:\n\n" + "\n".join(gemini_chunks)
-            for chunk in [gemini_report[i:i+4000] for i in range(0, len(gemini_report), 4000)]:
-                await context.bot.send_message(chat_id, chunk, parse_mode="Markdown")
-        elif gemini_errors:
-            await context.bot.send_message(
-                chat_id,
-                "⚠️ Gemini не успел подготовить рекомендацию, отчёт не остановлен.\n"
-                + "\n".join(gemini_errors[:3]),
-            )
         await send_entry_instructions(context, chat_id)
         return
 
-    lines = [
-        f"🤖 *ВЕЧЕРНИЙ ОТЧЁТ* — база {AUTO_SCAN_DAYS} дня, позиция ${AUTO_SCAN_AMOUNT:,.0f} на ногу\n"
-    ]
-    for p in sorted(pairs, key=lambda x: x["net_rate"], reverse=True)[:20]:
-        long_label = EXCHANGE_LABELS.get(p["long_ex"], p["long_ex"])
-        short_label = EXCHANGE_LABELS.get(p["short_ex"], p["short_ex"])
-        approx_income = p["daily_income_usd"]
-        long_oi = format_oi_status(p["long_ex"], p["coin"])
-        short_oi = format_oi_status(p["short_ex"], p["coin"])
-        long_volume = format_volume_status(p["long_ex"], p["coin"])
-        short_volume = format_volume_status(p["short_ex"], p["coin"])
-        lines.append(
-            f"*{p['coin']}*\n"
-            f"  🟢 Лонг: `{long_label}` avg `{p['long_avg']:+.4f}%` | `{p['long_payments_per_day']:.1f}` выплат/день | {long_oi} | {long_volume}\n"
-            f"  🔴 Шорт: `{short_label}` avg `{p['short_avg']:+.4f}%` | `{p['short_payments_per_day']:.1f}` выплат/день | {short_oi} | {short_volume}\n"
-            f"  📈 Чистый фандинг: `{p['net_daily_pct']:+.4f}%` / день\n"
-            f"  💰 Оценка: `${approx_income:.2f}` за 1 день на позицию `${AUTO_SCAN_AMOUNT:,.0f}` на ногу\n"
-            f"  🚪 Спред входа: `{p['entry_spread_pct']:+.3f}%`\n"
-        )
-
-    report = "\n".join(lines)
-    for chunk in [report[i:i+4000] for i in range(0, len(report), 4000)]:
-        await context.bot.send_message(chat_id, chunk, parse_mode="Markdown")
-
-
-    if gemini_chunks:
-        gemini_report = "🤖 *Gemini-рекомендация* — не фильтр, а ручная проверка:\n\n" + "\n".join(gemini_chunks)
-        for chunk in [gemini_report[i:i+4000] for i in range(0, len(gemini_report), 4000)]:
-            await context.bot.send_message(chat_id, chunk, parse_mode="Markdown")
-    elif gemini_errors:
-        await context.bot.send_message(
-            chat_id,
-            "⚠️ Gemini не успел подготовить рекомендацию, основной отчёт отправлен без AI-блока.\n"
-            + "\n".join(gemini_errors[:3]),
-        )
-
+    pairs.sort(key=lambda pair: pair["net_rate"], reverse=True)
+    await send_evening_pages(context.bot, chat_id, pairs)
     await send_entry_instructions(context, chat_id)
+    visible_symbols = {pair["coin"] for pair in pairs}
+    gemini_signals = [
+        best_signal_by_coin[symbol]
+        for symbol in report_coins
+        if symbol in visible_symbols
+    ]
+    await send_evening_gemini_recommendations(context, chat_id, gemini_signals)
 
 
 async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):

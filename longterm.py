@@ -13,6 +13,7 @@ from telegram.ext import ContextTypes
 
 from ai import gemini_generate, get_last_gemini_error
 from analysis import analyze_rates, calc_std, recent_trend_ok
+from asset_groups import GROUP_LABELS, GROUP_ORDER, group_items
 from config import EXCHANGES_ENABLED, GEMINI_API_KEY, REPORT_CHAT_ID, TEMPORARILY_DISABLED_EXCHANGES
 from exchanges import (
     EXCHANGE_FETCHERS,
@@ -37,6 +38,7 @@ LONGTERM_MIN_MONTHLY_USD = float(os.getenv("LONGTERM_MIN_MONTHLY_USD", "300"))
 LONGTERM_PAGE_SIZE = int(os.getenv("LONGTERM_PAGE_SIZE", "5"))
 LONGTERM_GEMINI_FILTER = os.getenv("LONGTERM_GEMINI_FILTER", "1").lower() not in ("0", "false", "off", "no")
 LONGTERM_GEMINI_CHUNK_SIZE = int(os.getenv("LONGTERM_GEMINI_CHUNK_SIZE", "15"))
+LONGTERM_GEMINI_TIMEOUT_SECONDS = int(os.getenv("LONGTERM_GEMINI_TIMEOUT_SECONDS", "90"))
 LONGTERM_MIN_OI_WARN_USD = float(os.getenv("LONGTERM_MIN_OI_WARN_USD", "1000000"))
 LONGTERM_MIN_VOL_WARN_USD = float(os.getenv("LONGTERM_MIN_VOL_WARN_USD", "400000"))
 LONGTERM_EXAMPLE_SYMBOLS = ()
@@ -613,7 +615,7 @@ def format_longterm_summary(result):
         f"Доступно к показу: `{len(result['groups'])}` монет — по одной лучшей связке\n"
         f"{error_line}"
         f"{symbol_error_line}"
-        f"Показываю порциями по `{LONGTERM_PAGE_SIZE}` монет\n\n"
+        f"Показываю по категориям, порциями по `{LONGTERM_PAGE_SIZE}` монет\n\n"
         "OI/24h volume и live-спред не фильтруют longterm-результат."
     )
 
@@ -892,34 +894,41 @@ def _save_session(result):
     token = secrets.token_urlsafe(6)
     _longterm_sessions[token] = {
         "created_at": time.time(),
-        "groups": result["groups"],
+        "groups": group_items(result["groups"], lambda item: item[0]),
     }
     return token
 
 
-def _more_markup(token, next_offset, total):
+def _more_markup(token, group_key, next_offset, total):
     if next_offset >= total:
         return None
     count = min(LONGTERM_PAGE_SIZE, total - next_offset)
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"Показать ещё {count}", callback_data=f"lt_more:{token}:{next_offset}")]
-    ])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            f"Показать ещё {count}",
+            callback_data=f"lt_more:{token}:{group_key}:{next_offset}",
+        )
+    ]])
 
 
-async def send_longterm_page(bot, chat_id, token, offset):
+async def send_longterm_group_page(bot, chat_id, token, group_key, offset):
     session = _longterm_sessions.get(token)
     if not session:
         await bot.send_message(chat_id, "Сессия longfunding устарела. Запусти /longfunding ещё раз.")
         return
 
-    groups = session["groups"]
+    groups = session["groups"].get(group_key, [])
     total = len(groups)
+    if not total:
+        return
     end = min(offset + LONGTERM_PAGE_SIZE, total)
     page_groups = await asyncio.to_thread(_enrich_entry_spreads, groups[offset:end])
+    if offset == 0:
+        await bot.send_message(chat_id, f"{GROUP_LABELS[group_key]} — {total}")
     for symbol, pairs in page_groups:
         await bot.send_message(chat_id, format_longterm_coin(symbol, pairs), parse_mode="Markdown")
 
-    markup = _more_markup(token, end, total)
+    markup = _more_markup(token, group_key, end, total)
     if markup:
         await bot.send_message(
             chat_id,
@@ -935,16 +944,35 @@ async def send_longterm_page(bot, chat_id, token, offset):
         )
 
 
+async def send_longterm_page(bot, chat_id, token, offset=0, group_key=None):
+    if group_key is not None:
+        await send_longterm_group_page(bot, chat_id, token, group_key, offset)
+        return
+    session = _longterm_sessions.get(token)
+    if not session:
+        await bot.send_message(chat_id, "Сессия longfunding устарела. Запусти /longfunding ещё раз.")
+        return
+    counts = " · ".join(
+        f"{GROUP_LABELS[key]}: {len(session['groups'][key])}"
+        for key in GROUP_ORDER
+    )
+    await bot.send_message(chat_id, counts)
+    for key in GROUP_ORDER:
+        await send_longterm_group_page(bot, chat_id, token, key, offset)
+
+
 async def longterm_more_callback(update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     try:
-        _prefix, token, offset_raw = query.data.split(":", 2)
+        _prefix, token, group_key, offset_raw = query.data.split(":", 3)
+        if group_key not in GROUP_ORDER:
+            raise ValueError("unknown group")
         offset = int(offset_raw)
     except Exception:
         await query.message.reply_text("Не смог открыть следующую порцию. Запусти /longfunding ещё раз.")
         return
-    await send_longterm_page(context.bot, query.message.chat_id, token, offset)
+    await send_longterm_page(context.bot, query.message.chat_id, token, offset, group_key)
 
 
 async def send_longterm_report(bot, chat_id, manual=False):
@@ -967,27 +995,39 @@ async def send_longterm_report(bot, chat_id, manual=False):
         asyncio.run_coroutine_threadsafe(bot.send_message(chat_id, message), loop)
 
     result = await asyncio.to_thread(scan_longterm_funding, LONGTERM_DAYS, None, report_progress)
-    if not manual and GEMINI_API_KEY and LONGTERM_GEMINI_FILTER and result.get("groups"):
-        await bot.send_message(
-            chat_id,
-            "🤖 Gemini проверяет монеты на долгосрок: капитализация, серьёзность, риск 30-50% свечи, мем/скам риск...",
-        )
-        result, gemini_note = await asyncio.to_thread(apply_longterm_gemini_filter, result)
-    else:
-        gemini_note = None
     await bot.send_message(chat_id, format_longterm_summary(result), parse_mode="Markdown")
     if not result["groups"]:
         await bot.send_message(chat_id, "✅ Подходящих долгосрочных связок сейчас нет.")
         return
     token = _save_session(result)
     await send_longterm_page(bot, chat_id, token, 0)
-    if not manual:
-        recommendation_chunks = format_longterm_gemini_recommendations(result)
-        if result.get("gemini_reviewed_symbols"):
-            for chunk in recommendation_chunks:
-                await bot.send_message(chat_id, chunk)
-        elif gemini_note:
-            await bot.send_message(chat_id, gemini_note)
+    if manual:
+        return
+    if not GEMINI_API_KEY or not LONGTERM_GEMINI_FILTER:
+        await bot.send_message(chat_id, "⚠️ Gemini не настроен; основной longterm-отчёт уже отправлен.")
+        return
+    await bot.send_message(
+        chat_id,
+        "🤖 Gemini отдельно проверяет найденные монеты. Основной список уже доступен.",
+    )
+    try:
+        reviewed, gemini_note = await asyncio.wait_for(
+            asyncio.to_thread(apply_longterm_gemini_filter, result),
+            timeout=LONGTERM_GEMINI_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        await bot.send_message(
+            chat_id,
+            f"⚠️ Gemini не ответил за {LONGTERM_GEMINI_TIMEOUT_SECONDS} сек. "
+            "Основной longterm-отчёт не затронут.",
+        )
+        return
+    recommendation_chunks = format_longterm_gemini_recommendations(reviewed)
+    if reviewed.get("gemini_reviewed_symbols"):
+        for chunk in recommendation_chunks:
+            await bot.send_message(chat_id, chunk)
+    elif gemini_note:
+        await bot.send_message(chat_id, gemini_note)
 
 
 async def auto_longterm_job(context: ContextTypes.DEFAULT_TYPE):

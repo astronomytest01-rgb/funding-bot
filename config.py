@@ -29,7 +29,8 @@ MIN_POS_RATIO = 0.30
 RECENT_TREND_RATES = 4
 RECENT_TREND_MIN_GOOD_RATIO = 0.50
 
-# Вечерний авто-отчёт: 20:00 Europe/Kyiv.
+# Daily reports are scheduled in the Europe/Kyiv timezone (20:00 and 22:00),
+# so daylight-saving changes do not move them relative to Kyiv local time.
 AUTO_SCAN_AMOUNT = 20000
 AUTO_SCAN_THRESHOLD = 29
 AUTO_SCAN_DAYS = 3
@@ -47,6 +48,7 @@ EXCHANGES_ENABLED = {
     "bingx": True,
     "bitget": True,
     "aster": True,
+    "weex": True,
     "coinw": True,
     "kucoin": True,
     "bitunix": False,

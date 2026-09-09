@@ -63,7 +63,7 @@ from oi import (
     is_oi_allowed,
     is_volume_allowed,
 )
-from reports import auto_scan_job, run_evening_report, send_entry_instructions
+from reports import auto_scan_job, evening_more_callback, run_evening_report, send_entry_instructions
 
 
 def temporary_disabled_text():
@@ -145,7 +145,7 @@ def parse_tokens(text):
     'BTC ETH phemex 14' -> (['BTC', 'ETH'], 14, 'phemex')
     """
     KNOWN_EXCHANGES = set(EXCHANGES_ENABLED.keys())
-    DISABLED_EXCHANGE_ALIASES = {"gate", "gateio", "gate.io", "blofin", "weex"}
+    DISABLED_EXCHANGE_ALIASES = {"gate", "gateio", "gate.io", "blofin"}
 
     parts = text.strip().split()
     days = DEFAULT_DAYS
@@ -1125,6 +1125,7 @@ SCAN_EXCHANGE_FETCHERS = {
     "bitunix": "bitunix",
     "bitget": "bitget",
     "aster": "aster",
+    "weex": "weex",
 }
 
 
@@ -2448,6 +2449,7 @@ def main():
     app.add_handler(CommandHandler("report",    cmd_report))
     app.add_handler(CommandHandler("longfunding", cmd_longfunding))
     app.add_handler(CommandHandler("instruction", cmd_instruction))
+    app.add_handler(CallbackQueryHandler(evening_more_callback, pattern="^ev_more:"))
     app.add_handler(CallbackQueryHandler(longterm_more_callback, pattern="^lt_more:"))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern="^set_"))
     # Critical direct AI handler: keep before ConversationHandlers and unknown.

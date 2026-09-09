@@ -822,6 +822,66 @@ def aster_get_all_symbols():
 
 
 # ─────────────────────────────────────────────
+# WEEX API (Futures V3)
+# ─────────────────────────────────────────────
+
+
+def weex_symbol_for_coin(coin):
+    coin = coin.upper().replace("-", "").replace("_", "")
+    if coin.endswith("USDT"):
+        return coin
+    if coin.endswith("USD"):
+        coin = coin[:-3]
+    return f"{coin}USDT"
+
+
+def weex_fetch(coin, start_ms, end_ms):
+    """WEEX Futures V3 settled funding history (fractional rate -> percent)."""
+    sym = weex_symbol_for_coin(coin)
+    try:
+        r = requests.get(
+            "https://api-contract.weex.com/capi/v3/market/fundingRate",
+            params={"symbol": sym, "limit": "100"},
+            timeout=6,
+        )
+        r.raise_for_status()
+        payload = r.json()
+        rows = payload if isinstance(payload, list) else payload.get("data", [])
+        result = []
+        for item in rows:
+            ts = int(item.get("fundingTime") or 0)
+            if start_ms <= ts <= end_ms:
+                result.append((ts, float(item.get("fundingRate", 0)) * 100))
+        if not result:
+            return [], f"Нет данных за период (символ: {sym})"
+        return sorted(result, key=lambda row: row[0]), sym
+    except Exception as exc:
+        return [], str(exc)
+
+
+def weex_get_all_symbols():
+    """Return every WEEX contract currently eligible for futures API trading."""
+    r = requests.get(
+        "https://api-contract.weex.com/capi/v3/market/apiTradingSymbols",
+        timeout=10,
+    )
+    r.raise_for_status()
+    payload = r.json()
+    symbols = payload if isinstance(payload, list) else payload.get("data", [])
+    coins = []
+    seen = set()
+    for symbol in symbols:
+        symbol = str(symbol).upper()
+        if not symbol.endswith("USDT"):
+            continue
+        coin = symbol[:-4]
+        if coin and coin not in seen:
+            coins.append(coin)
+            seen.add(coin)
+    return coins
+
+
+# ─────────────────────────────────────────────
 # УНИВЕРСАЛЬНЫЙ АНАЛИЗ
 # ─────────────────────────────────────────────
 
@@ -945,6 +1005,7 @@ EXCHANGE_FETCHERS = {
     "bitunix": bitunix_fetch,
     "bitget": bitget_fetch,
     "aster": aster_fetch,
+    "weex": weex_fetch,
 }
 
 EXCHANGE_SYMBOL_FETCHERS = {
@@ -959,6 +1020,7 @@ EXCHANGE_SYMBOL_FETCHERS = {
     "bitunix": bitunix_get_all_symbols,
     "bitget": bitget_get_all_symbols,
     "aster": aster_get_all_symbols,
+    "weex": weex_get_all_symbols,
 }
 
 EXCHANGE_LABELS = {
@@ -975,4 +1037,5 @@ EXCHANGE_LABELS = {
     "bitunix": "Bitunix",
     "bitget": "Bitget",
     "aster": "Aster",
+    "weex": "WEEX",
 }

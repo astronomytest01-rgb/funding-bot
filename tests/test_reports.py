@@ -1,7 +1,25 @@
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 import reports
+
+
+def report_pair(symbol):
+    return {
+        "coin": symbol,
+        "direction": "LONG",
+        "long_ex": "xt",
+        "short_ex": "phemex",
+        "long_avg": -0.1,
+        "short_avg": 0.01,
+        "long_payments_per_day": 3.0,
+        "short_payments_per_day": 3.0,
+        "net_rate": 0.33,
+        "net_daily_pct": 0.33,
+        "daily_income_usd": 66.0,
+        "entry_spread_pct": -0.1,
+    }
 
 
 class EveningReportPairTests(unittest.TestCase):
@@ -141,6 +159,60 @@ class EveningReportPairTests(unittest.TestCase):
         self.assertEqual(pair["long_ex"], "okx")
         self.assertEqual(pair["short_ex"], "kucoin")
         self.assertGreaterEqual(pair["entry_spread_pct"], -0.8)
+
+
+class EveningReportTelegramTests(unittest.IsolatedAsyncioTestCase):
+    async def test_grouped_pages_have_independent_load_more_buttons(self):
+        pairs = [report_pair("GOOGLX"), report_pair("DASH")] + [
+            report_pair(f"MEME{i}") for i in range(6)
+        ]
+        bot = Mock(send_message=AsyncMock())
+        with (
+            patch.dict(reports._evening_sessions, {}, clear=True),
+            patch.object(reports, "EVENING_PAGE_SIZE", 5),
+            patch.object(reports, "format_oi_status", return_value="OI"),
+            patch.object(reports, "format_volume_status", return_value="VOL"),
+        ):
+            token = await reports.send_evening_pages(bot, 1, pairs)
+
+        messages = [call.args[1] for call in bot.send_message.call_args_list]
+        self.assertTrue(any("Фондовый рынок / TradFi — 1" in text for text in messages))
+        self.assertTrue(any("Tier-1 — 1" in text for text in messages))
+        other_call = next(
+            call for call in bot.send_message.call_args_list
+            if call.args[1].startswith("🧪 Остальные / щиткоины — 6")
+        )
+        button = other_call.kwargs["reply_markup"].inline_keyboard[0][0]
+        self.assertEqual(button.text, "Показать ещё 1")
+        self.assertEqual(button.callback_data, f"ev_more:{token}:other:5")
+
+    async def test_evening_math_report_is_sent_before_gemini_starts(self):
+        events = []
+        pair = report_pair("DASH")
+        context = SimpleNamespace(bot=Mock(send_message=AsyncMock()))
+
+        async def send_math(*_args, **_kwargs):
+            events.append("math")
+
+        async def send_instructions(*_args, **_kwargs):
+            events.append("instructions")
+
+        async def send_gemini(*_args, **_kwargs):
+            events.append("gemini")
+
+        with (
+            patch.object(reports, "get_active_exchanges", return_value=["xt"]),
+            patch.object(reports, "get_scan_symbols_for_exchange", return_value=["DASH"]),
+            patch.object(reports, "EXCHANGE_FETCHERS", {"xt": lambda *_args: ([(1, -0.1)] * 4, "DASH")}),
+            patch.object(reports, "find_delta_pair_for_signal", return_value=pair),
+            patch.object(reports, "send_evening_pages", side_effect=send_math),
+            patch.object(reports, "send_entry_instructions", side_effect=send_instructions),
+            patch.object(reports, "send_evening_gemini_recommendations", side_effect=send_gemini),
+            patch.object(reports.time, "sleep"),
+        ):
+            await reports.run_evening_report(context, 1)
+
+        self.assertEqual(events, ["math", "instructions", "gemini"])
 
 
 if __name__ == "__main__":
