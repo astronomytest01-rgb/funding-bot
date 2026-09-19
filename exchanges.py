@@ -439,6 +439,66 @@ def bybit_get_all_symbols():
 
 
 # ─────────────────────────────────────────────
+# MEXC API
+# ─────────────────────────────────────────────
+
+
+def mexc_symbol_for_coin(coin):
+    coin = coin.upper().replace("-", "").replace("_", "")
+    if coin.endswith("USDT"):
+        return f"{coin[:-4]}_USDT"
+    if coin.endswith("USD"):
+        return f"{coin[:-3]}_USDT"
+    return f"{coin}_USDT"
+
+
+def mexc_fetch(coin, start_ms, end_ms):
+    """MEXC USDT-M settled funding history. Rates are fractional."""
+    sym = mexc_symbol_for_coin(coin)
+    url = "https://contract.mexc.com/api/v1/contract/funding_rate/history"
+    page = 1
+    page_size = 100
+    rows = []
+
+    try:
+        while True:
+            response = requests.get(
+                url,
+                params={"symbol": sym, "page_num": page, "page_size": page_size},
+                timeout=6,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not payload.get("success") or payload.get("code") not in (0, None):
+                raise ValueError(payload.get("message") or payload.get("msg") or "MEXC API error")
+
+            data = payload.get("data") or {}
+            page_rows = data.get("resultList") or []
+            if not page_rows:
+                break
+
+            oldest_ts = None
+            for item in page_rows:
+                ts = int(item.get("settleTime") or 0)
+                if ts <= 0:
+                    continue
+                oldest_ts = ts if oldest_ts is None else min(oldest_ts, ts)
+                if start_ms <= ts <= end_ms:
+                    rows.append((ts, float(item.get("fundingRate", 0)) * 100))
+
+            total_pages = int(data.get("totalPage") or page)
+            if page >= total_pages or (oldest_ts is not None and oldest_ts < start_ms):
+                break
+            page += 1
+
+        if not rows:
+            return [], f"Нет данных за период (символ: {sym})"
+        return sorted(set(rows), key=lambda item: item[0]), sym
+    except Exception as exc:
+        return [], str(exc)
+
+
+# ─────────────────────────────────────────────
 # BINGX API
 # ─────────────────────────────────────────────
 
@@ -1006,6 +1066,7 @@ EXCHANGE_FETCHERS = {
     "bitget": bitget_fetch,
     "aster": aster_fetch,
     "weex": weex_fetch,
+    "mexc": mexc_fetch,
 }
 
 EXCHANGE_SYMBOL_FETCHERS = {
@@ -1038,4 +1099,5 @@ EXCHANGE_LABELS = {
     "bitget": "Bitget",
     "aster": "Aster",
     "weex": "WEEX",
+    "mexc": "MEXC",
 }

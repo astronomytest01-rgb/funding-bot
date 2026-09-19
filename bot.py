@@ -33,6 +33,7 @@ from config import (
     DEFAULT_DAYS,
     EVENING_REPORT_HOUR_LOCAL,
     EXCHANGES_ENABLED,
+    FUNDING_ONLY_EXCHANGES,
     GEMINI_API_KEY,
     LONGTERM_REPORT_HOUR_LOCAL,
     MAX_OUTLIER_PCT,
@@ -144,7 +145,7 @@ def parse_tokens(text):
     'BTC coinw 7' -> (['BTC'], 7, 'coinw')
     'BTC ETH phemex 14' -> (['BTC', 'ETH'], 14, 'phemex')
     """
-    KNOWN_EXCHANGES = set(EXCHANGES_ENABLED.keys())
+    KNOWN_EXCHANGES = set(EXCHANGES_ENABLED.keys()) | set(FUNDING_ONLY_EXCHANGES)
     DISABLED_EXCHANGE_ALIASES = {"gate", "gateio", "gate.io", "blofin"}
 
     parts = text.strip().split()
@@ -318,15 +319,18 @@ async def do_analyze(update, coins, days, exchange_arg, selected_exchanges=None)
 
 
 async def do_show(update, coin, days, exchange_arg, selected_exchanges=None):
+    allowed = set(funding_exchange_keys())
     if selected_exchanges:
         active = [
             e for e in selected_exchanges
             if e in EXCHANGE_FETCHERS
-            and EXCHANGES_ENABLED.get(e, False)
-            and e not in TEMPORARILY_DISABLED_EXCHANGES
+            and e in allowed
         ]
+    elif exchange_arg:
+        exchange = exchange_arg.lower()
+        active = [exchange] if exchange in allowed and exchange in EXCHANGE_FETCHERS else []
     else:
-        active = get_active_exchanges(exchange_arg)
+        active = funding_exchange_keys()
     if not active:
         await update.message.reply_text("❌ Нет активных бирж.")
         return
@@ -1648,17 +1652,27 @@ def active_exchange_keys():
     ]
 
 
-def make_exchange_keyboard(cb_prefix, selected=None):
+def funding_exchange_keys():
+    keys = active_exchange_keys()
+    keys.extend(
+        ex for ex in FUNDING_ONLY_EXCHANGES
+        if ex in EXCHANGE_FETCHERS and ex not in TEMPORARILY_DISABLED_EXCHANGES and ex not in keys
+    )
+    return keys
+
+
+def make_exchange_keyboard(cb_prefix, selected=None, exchange_keys=None):
     """Кнопки выбора бирж с мультивыбором.
     selected — set выбранных бирж (чекбоксы).
     Внизу кнопки: Все / Подтвердить / Отмена.
     """
     if selected is None:
         selected = set()
+    available = set(active_exchange_keys() if exchange_keys is None else exchange_keys)
     buttons = []
     row = []
     for ex, label in EXCHANGE_LABELS.items():
-        if not EXCHANGES_ENABLED.get(ex, False) or ex in TEMPORARILY_DISABLED_EXCHANGES:
+        if ex not in available:
             continue
         icon = "✅ " if ex in selected else ""
         row.append(InlineKeyboardButton(
@@ -1670,7 +1684,7 @@ def make_exchange_keyboard(cb_prefix, selected=None):
             row = []
     if row:
         buttons.append(row)
-    active = set(active_exchange_keys())
+    active = available
     all_label = "Снять все" if active and active.issubset(selected) else "Все биржи"
     buttons.append([
         InlineKeyboardButton(all_label,   callback_data=f"{cb_prefix}_ex_all"),
@@ -1922,7 +1936,7 @@ async def fr_days_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["fr_days"] = days
     await q.edit_message_text(
         "Шаг 3/3: Выбери биржу.",
-        reply_markup=make_exchange_keyboard("fr"),
+        reply_markup=make_exchange_keyboard("fr", exchange_keys=funding_exchange_keys()),
         parse_mode="Markdown"
     )
     return FR_EXCH
@@ -1938,7 +1952,7 @@ async def fr_days_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["fr_days"] = days
     await update.message.reply_text(
         "Шаг 3/3: Выбери биржу.",
-        reply_markup=make_exchange_keyboard("fr"),
+        reply_markup=make_exchange_keyboard("fr", exchange_keys=funding_exchange_keys()),
         parse_mode="Markdown"
     )
     return FR_EXCH
@@ -1955,12 +1969,12 @@ async def fr_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     selected = context.user_data.get("fr_selected_ex", set())
 
     if q.data == "fr_ex_all":
-        all_active = set(active_exchange_keys())
+        all_active = set(funding_exchange_keys())
         selected = set() if all_active and all_active.issubset(selected) else all_active
         context.user_data["fr_selected_ex"] = selected
         await q.edit_message_text(
             "Шаг 3/3: Выбери биржу.",
-            reply_markup=make_exchange_keyboard("fr", selected),
+            reply_markup=make_exchange_keyboard("fr", selected, funding_exchange_keys()),
             parse_mode="Markdown"
         )
         return FR_EXCH
@@ -1969,7 +1983,7 @@ async def fr_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not selected:
             await q.edit_message_text(
                 "Выбери хотя бы одну биржу или нажми «Все биржи».",
-                reply_markup=make_exchange_keyboard("fr", selected),
+                reply_markup=make_exchange_keyboard("fr", selected, funding_exchange_keys()),
                 parse_mode="Markdown"
             )
             return FR_EXCH
@@ -1989,7 +2003,7 @@ async def fr_exchange_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["fr_selected_ex"] = selected
     await q.edit_message_text(
         "Шаг 3/3: Выбери биржу.",
-        reply_markup=make_exchange_keyboard("fr", selected),
+        reply_markup=make_exchange_keyboard("fr", selected, funding_exchange_keys()),
         parse_mode="Markdown"
     )
     return FR_EXCH
