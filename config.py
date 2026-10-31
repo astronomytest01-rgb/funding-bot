@@ -57,6 +57,6 @@ EXCHANGES_ENABLED = {
 # Exchanges exposed only by the historical /funding command. Keeping this
 # separate prevents a history-only integration from silently entering scans,
 # reports, OI checks, or delta-neutral pair selection.
-FUNDING_ONLY_EXCHANGES = {"mexc"}
+FUNDING_ONLY_EXCHANGES = {"mexc", "pionex", "ourbit"}
 
 TEMPORARILY_DISABLED_EXCHANGES = {"bitunix"}

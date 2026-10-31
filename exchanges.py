@@ -452,10 +452,9 @@ def mexc_symbol_for_coin(coin):
     return f"{coin}_USDT"
 
 
-def mexc_fetch(coin, start_ms, end_ms):
-    """MEXC USDT-M settled funding history. Rates are fractional."""
+def _mexc_style_fetch(coin, start_ms, end_ms, *, exchange, url):
+    """USDT-M settled funding history on the MEXC-style V1 API."""
     sym = mexc_symbol_for_coin(coin)
-    url = "https://contract.mexc.com/api/v1/contract/funding_rate/history"
     page = 1
     page_size = 100
     rows = []
@@ -470,7 +469,7 @@ def mexc_fetch(coin, start_ms, end_ms):
             response.raise_for_status()
             payload = response.json()
             if not payload.get("success") or payload.get("code") not in (0, None):
-                raise ValueError(payload.get("message") or payload.get("msg") or "MEXC API error")
+                raise ValueError(payload.get("message") or payload.get("msg") or f"{exchange} API error")
 
             data = payload.get("data") or {}
             page_rows = data.get("resultList") or []
@@ -491,6 +490,72 @@ def mexc_fetch(coin, start_ms, end_ms):
                 break
             page += 1
 
+        if not rows:
+            return [], f"Нет данных за период (символ: {sym})"
+        return sorted(set(rows), key=lambda item: item[0]), sym
+    except Exception as exc:
+        return [], str(exc)
+
+
+def mexc_fetch(coin, start_ms, end_ms):
+    """MEXC USDT-M settled funding history. Rates are fractional."""
+    return _mexc_style_fetch(
+        coin, start_ms, end_ms, exchange="MEXC",
+        url="https://contract.mexc.com/api/v1/contract/funding_rate/history",
+    )
+
+
+def ourbit_fetch(coin, start_ms, end_ms):
+    """Ourbit USDT-M settled funding history. Rates are fractional."""
+    return _mexc_style_fetch(
+        coin, start_ms, end_ms, exchange="Ourbit",
+        url="https://futures.ourbit.com/api/v1/contract/funding_rate/history",
+    )
+
+
+def pionex_symbol_for_coin(coin):
+    coin = coin.upper().replace("-", "").replace("_", "")
+    if coin.endswith("USDTPERP"):
+        coin = coin[:-8]
+    elif coin.endswith("USDT"):
+        coin = coin[:-4]
+    elif coin.endswith("USD"):
+        coin = coin[:-3]
+    return f"{coin}_USDT_PERP"
+
+
+def pionex_fetch(coin, start_ms, end_ms):
+    """Pionex settled funding history, paged backward to the requested start."""
+    sym = pionex_symbol_for_coin(coin)
+    url = "https://api.pionex.com/api/v1/market/fundingRates"
+    cursor = end_ms
+    rows = []
+    seen_cursors = set()
+    try:
+        while cursor not in seen_cursors:
+            seen_cursors.add(cursor)
+            response = requests.get(
+                url, params={"symbol": sym, "endTime": cursor, "limit": 500}, timeout=6,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("result") is not True:
+                raise ValueError(payload.get("message") or payload.get("msg") or "Pionex API error")
+            data = payload.get("data") or {}
+            page_rows = data.get("rates") or []
+            if not page_rows:
+                break
+            oldest_ts = None
+            for item in page_rows:
+                ts = int(item.get("fundingTime") or 0)
+                if ts <= 0:
+                    continue
+                oldest_ts = ts if oldest_ts is None else min(oldest_ts, ts)
+                if start_ms <= ts <= end_ms:
+                    rows.append((ts, float(item.get("fundingRate", 0)) * 100))
+            if oldest_ts is None or oldest_ts <= start_ms or len(page_rows) < 500:
+                break
+            cursor = oldest_ts - 1
         if not rows:
             return [], f"Нет данных за период (символ: {sym})"
         return sorted(set(rows), key=lambda item: item[0]), sym
@@ -1067,6 +1132,8 @@ EXCHANGE_FETCHERS = {
     "aster": aster_fetch,
     "weex": weex_fetch,
     "mexc": mexc_fetch,
+    "ourbit": ourbit_fetch,
+    "pionex": pionex_fetch,
 }
 
 EXCHANGE_SYMBOL_FETCHERS = {
@@ -1100,4 +1167,6 @@ EXCHANGE_LABELS = {
     "aster": "Aster",
     "weex": "WEEX",
     "mexc": "MEXC",
+    "ourbit": "Ourbit",
+    "pionex": "Pionex",
 }
