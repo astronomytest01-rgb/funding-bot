@@ -206,7 +206,7 @@ Gemini используется как фундаментальный риск-�
 ## Telegram сценарии
 
 - `/filter`: монеты -> период -> мультивыбор бирж.
-- `/funding`: монета -> период `1/3/7/14 дней` или ручной ввод -> биржи. MEXC, Pionex и Ourbit доступны только в этой команде и не включаются автоматически в сканы/отчёты.
+- `/funding`: монета -> период `1/3/7/14 дней` или ручной ввод -> биржи. MEXC, Pionex, Ourbit и HTX доступны только в этой команде и не включаются автоматически в сканы/отчёты.
 - `/calculator`: монета -> сумма `15000/20000/25000/Другое` -> период -> биржи.
 - `/analyze`: биржа -> метод -> период -> batch progress -> итог -> Gemini.
 - `/analyze` runs exchange fetches and OI/volume checks off the Telegram event loop, so large scans do not freeze the bot.

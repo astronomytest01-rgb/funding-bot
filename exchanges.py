@@ -513,6 +513,51 @@ def ourbit_fetch(coin, start_ms, end_ms):
     )
 
 
+def htx_fetch(coin, start_ms, end_ms):
+    """HTX USDT perpetual settled funding, paged newest-first (max 50)."""
+    token = coin.upper().replace("_", "-")
+    if token.endswith("-USDT"):
+        symbol = token
+    elif token.endswith("USDT"):
+        symbol = f"{token[:-4]}-USDT"
+    elif token.endswith("USD"):
+        symbol = f"{token[:-3]}-USDT"
+    else:
+        symbol = f"{token}-USDT"
+    rows = []
+    page = 1
+    try:
+        while True:
+            response = requests.get(
+                "https://api.hbdm.com/linear-swap-api/v1/swap_historical_funding_rate",
+                params={"contract_code": symbol, "page_index": page, "page_size": 50}, timeout=6,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("status") != "ok":
+                raise ValueError(payload.get("err_msg") or "HTX API error")
+            data = payload.get("data") or {}
+            page_rows = data.get("data") or []
+            if not page_rows:
+                break
+            oldest = None
+            for item in page_rows:
+                ts = int(item.get("funding_time") or 0)
+                oldest = ts if oldest is None else min(oldest, ts)
+                if start_ms <= ts <= end_ms:
+                    raw_rate = item.get("realized_rate") or item.get("funding_rate")
+                    if raw_rate is not None:
+                        rows.append((ts, float(raw_rate) * 100))
+            if (oldest is not None and oldest < start_ms) or page >= int(data.get("total_page") or page):
+                break
+            page += 1
+        if not rows:
+            return [], f"Нет данных за период (символ: {symbol})"
+        return sorted(set(rows), key=lambda row: row[0]), symbol
+    except Exception as exc:
+        return [], str(exc)
+
+
 def pionex_symbol_for_coin(coin):
     coin = coin.upper().replace("-", "").replace("_", "")
     if coin.endswith("USDTPERP"):
@@ -1134,6 +1179,7 @@ EXCHANGE_FETCHERS = {
     "mexc": mexc_fetch,
     "ourbit": ourbit_fetch,
     "pionex": pionex_fetch,
+    "htx": htx_fetch,
 }
 
 EXCHANGE_SYMBOL_FETCHERS = {
@@ -1169,4 +1215,5 @@ EXCHANGE_LABELS = {
     "mexc": "MEXC",
     "ourbit": "Ourbit",
     "pionex": "Pionex",
+    "htx": "HTX",
 }

@@ -20,7 +20,7 @@ class PionexOurbitFundingTests(unittest.TestCase):
     def test_symbols_and_funding_only_routing(self):
         self.assertEqual(exchanges.pionex_symbol_for_coin("BTC_USDT_PERP"), "BTC_USDT_PERP")
         self.assertEqual(exchanges.pionex_symbol_for_coin("btcusdt"), "BTC_USDT_PERP")
-        for exchange, label in (("pionex", "Pionex"), ("ourbit", "Ourbit")):
+        for exchange, label in (("pionex", "Pionex"), ("ourbit", "Ourbit"), ("htx", "HTX")):
             with self.subTest(exchange=exchange):
                 self.assertIn(exchange, bot.funding_exchange_keys())
                 self.assertNotIn(exchange, bot.active_exchange_keys())
@@ -59,6 +59,22 @@ class PionexOurbitFundingTests(unittest.TestCase):
             rows, error = exchanges.pionex_fetch("BAD", 1000, 2000)
         self.assertEqual(rows, [])
         self.assertIn("bad symbol", error)
+
+    def test_htx_pages_and_uses_settled_rate(self):
+        first = {"status": "ok", "data": {"total_page": 2, "data": [
+            {"funding_time": ts, "funding_rate": "0.0001", "realized_rate": "-0.0002"}
+            for ts in range(3000, 2950, -1)
+        ]}}
+        second = {"status": "ok", "data": {"total_page": 2, "data": [
+            {"funding_time": 2000, "funding_rate": "0.0003", "realized_rate": None},
+        ]}}
+        with patch.object(exchanges.requests, "get", side_effect=[FakeResponse(first), FakeResponse(second)]) as get:
+            rows, symbol = exchanges.htx_fetch("BTC", 1900, 3000)
+        self.assertEqual(symbol, "BTC-USDT")
+        self.assertEqual(len(rows), 51)
+        self.assertEqual(rows[0], (2000, 0.03))
+        self.assertEqual(rows[-1], (3000, -0.02))
+        self.assertEqual(get.call_args_list[1].kwargs["params"]["page_index"], 2)
 
 
 if __name__ == "__main__":
